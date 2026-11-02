@@ -35,3 +35,6 @@ logs/
 artifacts/
 screenshots/
 *-credentials.json
+
+*.sql
+*.sql.gz

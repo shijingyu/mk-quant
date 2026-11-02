@@ -8,15 +8,14 @@ import time
 from fastapi.testclient import TestClient
 import pytest
 
-from backend import db
+from backend import db, storage
 from backend.app import app, overview_data
 from backend.security import encrypt_secret, decrypt_secret
 from backend.worker import run_experiment, runtime_tick, ensure_market_cache
 
 
 @pytest.fixture
-def client(tmp_path,monkeypatch):
-    monkeypatch.setenv("MK_DB_PATH",str(tmp_path/"test.sqlite3"))
+def client(mysql_database,monkeypatch):
     monkeypatch.setenv("MK_DEMO","1")
     monkeypatch.setenv("MK_DEMO_PASSWORD",secrets.token_urlsafe(24))
     with TestClient(app) as c:
@@ -32,8 +31,7 @@ def new_paper(client,phone="13900000000"):
     return r.json()
 
 
-def test_demo_requires_local_password_and_does_not_reset_existing(tmp_path, monkeypatch):
-    monkeypatch.setenv("MK_DB_PATH", str(tmp_path / "demo.sqlite3"))
+def test_demo_requires_local_password_and_does_not_reset_existing(mysql_database, monkeypatch):
     monkeypatch.delenv("MK_DEMO_PASSWORD", raising=False)
     with pytest.raises(ValueError, match="MK_DEMO_PASSWORD"):
         db.seed_demo()
@@ -126,6 +124,11 @@ def test_split_backtest_job_results_and_export(client):
     assert result["provenance"]["data_hash"]
     assert result["provenance"]["symbol_filters"]["source"]=="synthetic_documented_fixture"
     assert result["curve"][-1]["timestamp"]<result["validation_curve"][0]["timestamp"]
+    with db.connect() as con:
+        persisted=db.parse(con.execute("SELECT result FROM experiments WHERE id=?",(id,)).fetchone()[0])
+    assert "orders" not in persisted and "decisions" not in persisted
+    assert persisted["artifacts"]["orders"]["count"]==len(result["orders"])
+    assert len(client.get("/api/experiments").json()[0]["curve"])<=600
     assert "split,timestamp,equity" in client.get(f"/api/experiments/{id}/export?format=csv").text
     body["validation_start"]="2026-09-09"
     assert client.post("/api/experiments",json=body).status_code==422
@@ -158,6 +161,55 @@ def test_uploaded_source_never_executes(client):
     assert client.post("/api/strategies",json={"source":"import os\nos.system('touch /tmp/unsafe')"}).status_code==422
 
 
+def test_experiment_pins_immutable_source_version(client):
+    experiment=client.post("/api/experiments",json=experiment_body()).json()
+    with db.connect() as con:
+        version=con.execute("SELECT source FROM strategy_versions WHERE id=?",(experiment["provenance"]["strategy_version_id"],)).fetchone()
+        assert version
+        con.execute("UPDATE strategies SET source=? WHERE id='momentum'",("raise RuntimeError('mutable source must not execute')",))
+    run_experiment(experiment["id"])
+    assert client.get(f"/api/experiments/{experiment['id']}").json()["status"]=="completed"
+
+
+def test_dataset_uses_parquet_and_backfill_is_repeatable(client):
+    rows=[{"timestamp":1788220800000+i*60000,"open":100,"high":102,"low":99,"close":101,"volume":0} for i in range(3)]
+    response=client.post("/api/datasets",json={"symbols":["BTCUSDT"],"market":"futures","interval":"1m","candles":{"BTCUSDT":rows}})
+    assert response.status_code==201,response.text
+    dataset=response.json()
+    assert dataset["storage"]=="parquet" and dataset["count"]==3
+    with db.connect() as con:
+        raw=con.execute("SELECT candles FROM datasets WHERE id=?",(dataset["id"],)).fetchone()[0]
+    assert storage.is_manifest(db.parse(raw))
+    assert storage.read_candles(raw)["BTCUSDT"][0]["volume"]==0
+    storage.backfill_artifacts()
+    assert storage.backfill_artifacts()=={"datasets":0,"experiments":0}
+
+
+def test_paper_fills_orders_and_audit_commit_together(client,monkeypatch):
+    account=new_paper(client)
+    command=client.post("/api/commands",json={"account_ids":[account["id"]],"action":"resume"}).json()["commands"][0]
+    tick=int(time.time()//60)*60000
+    bars=[{"timestamp":tick-(10-i)*60000,"open":100+i,"high":102+i,"low":99+i,"close":101+i,"volume":100} for i in range(10)]
+    rules={"tick_size":"0.01","step_size":"0.001","min_qty":"0.001","min_notional":"5"}
+    with db.connect() as con:
+        con.execute("INSERT INTO market_cache VALUES(?,?,'1m',?,?,?)",("futures","BTCUSDT",db.dump(bars),db.dump(rules),time.time()))
+    runtime_tick(account["id"],"fill-test")
+    later=time.time()+61
+    monkeypatch.setattr(time,"time",lambda:later)
+    bars.append({"timestamp":tick,"open":110,"high":112,"low":109,"close":111,"volume":100})
+    with db.connect() as con:
+        con.execute("UPDATE market_cache SET candles=?,fetched_at=?",(db.dump(bars),time.time()))
+    runtime_tick(account["id"],"fill-test")
+    runtime_tick(account["id"],"fill-test")
+    with db.connect() as con:
+        assert con.execute("SELECT COUNT(*) FROM orders WHERE account_id=?",(account["id"],)).fetchone()[0]==1
+        assert con.execute("SELECT COUNT(*) FROM fills WHERE account_id=?",(account["id"],)).fetchone()[0]==1
+        assert con.execute("SELECT COUNT(*) FROM ledger WHERE account_id=? AND kind='fill'",(account["id"],)).fetchone()[0]==1
+        audits=con.execute("SELECT action,payload FROM audit_records").fetchall()
+        assert {"account.create","command.request","command.complete"} <= {row["action"] for row in audits}
+        assert "test-password-123" not in json.dumps([dict(row) for row in audits])
+
+
 def test_paper_worker_ack_and_no_fabricated_live_data(client):
     account=new_paper(client)
     client.post("/api/commands",json={"account_ids":[account["id"]],"action":"resume"})
@@ -178,6 +230,22 @@ def test_paper_worker_ack_and_no_fabricated_live_data(client):
     runtime_tick(account["id"],"test-runtime")
     assert client.get(f"/api/client/{account['route']}").json()["status"]=="stopped"
     assert client.patch(f"/api/accounts/{account['id']}",json={"initial_equity":2000}).status_code==409
+
+
+def test_replaced_actor_cannot_acknowledge_stop_without_market_data(client,monkeypatch):
+    account=new_paper(client)
+    command=client.post("/api/commands",json={"account_ids":[account["id"]],"action":"flatten","confirmed":True}).json()["commands"][0]
+    original_acquire=db.acquire_lease
+    def replaced_lease(account_id,owner):
+        fence=original_acquire(account_id,owner)
+        with db.connect() as con:
+            con.execute("UPDATE instances SET owner='replacement',fence=fence+1 WHERE account_id=?",(account_id,))
+        return fence
+    monkeypatch.setattr(db,"acquire_lease",replaced_lease)
+    assert runtime_tick(account["id"],"expired-worker") is True
+    with db.connect() as con:
+        assert con.execute("SELECT status FROM commands WHERE id=?",(command["id"],)).fetchone()[0]=="pending"
+        assert con.execute("SELECT owner FROM instances WHERE account_id=?",(account["id"],)).fetchone()[0]=="replacement"
 
 
 def test_edit_pre_run_account_and_credentials(client):
@@ -233,8 +301,8 @@ def test_batch_parameters_validate_atomically(client):
     assert client.post("/api/experiments",json=body).status_code==422
 
 
-def test_create_admin_noninteractive_is_non_destructive(tmp_path):
-    env={**os.environ,"MK_DEMO":"0","MK_DB_PATH":str(tmp_path/"admin.sqlite3")}
+def test_create_admin_noninteractive_is_non_destructive(mysql_database):
+    env={**os.environ,"MK_DEMO":"0"}
     command=[sys.executable,"-m","backend.worker","create-admin","--username","owner","--generate-password"]
     first=subprocess.run(command,env=env,capture_output=True,text=True,timeout=20)
     assert first.returncode==0,first.stderr

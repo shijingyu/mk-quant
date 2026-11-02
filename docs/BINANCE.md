@@ -46,9 +46,9 @@
 
 ## 下单网关
 
-默认禁用。启用需要 `configure_live(enabled=True,journal=SQLiteOrderJournal(path),execution_guard=callable)`，且此前通过完整账户检查。检查有效期 60 秒。网关只允许 MARKET/LIMIT，市价参考价格不得超过 5 秒，现货 SELL 重新检查可用资产。双向合约的 positionSide 与 reduceOnly 组合严格校验。触发单/止损单下单尚未实现，禁止使用普通 order 路径代替 Algo 接口。
+默认禁用。启用需要 `configure_live(enabled=True,journal=MySQLOrderJournal(),execution_guard=callable)`，且此前通过完整账户检查。检查有效期 60 秒。网关只允许 MARKET/LIMIT，市价参考价格不得超过 5 秒，现货 SELL 重新检查可用资产。双向合约的 positionSide 与 reduceOnly 组合严格校验。触发单/止损单下单尚未实现，禁止使用普通 order 路径代替 Algo 接口。
 
-`submit_order(symbol,side,quantity,client_order_id='mk_…',order_type='MARKET',price=None,reference_price=None,reference_timestamp_ms=None,reduce_only=False,position_side='BOTH')` 在发送前将交易意图与 clientOrderId 写入 SQLite（WAL、synchronous=FULL）；同一账户/ID 唯一，内容变化会拒绝。网络超时/5xx 等结果不确定时仅用 `origClientOrderId` 查询。查无记录也保持 UNKNOWN，不自动重发；崩溃重启后仍服从该记录。意图已确认时重复调用返回既有结果。
+`submit_order(symbol,side,quantity,client_order_id='mk_…',order_type='MARKET',price=None,reference_price=None,reference_timestamp_ms=None,reduce_only=False,position_side='BOTH')` 在发送前将交易意图与 clientOrderId 写入 MySQL InnoDB 的 `binance_order_intents` 表（唯一键与事务）；同一账户/ID 唯一，内容变化会拒绝。网络超时/5xx 等结果不确定时仅用 `origClientOrderId` 查询。查无记录也保持 UNKNOWN，不自动重发；崩溃重启后仍服从该记录。意图已确认时重复调用返回既有结果。
 
 这只是执行边界组件，**不是已经验收的无人值守实盘系统**。运行实例产生持仓后不能重新使用“空账户接入检查”续期；正式运行还需单独实现有账本依据的运行期授权续期、账户事件流、部分成交/手续费/资金费率对账、清算和紧急撤单/平仓。`execution_guard` 能检查租约和停止标记，但仅靠回调无法阻止进程在检查后暂停又恢复发送：生产必须把密钥与出口放在单一、可强制隔离旧持有者的执行网关，或通过基础设施隔离完成真正 fencing。上线前需要演练断网、重复回调、进程恢复和交易所未知订单等故障。
 

@@ -1,0 +1,34 @@
+# Optional local development/integration databases. Same MySQL version and mode
+# as the native deployment; dedicated schemas, users and volumes per environment.
+name: mk-quant-databases
+x-mysql: &mysql
+  image: mysql:5.7.44
+  platform: linux/amd64
+  command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_bin", "--default-storage-engine=InnoDB", "--transaction-isolation=READ-COMMITTED", "--default-time-zone=+00:00", "--sql-mode=STRICT_ALL_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ZERO_DATE,NO_ZERO_IN_DATE,NO_ENGINE_SUBSTITUTION"]
+  healthcheck:
+    test: [CMD-SHELL, "mysqladmin ping -h 127.0.0.1 --silent"]
+    interval: 5s
+    timeout: 5s
+    retries: 20
+services:
+  development:
+    <<: *mysql
+    environment:
+      MYSQL_DATABASE: mk_quant_dev
+      MYSQL_USER: mk_quant_dev
+      MYSQL_PASSWORD: ${MK_DB_PASSWORD:?Set a private database password}
+      MYSQL_ROOT_PASSWORD: ${MK_DB_ROOT_PASSWORD:?Set a separate private root password}
+    ports: ["127.0.0.1:3307:3306"]
+    volumes: ["dev-data:/var/lib/mysql"]
+  integration:
+    <<: *mysql
+    environment:
+      MYSQL_DATABASE: mk_quant_test
+      MYSQL_USER: mk_quant_test
+      MYSQL_PASSWORD: ${MK_DB_PASSWORD:?Set a private database password}
+      MYSQL_ROOT_PASSWORD: ${MK_DB_ROOT_PASSWORD:?Set a separate private root password}
+    ports: ["127.0.0.1:3308:3306"]
+    volumes: ["test-data:/var/lib/mysql"]
+volumes:
+  dev-data: {}
+  test-data: {}

@@ -10,13 +10,11 @@ import hmac
 import json
 import math
 import re
-import sqlite3
 import ssl
 import threading
 import time
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from functools import lru_cache
-from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -82,46 +80,37 @@ def _transport(method: str, url: str, headers: dict, body: bytes | None, timeout
         raise BinanceError("币安请求连接失败或响应无法解析") from None
 
 
-class SQLiteOrderJournal:
-    """A persistent at-most-once submission record, independent of Web lifetime.
+class MySQLOrderJournal:
+    """Durable at-most-once submission claims in the platform's MySQL database.
 
-    An UNKNOWN row stays uncertain even after an exchange 'not found' response:
-    the original request may still be in flight. Operator reconciliation is
-    required; there is intentionally no automatic resubmit API.
+    A unique INSERT acquires the InnoDB record lock even when competing callers
+    observe no existing row. UNKNOWN is committed before the exchange request;
+    it is never automatically submitted again, including after a restart.
     """
-    def __init__(self, path: str | Path):
-        if str(path) == ":memory:":
-            raise ValueError("实盘订单账本必须使用持久文件")
-        self.path = str(path)
-        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as db:
-            db.execute("""CREATE TABLE IF NOT EXISTS binance_order_intents (
-                account TEXT NOT NULL, client_id TEXT NOT NULL, payload TEXT NOT NULL,
-                status TEXT NOT NULL, result TEXT, updated_at REAL NOT NULL,
-                PRIMARY KEY(account, client_id))""")
-
-    def _connect(self):
-        db = sqlite3.connect(self.path, timeout=15)
-        db.row_factory = sqlite3.Row
-        db.execute("PRAGMA journal_mode=WAL")
-        db.execute("PRAGMA synchronous=FULL")
-        return db
+    def __init__(self):
+        from . import db
+        db.init_schema()
 
     def claim(self, account: str, client_id: str, payload: dict) -> tuple[bool, dict]:
+        from . import db
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-        with self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT * FROM binance_order_intents WHERE account=? AND client_id=?", (account, client_id)).fetchone()
-            if row:
-                if row["payload"] != encoded:
-                    raise BinanceError("相同 clientOrderId 不允许绑定不同交易意图")
-                return False, dict(row)
-            db.execute("INSERT INTO binance_order_intents VALUES(?,?,?,'UNKNOWN',NULL,?)", (account, client_id, encoded, time.time()))
-            return True, {"status": "UNKNOWN"}
+        with db.connect() as con:
+            result = con.execute("INSERT INTO binance_order_intents VALUES(?,?,?,'UNKNOWN',NULL,?) ON DUPLICATE KEY UPDATE client_id=VALUES(client_id)", (account, client_id, encoded, time.time()))
+            if result.rowcount == 1:
+                return True, {"status": "UNKNOWN"}
+            row = con.execute("SELECT * FROM binance_order_intents WHERE account=? AND client_id=? FOR UPDATE", (account, client_id)).fetchone()
+            if row is None:
+                raise BinanceError("订单意图状态不可确定，禁止再次提交") from None
+            if row["payload"] != encoded:
+                raise BinanceError("相同 clientOrderId 不允许绑定不同交易意图")
+            return False, dict(row)
 
     def record(self, account: str, client_id: str, status: str, result: dict):
-        with self._connect() as db:
-            db.execute("UPDATE binance_order_intents SET status=?,result=?,updated_at=? WHERE account=? AND client_id=?", (status, json.dumps(result), time.time(), account, client_id))
+        from . import db
+        with db.connect() as con:
+            changed = con.execute("UPDATE binance_order_intents SET status=?,result=?,updated_at=? WHERE account=? AND client_id=?", (status, json.dumps(result), time.time(), account, client_id))
+            if changed.rowcount == 0 and con.execute("SELECT 1 FROM binance_order_intents WHERE account=? AND client_id=?", (account, client_id)).fetchone() is None:
+                raise BinanceError("订单意图不存在，拒绝保存无关联回执")
 
 
 class BinanceClient:
@@ -478,8 +467,8 @@ class BinanceClient:
         final["applied"] = applied
         return final
 
-    def configure_live(self, *, enabled: bool, journal: SQLiteOrderJournal, execution_guard: Callable[[], bool]):
-        if enabled and (not isinstance(journal, SQLiteOrderJournal) or not callable(execution_guard)):
+    def configure_live(self, *, enabled: bool, journal: MySQLOrderJournal, execution_guard: Callable[[], bool]):
+        if enabled and (not isinstance(journal, MySQLOrderJournal) or not callable(execution_guard)):
             raise BinanceError("实盘执行需要持久订单账本与有效执行权检查")
         self._live_enabled, self._journal, self._execution_guard = enabled is True, journal, execution_guard
 

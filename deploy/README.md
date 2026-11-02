@@ -1,56 +1,106 @@
 # 部署方式
 
-支持宝塔原生 Python 项目和 Docker Compose 两种单机部署方式。宝塔安装步骤见 [宝塔部署指南](BAOTA.md)；本文介绍容器方案。同一数据库不要同时启动两套执行服务。
+支持宝塔原生 Python 项目和 Docker Compose 两种单机部署。两种方式均使用 **MySQL / InnoDB + 独立 Parquet 文件**，同一个业务库不要同时启动两套执行服务。宝塔步骤见 [宝塔部署指南](BAOTA.md)；本页介绍容器部署。
 
-## 可选：单机容器部署
+当前提供回测和模拟执行，真实下单在应用与编排中均关闭。旧版本数据先按 [一次性迁移说明](../docs/DATABASE.md#既有数据单次迁移) 处理，再启动新版本。
 
-该配置用于可审查的回测与模拟部署。实盘执行在应用和 Compose 中均关闭；容器编排不能替代真实交易验收。
+## 1. 准备私有配置
 
-## 启动
+安装 Docker Engine 和 Compose v2，建议至少 4 GB 内存，并为宿主机及数据增长留出空间。数据库镜像固定为 `mysql:5.7.44`，与当前宝塔版本一致；镜像声明 `linux/amd64`，ARM 开发机器需要相应的容器兼容支持。未来升级必须同步验证开发、集成与生产环境的版本和行为。
 
-安装 Docker Engine 与 Compose v2。需要约 4 GB 以上可用内存，并预留宿主机资源。默认仅向本机开放：网页 `http://127.0.0.1:8080`，API `http://127.0.0.1:8765`。
+在仓库根目录创建仅运维用户可读的 `.env`，填写下列值。真实凭据只留在私有部署环境中：
 
-```sh
+```dotenv
+MK_DB_PASSWORD='replace-with-private-application-password'
+MK_DB_ROOT_PASSWORD='replace-with-a-different-private-root-password'
+MK_MASTER_KEY=
+MK_COOKIE_SECURE=0
+MK_ALLOWED_ORIGINS=http://localhost:8080,http://127.0.0.1:8080
+MK_HTTP_PORT=8080
+```
+
+```bash
+chmod 600 .env
+```
+
+Compose 固定业务库和业务用户为 `mk_quant`；API、回测和运行进程使用业务用户，数据库 root 密码不传给应用。数据库服务不发布宿主机端口。内部数据库网络设为 `internal: true`，因此显式使用 `MK_DB_SSL_MODE=disabled`；跨主机数据库使用受验证的 TLS，参见 [数据库配置](../docs/DATABASE.md#环境与事务规则)。
+
+MySQL 初始化环境变量仅对首次创建空数据卷生效。更换 `.env` 中的密码不会修改现有 MySQL 用户，应通过数据库权限管理同步轮换，再重建应用容器。
+
+需要加密保存 Binance 凭据时，独立生成 Fernet 密钥并设置 `MK_MASTER_KEY`。默认空值支持回测与模拟，但拒绝加密录入实盘凭据。密钥与数据库备份分开保管；丢失密钥无法解密已有凭据。
+
+## 2. 构建与启动
+
+```bash
 docker compose build
 docker compose up -d
 docker compose exec api python -m backend.worker create-admin
 ```
 
-第三条命令会交互输入管理员账户与密码；部署不会自动生成演示管理员。模拟客户由管理员在网页创建。
+最后一条命令交互输入管理员用户名与密码。仅新安装需要创建；迁移已有管理员后跳过。默认没有演示管理员，客户由管理员在网页创建。
 
-需要加密保存币安凭证时，先独立生成并保管 Fernet 密钥，然后通过运行环境提供 `MK_MASTER_KEY`。不要将真实密钥写进 Dockerfile、Compose、策略源码或版本库。默认为空，界面仍可运行回测和模拟，但拒绝加密录入实盘凭证。备份该密钥与数据需要分别保管；丢失密钥无法解密已有凭证。
+本机网页地址为 `http://127.0.0.1:8080`，API 为 `http://127.0.0.1:8765`。入口仅绑定回环地址。MySQL 健康检查通过后启动后端，API 健康后启动前端；查看所有容器状态，不能仅依赖 `up -d` 返回成功。
 
-## 进程与资源
+## 3. 进程与资源
 
-| 服务 | 任务 | CPU 上限 | 内存上限 |
+| 服务 | 职责 | CPU 上限 | 内存上限 |
 | --- | --- | --- | --- |
-| api | 登录、权限、配置与任务控制 | 0.75 | 768 MB |
-| backtest | 队列与独立回测子进程 | 1.0 | 1 GB |
-| runtime | 共享行情轮询及逐账户模拟进程 | 2.0 | 2 GB |
-| frontend | nginx 静态网页与同源 API 代理 | 0.25 | 128 MB |
+| mysql | InnoDB 核心业务数据库 | 未单独限定 | 1 GB |
+| api | 登录、权限、配置、任务和查询 | 0.75 | 768 MB |
+| backtest | 回测队列与独立任务进程 | 1.0 | 768 MB |
+| runtime | 共享行情轮询及逐账户模拟进程 | 2.0 | 1 GB |
+| frontend | Nginx 静态网页与同源 API 代理 | 0.25 | 128 MB |
 
-`runtime` 不依赖 `api` 的生命周期，重启 API 不会关闭已有模拟运行进程；`docker compose down` 会停止整个部署。回测容器禁止网络访问，也不接收主密钥；历史数据从共享数据库读取。策略上传只向已登录管理员开放，管理员保存通过契约检查的源码即可运行；管理员是代码的信任边界，进程和容器限额不是恶意 Python 的安全沙箱。
+`runtime` 不依赖 API 的生命周期，重启 API 不会关闭已有模拟运行进程。`docker compose down` 会停止整套部署；执行前先根据需要完成账户停止指令并检查回执。
 
-CPU 限额防止单个服务无限占用，但不是物理资源预留。宿主机仍须监测 CPU、内存、磁盘空间和连接容量。进程 PID 上限也限制了单机最大并发账户数，需要容量测试后调整。
+回测服务只连接内部数据库网络，不具备公网行情访问能力，不接收凭证主密钥；输入来自 MySQL 清单及共享 Parquet 卷。运行服务有行情网络出口。所有后端角色挂载同一文件卷，以相同 UID 读写文件。
 
-## 持久化和备份
+回测进程的 2048 MB 地址空间上限用于限制进程虚拟地址空间，容器物理内存仍受 768 MB 限制。CPU、内存和 PID 上限不是物理资源预留；宿主机需监测 MySQL 连接数、内存、磁盘与整体负载，根据策略规模调整并发。
 
-三个 Python 服务共享本机命名卷 `mk-data`，数据库路径固定为 `/data/mk.sqlite3`，采用 SQLite WAL 和文件锁。此方案只面向单宿主机，不允许把数据库文件放入 NFS 或多个宿主机共享目录，也不提供数据库高可用。需要横向扩展时应迁移 PostgreSQL、统一任务协调和独立执行网关。
+策略源码只允许可信管理员上传和保存。契约校验与独立进程限额不构成恶意 Python 的安全沙箱。
 
-运行时不要只复制 `.sqlite3` 主文件而遗漏 WAL。使用 SQLite 在线 backup API 生成一致性备份，再导出并核对恢复流程。不要用 `docker compose down -v` 做日常重启；该命令删除持久卷。
+## 4. 持久化与联合备份
 
-## 公网部署和运维
+| 命名卷 | 容器位置 | 内容 |
+| --- | --- | --- |
+| `mysql-data` | MySQL 的 `/var/lib/mysql` | 用户、账户、策略版本、实例、订单、成交、账本、审计及文件清单等 |
+| `mk-artifacts` | 后端的 `/data` | `/data/artifacts` 下不可变的历史 K 线与回测明细 Parquet |
 
-默认只绑定回环地址。公网访问需要在宿主机入口设置 HTTPS，保持单一可信代理，配置 `MK_COOKIE_SECURE=1` 以及准确的 `MK_ALLOWED_ORIGINS`。本仓库 nginx 使用本地 HTTP；接在 TLS 终止代理后应让可信入口传递正确协议，并调整 nginx 的 `X-Forwarded-Proto` 设置，不能接受任意公网客户端伪造代理头。不要把未加密的管理端口直接开放到互联网。
+所有业务表显式使用 InnoDB；连接统一采用 UTC、READ COMMITTED 和严格 SQL 模式。文件先发布再提交数据库引用。备份必须包含 MySQL 一致性快照及其引用的文件，单独保留 SQL 或数据卷其中之一不完整。不要用 `docker compose down -v` 做日常重启，该命令会删除持久卷。
 
-查看状态与日志：
+`deploy/backup.py` 需要安装本项目 Python 依赖的 Python 3.11 环境、兼容版本的 `mysqldump`，以及数据库连接和 Parquet 读取权限；应用镜像没有内置备份脚本和 MySQL 命令行客户端。Linux Docker 宿主机可准备独立 Python 环境及 MySQL 客户端，由运维用户在仓库目录执行以下示例。私有 `.env` 必须采用可信、可被 shell 读取的赋值格式：
 
-```sh
+```bash
+set -a
+. ./.env
+set +a
+export MK_DB_NAME=mk_quant
+export MK_DB_USER=mk_quant
+export MK_DB_PORT=3306
+export MK_DB_SSL_MODE=disabled
+export MK_DB_HOST="$(docker inspect "$(docker compose ps -q mysql)" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')"
+export MK_ARTIFACT_ROOT="$(docker inspect "$(docker compose ps -q api)" --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}')/artifacts"
+.venv/bin/python deploy/backup.py --directory /private-backup/mk-quant --mysqldump /path/to/compatible/mysqldump
+```
+
+替换 Python 环境、备份和工具路径，确认两个容器正在运行且查询到的目录正确。这里显式关闭 TLS 仅用于宿主机与隔离 Docker 内网之间的连接；跨主机应设置 `verify_identity` 和 `MK_DB_SSL_CA`，由应用驱动和 `mysqldump` 同时校验证书。宿主机需可访问 Docker 内部数据库地址和卷目录；此方法适用于 Linux 原生 Docker，不直接适用于 Docker Desktop 的虚拟机卷。后者应在具有相同工具、数据库网络和只读文件卷的专用备份环境中运行脚本。
+
+脚本用 `--single-transaction` 导出 InnoDB 快照，再收集不可变 Parquet，输出权限 600 的归档与整体 SHA-256。归档包含 `database.sql.gz`、`artifacts/` 和 `manifest.json`。归档前校验数据库引用与文件哈希，只收集已发布文件，跳过临时写入文件并拒绝符号链接。备份期间可继续业务读写，但不可做 DDL 或删除文件；定期执行恢复演练。环境文件和 Fernet 主密钥不在归档内，分别安全备份。
+
+恢复时停写，将 SQL 导入空的隔离业务库，按清单恢复文件并验证哈希、数据库引用及历史结果。文件目录须允许应用 UID `10001` 读取和写入。先完成权限、回放和独立工作进程验收，再切换正式服务。完整规则见 [联合备份与恢复](../docs/DATABASE.md#联合备份与恢复)。
+
+## 5. 公网入口与日常更新
+
+公网访问使用宿主机 HTTPS 入口，设置 `MK_COOKIE_SECURE=1` 和准确的 `MK_ALLOWED_ORIGINS`，修改后重建 API 容器以加载环境。当前仓库 Nginx 在容器内使用 HTTP；接入 TLS 终止代理时需限定可信代理并正确传递协议，不能接受公网客户端任意伪造的转发头。
+
+```bash
 docker compose ps
 docker compose logs --tail=100 api runtime backtest
 docker compose restart api
 ```
 
-API `/healthz` 只能证明控制服务存活；工作进程的真实状态取自数据库中的心跳和命令结果。实盘上线还需要账户事件流/成交对账、保护单、运行授权续期、旧执行者强制隔离、故障恢复演练及受保护的交易出口，详见 `docs/BINANCE.md`。本部署不会执行真实下单。
+前端修改后重新构建并启动 `frontend`；后端发布涉及角色代码时按计划重建相应容器。修改环境变量需要重建容器，单纯 `restart` 不会重新读取 Compose 配置。发布前执行联合备份并记录版本；数据库版本升级应先在同版本开发、测试环境验证，再同步生产。
 
-基础镜像使用维护分支标签，Python 使用明确版本范围，前端通过已提交 lockfile 和 `npm ci` 构建。正式发布应另外固定镜像摘要与 Python 完整锁文件，并记录构建产物和依赖审计结果。
+`/healthz` 查询 MySQL 并报告存储类型，但不会验证所有文件和工作进程。账户运行状态仍以数据库中的执行端心跳、命令回执和账本更新为准。保持证书自动续期、备份任务和磁盘容量监测可观察。
+
+开发和集成库可单独通过 `compose.database.yaml` 启动；开发端口 3307、测试端口 3308 均只绑定回环。测试需要专用 `_test` 数据库和 `MK_TEST_ALLOW_RESET=1`，不得指向生产，详见 [开发与集成验证](../docs/DATABASE.md#开发与集成验证)。

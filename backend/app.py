@@ -10,13 +10,12 @@ import math
 import os
 import platform
 import secrets
-import sqlite3
 import time
 from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
-from fastapi.responses import StreamingResponse
-from . import db
+from fastapi.responses import JSONResponse, StreamingResponse
+from . import db, storage
 from .security import decrypt_secret, encrypt_secret, hash_password, token_hash, verify_password
 
 
@@ -30,6 +29,11 @@ async def lifespan(app):
 
 app = FastAPI(title="MK Quant 控制服务", version="0.1.0", lifespan=lifespan)
 COOKIE = "mk_session"
+
+
+@app.exception_handler(storage.ArtifactError)
+async def artifact_error_handler(request, exc):
+    return JSONResponse(status_code=503, content={"detail":str(exc)})
 
 
 def exchange_error(exc):
@@ -79,7 +83,9 @@ def public_user(current):
 
 @app.get("/healthz")
 def health():
-    return {"status":"ok","service":"control","engine_version":db.ENGINE_VERSION}
+    with db.connect() as con:
+        con.execute("SELECT 1").fetchone()
+    return {"status":"ok","service":"control","engine_version":db.ENGINE_VERSION,"database":"mysql","table_engine":"InnoDB","artifact_storage":"parquet"}
 
 
 @app.post("/api/login")
@@ -98,6 +104,7 @@ def login(body: dict, response: Response, request: Request):
     with db.connect() as con:
         con.execute("DELETE FROM sessions WHERE expires<?", (time.time(),))
         con.execute("INSERT INTO sessions VALUES(?,?,?,?)",(token_hash(token),row["id"],csrf,time.time()+12*3600))
+        db.audit(con,row["id"],"auth.login","user",row["id"],{})
     response.set_cookie(COOKIE,token,httponly=True,samesite="strict",secure=os.getenv("MK_COOKIE_SECURE","0")=="1",max_age=12*3600,path="/")
     return {"current_user":public_user(dict(row)),"csrf_token":csrf}
 
@@ -106,6 +113,7 @@ def login(body: dict, response: Response, request: Request):
 def logout(request: Request, response: Response, current=Depends(user)):
     with db.connect() as con:
         con.execute("DELETE FROM sessions WHERE token_hash=?", (token_hash(request.cookies.get(COOKIE,"")),))
+        db.audit(con,current["id"],"auth.logout","user",current["id"],{})
     response.delete_cookie(COOKIE,path="/")
     return {"ok":True}
 
@@ -183,7 +191,7 @@ def all_accounts(current):
 def experiment_data(row,detail=False):
     d=dict(row)
     config=db.parse(d.pop("config"),{})
-    result=db.parse(d.pop("result"),{})
+    result=storage.load_result(d.pop("result"), detail=detail)
     d.update(config)
     d["provenance"]=db.parse(d["provenance"],{})
     d.update(result)
@@ -214,9 +222,8 @@ def list_datasets():
     result=[]
     for row in rows:
         d=dict(row)
-        candles=db.parse(d.pop("candles"),{})
-        times=[c["timestamp"] for series in candles.values() for c in series]
-        d.update(symbols=db.parse(d["symbols"],[]),count=sum(len(x) for x in candles.values()),start=min(times) if times else None,end=max(times) if times else None)
+        metadata=storage.candle_metadata(d.pop("candles"))
+        d.update(symbols=db.parse(d["symbols"],[]),**metadata)
         result.append(d)
     return result
 
@@ -322,7 +329,8 @@ def create_account(body:dict,current=Depends(admin)):
             con.execute("INSERT INTO users VALUES(?,?,?,?,?,?,?)",(user_id,str(body.get("username",phone)),name,phone,password,"client",db.now()))
             con.execute("INSERT INTO accounts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(account_id,user_id,name,mode,db.uid(),strategy["id"],db.dump(config),db.dump(symbols),initial,db.dump({"equity":initial,"curve":[],"positions":[],"orders":[]}),credentials,None,None,"local",db.now()))
             con.execute("INSERT INTO instances(account_id) VALUES(?)",(account_id,))
-    except sqlite3.IntegrityError as exc:
+            db.audit(con,current["id"],"account.create","account",account_id,{"strategy_id":strategy["id"],"mode":mode,"symbols":symbols})
+    except db.IntegrityError as exc:
         raise HTTPException(409,"登录账号已存在") from exc
     db.log("debug","管理员创建账户",account_id=account_id,strategy_id=strategy["id"])
     return next(a for a in all_accounts(current) if a["id"]==account_id)
@@ -370,6 +378,11 @@ def update_account(account_id:str,body:dict,current=Depends(admin)):
                 raise ValueError("更新实盘凭证需要同时填写 API Key 和 Secret")
             credentials=encrypt_secret(db.dump({"api_key":body["api_key"],"api_secret":body["api_secret"]}))
         with db.connect() as con:
+            locked=db.lock_instance(con,account_id)
+            if not locked or locked["observed_state"]!="stopped" or locked["desired_state"]!="stopped":
+                raise HTTPException(409,"账户状态已改变，请等待停止回执后再修改")
+            if initial!=row["initial_equity"] and con.execute("SELECT 1 FROM ledger WHERE account_id=? LIMIT 1",(account_id,)).fetchone():
+                raise HTTPException(409,"账户已产生运行账本，不能修改初始资金")
             con.execute("UPDATE accounts SET name=?,strategy_id=?,config=?,symbols=?,credentials=?,initial_equity=?,metrics=?,check_result=NULL WHERE id=?",(name,strategy_id,db.dump(config),db.dump(symbols),credentials,initial,db.dump(metrics),account_id))
             current_user=con.execute("SELECT * FROM users WHERE id=?",(row["user_id"],)).fetchone()
             phone=str(body.get("phone",current_user["phone"] or "")).strip()
@@ -380,9 +393,10 @@ def update_account(account_id:str,body:dict,current=Depends(admin)):
             con.execute("UPDATE instances SET config_revision=config_revision+1 WHERE account_id=?",(account_id,))
             if password or credentials!=row["credentials"]:
                 con.execute("DELETE FROM sessions WHERE user_id=?",(row["user_id"],))
+            db.audit(con,current["id"],"account.update","account",account_id,{"strategy_id":strategy_id,"symbols":symbols,"parameters":config,"password_changed":bool(password),"credentials_changed":credentials!=row["credentials"]})
     except ValueError as exc:
         raise HTTPException(422,str(exc)) from exc
-    except sqlite3.IntegrityError as exc:
+    except db.IntegrityError as exc:
         raise HTTPException(409,"更新后的登录账号已存在") from exc
     return next(a for a in all_accounts(current) if a["id"]==account_id)
 
@@ -415,13 +429,14 @@ def check_account(account_id:str,body:dict=None,current=Depends(admin)):
             if identity:
                 with db.connect() as con:
                     con.execute("UPDATE accounts SET external_uid=? WHERE id=?",(str(identity),account_id))
-        except sqlite3.IntegrityError as exc:
+        except db.IntegrityError as exc:
             raise HTTPException(409,"该实际交易所账户已被其他账户绑定") from exc
         except Exception as exc:
             result={"ok":False,"checks":[{"name":"交易所连接","status":"unknown","message":f"接入检查未完成：{exchange_error(exc)}"}],"adjustments":[],"checked_at":db.now()}
             db.log("error","账户接入检查失败",account_id=account_id,details={"exception":type(exc).__name__})
     with db.connect() as con:
         con.execute("UPDATE accounts SET check_result=? WHERE id=?",(db.dump(result),account_id))
+        db.audit(con,current["id"],"account.adjust" if body and body.get("apply_adjustments") else "account.check","account",account_id,{"ok":result.get("ok"),"applied_adjustments":result.get("applied_adjustments",[])})
     return result
 
 
@@ -448,15 +463,15 @@ def command(body:dict,current=Depends(admin)):
     action=body.get("action")
     if action not in {"pause","flatten","resume"} or not isinstance(ids,list) or not ids or len(ids)>1000:
         raise HTTPException(422,"请选择账户及有效操作")
-    ids=list(dict.fromkeys(ids))
+    ids=sorted(set(ids))
     if len(ids)>1 and not (body.get("confirmed") is True and body.get("confirmed_twice") is True):
         raise HTTPException(422,"批量操作需要两次明确确认影响范围")
     if action=="flatten" and body.get("confirmed") is not True:
         raise HTTPException(422,"平仓并停止需要明确确认")
     commands=[]
     with db.connect() as con:
-        con.execute("BEGIN IMMEDIATE")
         for account_id in ids:
+            db.lock_instance(con,account_id)
             account=con.execute("SELECT * FROM accounts WHERE id=?",(account_id,)).fetchone()
             if not account:
                 raise HTTPException(404,"账户不存在")
@@ -468,6 +483,7 @@ def command(body:dict,current=Depends(admin)):
             con.execute("INSERT INTO commands(id,account_id,action,requested_by,created_at) VALUES(?,?,?,?,?)",(id,account_id,action,current["id"],db.now()))
             desired={"pause":"paused","flatten":"stopped","resume":"running"}[action]
             con.execute("UPDATE instances SET desired_state=? WHERE account_id=?",(desired,account_id))
+            db.audit(con,current["id"],"command.request","command",id,{"account_id":account_id,"action":action,"confirmed":body.get("confirmed") is True,"confirmed_twice":body.get("confirmed_twice") is True})
             commands.append({"id":id,"account_id":account_id,"action":action,"status":"pending"})
     return {"commands":commands,"message":"指令已持久化，等待独立执行端确认"}
 
@@ -499,7 +515,10 @@ def save_strategy(body:dict,current=Depends(admin)):
     id=db.uid()
     manifest["id"]=id
     with db.connect() as con:
-        con.execute("INSERT INTO strategies VALUES(?,?,?,?,1,?)",(id,db.dump(manifest),source,hashlib.sha256(source.encode()).hexdigest(),db.now()))
+        source_hash=hashlib.sha256(source.encode()).hexdigest()
+        con.execute("INSERT INTO strategies VALUES(?,?,?,?,1,?)",(id,db.dump(manifest),source,source_hash,db.now()))
+        version_id=db.pin_strategy_version(con,id,manifest,source,source_hash)
+        db.audit(con,current["id"],"strategy.create","strategy",id,{"version_id":version_id,"source_hash":source_hash})
     return {**manifest,"source":source,"source_hash":hashlib.sha256(source.encode()).hexdigest(),"trusted":True,"review_status":"admin_trusted","message":"契约检查通过，已按管理员可信代码启用；策略在独立进程运行"}
 
 
@@ -515,6 +534,7 @@ def save_preset(body:dict,current=Depends(admin)):
     id=db.uid()
     with db.connect() as con:
         con.execute("INSERT INTO presets VALUES(?,?,?,?,?)",(id,body["strategy_id"],str(body.get("name","未命名预设")),db.dump(body.get("parameters",{})),db.now()))
+        db.audit(con,current["id"],"preset.create","preset",id,{"strategy_id":body["strategy_id"]})
     return {"id":id,**body}
 
 
@@ -537,7 +557,7 @@ def datasets(current=Depends(admin)):
     return list_datasets()
 
 
-def store_dataset(body,source):
+def store_dataset(body,source,actor_id=None):
     market=body.get("market","futures")
     if market=="perpetual":
         market="futures"
@@ -554,6 +574,8 @@ def store_dataset(body,source):
         raise HTTPException(422,"单个数据集需要 1–500000 根 K 线")
     normalized={}
     for symbol,rows in candles.items():
+        if not isinstance(rows,list) or not rows:
+            raise HTTPException(422,f"{symbol} 至少需要一根 K 线")
         seen=set(); normalized[symbol]=[]
         for c in rows:
             try:
@@ -566,14 +588,16 @@ def store_dataset(body,source):
                 raise HTTPException(422,f"{symbol} 的 K 线格式、OHLC 范围或时间唯一性校验失败") from exc
         normalized[symbol].sort(key=lambda r:r["timestamp"])
     id=db.uid(); serialized=db.dump(normalized)
+    artifact=storage.write_candles(normalized)
     with db.connect() as con:
-        con.execute("INSERT INTO datasets VALUES(?,?,?,?,?,?,?,?,?)",(id,str(body.get("name","导入 K 线")),market,str(body.get("interval","1h")),db.dump(symbols),serialized,hashlib.sha256(serialized.encode()).hexdigest(),source,db.now()))
+        con.execute("INSERT INTO datasets VALUES(?,?,?,?,?,?,?,?,?)",(id,str(body.get("name","导入 K 线")),market,str(body.get("interval","1h")),db.dump(symbols),db.dump(artifact),hashlib.sha256(serialized.encode()).hexdigest(),source,db.now()))
+        db.audit(con,actor_id,"dataset.create","dataset",id,{"source":source,"count":count,"hash":artifact["content_sha256"]})
     return next(x for x in list_datasets() if x["id"]==id)
 
 
 @app.post("/api/datasets",status_code=201)
 def import_dataset(body:dict,current=Depends(admin)):
-    return store_dataset(body,"import")
+    return store_dataset(body,"import",current["id"])
 
 
 @app.post("/api/datasets/download",status_code=201)
@@ -590,7 +614,7 @@ def download_dataset(body:dict,current=Depends(admin)):
         candles={s:client.klines(s,body.get("interval","1h"),start,end) for s in symbols}
     except Exception as exc:
         raise HTTPException(502,f"币安行情下载失败：{exchange_error(exc)}") from exc
-    return store_dataset({**body,"candles":candles},"binance_public")
+    return store_dataset({**body,"candles":candles},"binance_public",current["id"])
 
 
 @app.get("/api/market/symbols")
@@ -607,7 +631,7 @@ def experiments(current=Depends(admin)):
     return list_experiments()
 
 
-def enqueue_experiment(body, *, persist=True, rules_snapshot=None):
+def enqueue_experiment(body, *, persist=True, rules_snapshot=None, actor_id=None):
     strategy=strategy_row(body.get("strategy_id",""))
     manifest=db.parse(strategy["manifest"],{})
     params=validate_config(manifest,body.get("parameters",body.get("params",{})),body.get("symbols",["BTCUSDT"]),body.get("market",manifest.get("market","futures")))
@@ -625,7 +649,7 @@ def enqueue_experiment(body, *, persist=True, rules_snapshot=None):
     ranges=[timestamp(body.get(k)) for k in ("train_start","train_end","validation_start","validation_end")]
     if not ranges[0]<ranges[1]<=ranges[2]<ranges[3]:
         raise HTTPException(422,"训练集和验证集必须按时间顺序分离，区间采用 [开始,结束) 且不可重叠")
-    dataset_candles=db.parse(dataset["candles"],{})
+    dataset_candles=storage.read_candles(dataset["candles"], symbols=symbols, start=ranges[0], end=ranges[3])
     for symbol in symbols:
         times=[timestamp(c["timestamp"]) for c in dataset_candles[symbol]]
         for start,end in (ranges[:2],ranges[2:]):
@@ -669,16 +693,21 @@ def enqueue_experiment(body, *, persist=True, rules_snapshot=None):
     config.update(parameters=params,symbols=symbols,initial_capital=capital,fee_rate=fee,slippage_bps=slip,seed=seed,market=manifest.get("market","futures"),leverage=int(leverage),ranges_ms=ranges,symbol_filters=filters)
     provenance={"strategy_version":manifest.get("version"),"strategy_hash":strategy["source_hash"],"parameters_hash":hashlib.sha256(db.dump(params).encode()).hexdigest(),"data_version":dataset["id"],"data_hash":dataset["sha256"],"engine_version":db.ENGINE_VERSION,"fee_model":{"taker_rate":fee,"source":"manual"},"slippage_model":{"bps":slip,"type":"fixed_adverse"},"seed":seed,"intervals":dict(zip(("train_start","train_end","validation_start","validation_end"),ranges)),"environment":{"python":platform.python_version(),"platform":platform.system()},"source":"synthetic" if dataset["source"]=="synthetic" else "historical"}
     provenance["symbol_filters"]={"source":filters_source,"rules":filters}
-    prepared={"id":db.uid(),"name":str(body.get("name") or manifest.get("name","策略")+" · 参数实验"),"strategy_id":strategy["id"],"dataset_id":dataset["id"],"config":config,"provenance":provenance}
+    prepared={"id":db.uid(),"name":str(body.get("name") or manifest.get("name","策略")+" · 参数实验"),"strategy_id":strategy["id"],"dataset_id":dataset["id"],"config":config,"provenance":provenance,"strategy_snapshot":strategy}
     if not persist:
         return prepared
-    return store_experiments([prepared])[0]
+    return store_experiments([prepared],actor_id=actor_id)[0]
 
 
-def store_experiments(items):
+def store_experiments(items,actor_id=None):
     with db.connect() as con:
         for item in items:
+            snapshot=item["strategy_snapshot"]
+            version_id=db.pin_strategy_version(con,item["strategy_id"],db.parse(snapshot["manifest"],{}),snapshot["source"],snapshot["source_hash"])
+            item["config"]["strategy_version_id"]=version_id
+            item["provenance"]["strategy_version_id"]=version_id
             con.execute("INSERT INTO experiments(id,name,strategy_id,dataset_id,status,config,provenance,created_at) VALUES(?,?,?,?,?,?,?,?)",(item["id"],item["name"],item["strategy_id"],item["dataset_id"],"queued",db.dump(item["config"]),db.dump(item["provenance"]),db.now()))
+            db.audit(con,actor_id,"experiment.enqueue","experiment",item["id"],{"strategy_version_id":version_id,"data_hash":item["provenance"]["data_hash"],"parameters_hash":item["provenance"]["parameters_hash"]})
     return [{"id":item["id"],"status":"queued","provenance":item["provenance"]} for item in items]
 
 
@@ -686,7 +715,7 @@ def store_experiments(items):
 def create_experiment(body:dict,current=Depends(admin)):
     grid=body.get("parameter_grid")
     if not grid:
-        return enqueue_experiment(body)
+        return enqueue_experiment(body,actor_id=current["id"])
     if not isinstance(grid,dict) or not all(isinstance(v,list) and v for v in grid.values()):
         raise HTTPException(422,"批量参数格式为参数名到候选值列表")
     total=math.prod(len(v) for v in grid.values())
@@ -698,7 +727,7 @@ def create_experiment(body:dict,current=Depends(admin)):
         item=enqueue_experiment({**body,"parameters":{**body.get("parameters",{}),**dict(zip(grid,values))},"name":f"{body.get('name','批量实验')} #{i+1}"},persist=False,rules_snapshot=rules)
         prepared.append(item)
         rules=(item["config"]["symbol_filters"],item["provenance"]["symbol_filters"]["source"])
-    return {"experiments":store_experiments(prepared)}
+    return {"experiments":store_experiments(prepared,actor_id=current["id"])}
 
 
 @app.get("/api/experiments/{experiment_id}")
@@ -713,12 +742,13 @@ def experiment_detail(experiment_id:str,current=Depends(admin)):
 @app.post("/api/experiments/{experiment_id}/cancel")
 def cancel_experiment(experiment_id:str,current=Depends(admin)):
     with db.connect() as con:
-        row=con.execute("SELECT status FROM experiments WHERE id=?",(experiment_id,)).fetchone()
+        row=con.execute("SELECT status FROM experiments WHERE id=? FOR UPDATE",(experiment_id,)).fetchone()
         if not row:
             raise HTTPException(404,"实验不存在")
         if row["status"] not in {"queued","running"}:
             raise HTTPException(409,"该实验已结束")
         con.execute("UPDATE experiments SET cancel_requested=1,status=CASE WHEN status='queued' THEN 'cancelled' ELSE status END WHERE id=?",(experiment_id,))
+        db.audit(con,current["id"],"experiment.cancel","experiment",experiment_id,{})
     return {"id":experiment_id,"cancel_requested":True}
 
 
@@ -728,7 +758,7 @@ def retry_experiment(experiment_id:str,current=Depends(admin)):
         row=con.execute("SELECT config FROM experiments WHERE id=?",(experiment_id,)).fetchone()
     if not row:
         raise HTTPException(404,"实验不存在")
-    return enqueue_experiment(db.parse(row["config"],{}))
+    return enqueue_experiment(db.parse(row["config"],{}),actor_id=current["id"])
 
 
 @app.get("/api/experiments/{experiment_id}/export")

@@ -1,12 +1,11 @@
 import hashlib
 import hmac
 import json
-import tempfile
 import unittest
-from pathlib import Path
+import pytest
 from urllib.parse import parse_qs, urlsplit
 
-from backend.binance import BinanceClient, BinanceError, OrderUncertain, SQLiteOrderJournal, floor_step
+from backend.binance import BinanceClient, BinanceError, OrderUncertain, MySQLOrderJournal, floor_step
 
 
 MANIFEST = {
@@ -67,6 +66,7 @@ class FakeExchange:
                              sleep=self.sleep, clock=lambda: self.now, max_retries=1, **kwargs)
 
 
+@pytest.mark.usefixtures("mysql_database")
 class BinanceTests(unittest.TestCase):
     def test_decimal_filters_use_step_not_display_precision(self):
         self.assertEqual(floor_step("1.29999999", "0.05"), "1.25")
@@ -162,10 +162,10 @@ class BinanceTests(unittest.TestCase):
             exchange.client().submit_order("BTCUSDT", "BUY", "0.01", client_order_id="mk_first")
         self.assertEqual(exchange.calls, [])
 
-    def live_client(self, exchange, directory):
+    def live_client(self, exchange):
         client = exchange.client()
         self.assertTrue(client.inspect_account(MANIFEST, ["BTCUSDT"])["ok"])
-        client.configure_live(enabled=True, journal=SQLiteOrderJournal(Path(directory) / "orders.sqlite"), execution_guard=lambda: True)
+        client.configure_live(enabled=True, journal=MySQLOrderJournal(), execution_guard=lambda: True)
         return client
 
     def submit(self, client, exchange, **kwargs):
@@ -174,12 +174,11 @@ class BinanceTests(unittest.TestCase):
     def test_timeout_reconciles_once_by_id_without_second_post(self):
         exchange = FakeExchange()
         exchange.routes["/fapi/v1/order"] = lambda method, params: TimeoutError() if method == "POST" else {"orderId": 42, "status": "FILLED", "clientOrderId": "mk_first"}
-        with tempfile.TemporaryDirectory() as directory:
-            client = self.live_client(exchange, directory)
-            result = self.submit(client, exchange)
-            self.assertEqual(result["orderId"], 42)
-            restarted = self.live_client(exchange, directory)
-            self.assertEqual(self.submit(restarted, exchange)["orderId"], 42)
+        client = self.live_client(exchange)
+        result = self.submit(client, exchange)
+        self.assertEqual(result["orderId"], 42)
+        restarted = self.live_client(exchange)
+        self.assertEqual(self.submit(restarted, exchange)["orderId"], 42)
         posts = [c for c in exchange.calls if c[0] == "POST"]
         self.assertEqual(len(posts), 1)
         queries = [c for c in exchange.calls if c[1] == "/fapi/v1/order" and c[0] == "GET"]
@@ -188,30 +187,27 @@ class BinanceTests(unittest.TestCase):
     def test_not_found_after_timeout_remains_unknown_across_restart(self):
         exchange = FakeExchange()
         exchange.routes["/fapi/v1/order"] = lambda method, params: TimeoutError() if method == "POST" else (400, {}, {"code": -2013})
-        with tempfile.TemporaryDirectory() as directory:
-            client = self.live_client(exchange, directory)
-            with self.assertRaises(OrderUncertain):
-                self.submit(client, exchange)
-            restarted = self.live_client(exchange, directory)
-            with self.assertRaises(OrderUncertain):
-                self.submit(restarted, exchange)
+        client = self.live_client(exchange)
+        with self.assertRaises(OrderUncertain):
+            self.submit(client, exchange)
+        restarted = self.live_client(exchange)
+        with self.assertRaises(OrderUncertain):
+            self.submit(restarted, exchange)
         self.assertEqual(len([c for c in exchange.calls if c[0] == "POST"]), 1)
 
     def test_same_intent_id_cannot_change_quantity(self):
-        with tempfile.TemporaryDirectory() as directory:
-            journal = SQLiteOrderJournal(Path(directory) / "orders.sqlite")
-            self.assertTrue(journal.claim("account", "mk_one", {"quantity": "1"})[0])
-            self.assertFalse(journal.claim("account", "mk_one", {"quantity": "1"})[0])
-            with self.assertRaises(BinanceError):
-                journal.claim("account", "mk_one", {"quantity": "2"})
+        journal = MySQLOrderJournal()
+        self.assertTrue(journal.claim("account", "mk_one", {"quantity": "1"})[0])
+        self.assertFalse(journal.claim("account", "mk_one", {"quantity": "1"})[0])
+        with self.assertRaises(BinanceError):
+            journal.claim("account", "mk_one", {"quantity": "2"})
 
     def test_fencing_guard_prevents_submission(self):
         exchange = FakeExchange()
-        with tempfile.TemporaryDirectory() as directory:
-            client = self.live_client(exchange, directory)
-            client._execution_guard = lambda: False
-            with self.assertRaises(BinanceError):
-                self.submit(client, exchange)
+        client = self.live_client(exchange)
+        client._execution_guard = lambda: False
+        with self.assertRaises(BinanceError):
+            self.submit(client, exchange)
         self.assertFalse(any(c[0] == "POST" for c in exchange.calls))
 
     def test_missing_strategy_contract_fails_without_network(self):

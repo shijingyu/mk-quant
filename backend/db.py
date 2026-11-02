@@ -1,16 +1,25 @@
-"""SQLite WAL control store. No runtime state lives exclusively in memory."""
+"""MySQL / InnoDB control store shared by development, tests and production.
+
+All connections use UTC, strict SQL mode and READ COMMITTED. No in-memory or
+file-database fallback is provided: missing MySQL configuration fails closed.
+"""
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from decimal import Decimal
 import hashlib
 import json
 import math
 import os
-from pathlib import Path
+import re
 import secrets
-import sqlite3
 import time
 
-ENGINE_VERSION = "1.0.0"
+import pymysql
+from pymysql.err import IntegrityError
+from .schema import SCHEMA, TABLES
+
+ENGINE_VERSION = "1.1.0"
+SQL_MODE = "STRICT_ALL_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ZERO_DATE,NO_ZERO_IN_DATE,NO_ENGINE_SUBSTITUTION"
 
 
 def now():
@@ -29,52 +38,188 @@ def parse(value, fallback=None):
     return json.loads(value) if value else fallback
 
 
+class Row(dict):
+    """Mapping rows, with positional reads retained for COUNT and scalar queries."""
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return tuple(self.values())[key]
+        return super().__getitem__(key)
+
+
+class Cursor:
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    @property
+    def rowcount(self):
+        return self._cursor.rowcount
+
+    @property
+    def lastrowid(self):
+        return self._cursor.lastrowid
+
+    def fetchone(self):
+        row = self._cursor.fetchone()
+        return Row(row) if row is not None else None
+
+    def fetchall(self):
+        return [Row(row) for row in self._cursor.fetchall()]
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+
+def _sql(query):
+    # Translate parameter markers, not values. Quote legacy column names which
+    # are MySQL keywords, without rewriting strings, comments or quoted names.
+    parts = re.split(r"('(?:''|\\.|[^'])*'|\"(?:\"\"|\\.|[^\"])*\"|`[^`]*`)", query)
+    for index in range(0, len(parts), 2):
+        parts[index] = re.sub(r"\b(interval|reference)\b", lambda m: "`" + m.group(0) + "`", parts[index], flags=re.I)
+        parts[index] = parts[index].replace("?", "%s")
+    return "".join(parts)
+
+
+class Connection:
+    def __init__(self, raw):
+        self.raw = raw
+        self._cursors = []
+
+    def execute(self, query, params=None):
+        cursor = self.raw.cursor()
+        self._cursors.append(cursor)
+        cursor.execute(_sql(query), params)
+        return Cursor(cursor)
+
+    def executemany(self, query, rows):
+        cursor = self.raw.cursor()
+        self._cursors.append(cursor)
+        cursor.executemany(_sql(query), rows)
+        return Cursor(cursor)
+
+    def commit(self):
+        self.raw.commit()
+
+    def rollback(self):
+        self.raw.rollback()
+
+    def close(self):
+        for cursor in self._cursors:
+            try:
+                cursor.close()
+            except pymysql.Error:
+                pass
+        try:
+            self.raw.close()
+        except pymysql.Error:
+            pass
+
+
+def settings():
+    required = ("MK_DB_HOST", "MK_DB_USER", "MK_DB_PASSWORD", "MK_DB_NAME")
+    missing = [key for key in required if not os.environ.get(key)]
+    if missing:
+        raise RuntimeError("必须配置 MySQL 环境变量：" + ", ".join(missing))
+    name = os.environ["MK_DB_NAME"]
+    if not re.fullmatch(r"[a-zA-Z0-9_]{1,64}", name):
+        raise ValueError("MK_DB_NAME 只能包含字母、数字和下划线")
+    host = os.environ["MK_DB_HOST"]
+    loopback = host in {"127.0.0.1", "localhost", "::1"}
+    mode = os.getenv("MK_DB_SSL_MODE", "disabled" if loopback else "verify_identity")
+    if mode == "disabled":
+        # Loopback and SSH forwarding already keep this hop local. Operators
+        # can explicitly select this for a private container network too.
+        tls = {"ssl_disabled": True}
+    elif mode == "verify_identity":
+        ca = os.environ.get("MK_DB_SSL_CA")
+        if not ca:
+            raise RuntimeError("非本机 MySQL 连接须配置 MK_DB_SSL_CA 并验证服务器身份；私有容器网络可显式设置 MK_DB_SSL_MODE=disabled")
+        tls = {"ssl_disabled": False, "ssl_ca": ca, "ssl_verify_cert": True, "ssl_verify_identity": True}
+    else:
+        raise ValueError("MK_DB_SSL_MODE 必须是 disabled 或 verify_identity")
+    return dict(host=host, port=int(os.getenv("MK_DB_PORT", "3306")),
+                user=os.environ["MK_DB_USER"], password=os.environ["MK_DB_PASSWORD"], database=name,
+                charset="utf8mb4", cursorclass=pymysql.cursors.DictCursor,
+                autocommit=False, connect_timeout=10, read_timeout=30, write_timeout=30, **tls)
+
+
 @contextmanager
 def connect():
-    path = Path(os.environ.get("MK_DB_PATH", "data/mk.sqlite3"))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(str(path), timeout=15)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA foreign_keys=ON")
-    con.execute("PRAGMA journal_mode=WAL")
-    con.execute("PRAGMA busy_timeout=15000")
+    raw = pymysql.connect(**settings())
+    con = Connection(raw)
     try:
+        con.execute("SET SESSION time_zone = '+00:00'")
+        con.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        con.execute("SET SESSION sql_mode = ?", (SQL_MODE,))
         yield con
         con.commit()
-    except Exception:
-        con.rollback()
+    except BaseException:
+        try:
+            con.rollback()
+        except pymysql.Error:
+            # Lost-connection rollback must not hide the original failure.
+            pass
         raise
     finally:
         con.close()
 
 
-def init_db():
+def init_schema():
     with connect() as con:
-        con.executescript("""
-        CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,username TEXT UNIQUE NOT NULL,name TEXT NOT NULL,phone TEXT,password TEXT NOT NULL,role TEXT NOT NULL CHECK(role IN ('admin','client')),created_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id),csrf TEXT NOT NULL,expires REAL NOT NULL);
-        CREATE TABLE IF NOT EXISTS accounts(id TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES users(id),name TEXT NOT NULL,mode TEXT NOT NULL CHECK(mode IN ('paper','live')),route TEXT UNIQUE NOT NULL,strategy_id TEXT NOT NULL,config TEXT NOT NULL,symbols TEXT NOT NULL,initial_equity REAL NOT NULL,metrics TEXT NOT NULL,credentials TEXT,external_uid TEXT,check_result TEXT,source TEXT NOT NULL DEFAULT 'local',created_at TEXT NOT NULL);
-        CREATE UNIQUE INDEX IF NOT EXISTS actual_account_once ON accounts(external_uid) WHERE external_uid IS NOT NULL;
-        CREATE TABLE IF NOT EXISTS instances(account_id TEXT PRIMARY KEY REFERENCES accounts(id),desired_state TEXT NOT NULL DEFAULT 'stopped',observed_state TEXT NOT NULL DEFAULT 'stopped',owner TEXT,fence INTEGER NOT NULL DEFAULT 0,lease_until REAL NOT NULL DEFAULT 0,last_heartbeat TEXT,error TEXT,config_revision INTEGER NOT NULL DEFAULT 1);
-        CREATE TABLE IF NOT EXISTS commands(id TEXT PRIMARY KEY,account_id TEXT NOT NULL REFERENCES accounts(id),action TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',requested_by TEXT NOT NULL REFERENCES users(id),created_at TEXT NOT NULL,completed_at TEXT,error TEXT,result TEXT);
-        CREATE TABLE IF NOT EXISTS strategies(id TEXT PRIMARY KEY,manifest TEXT NOT NULL,source TEXT NOT NULL,source_hash TEXT NOT NULL,trusted INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS datasets(id TEXT PRIMARY KEY,name TEXT NOT NULL,market TEXT NOT NULL,interval TEXT NOT NULL,symbols TEXT NOT NULL,candles TEXT NOT NULL,sha256 TEXT NOT NULL,source TEXT NOT NULL,created_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS experiments(id TEXT PRIMARY KEY,name TEXT NOT NULL,strategy_id TEXT NOT NULL,dataset_id TEXT NOT NULL,status TEXT NOT NULL,progress REAL NOT NULL DEFAULT 0,config TEXT NOT NULL,provenance TEXT NOT NULL,result TEXT,error TEXT,cancel_requested INTEGER NOT NULL DEFAULT 0,worker_pid INTEGER,created_at TEXT NOT NULL,started_at TEXT,completed_at TEXT);
-        CREATE TABLE IF NOT EXISTS presets(id TEXT PRIMARY KEY,strategy_id TEXT NOT NULL,name TEXT NOT NULL,parameters TEXT NOT NULL,created_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS logs(id INTEGER PRIMARY KEY AUTOINCREMENT,level TEXT NOT NULL,strategy_id TEXT,account_id TEXT,message TEXT NOT NULL,details TEXT,source TEXT NOT NULL DEFAULT 'system',created_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS ledger(id TEXT PRIMARY KEY,account_id TEXT NOT NULL REFERENCES accounts(id),kind TEXT NOT NULL,reference TEXT UNIQUE,payload TEXT NOT NULL,created_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS runtime_events(id INTEGER PRIMARY KEY AUTOINCREMENT,account_id TEXT NOT NULL,fence INTEGER NOT NULL,event TEXT NOT NULL,payload TEXT NOT NULL,created_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS services(name TEXT PRIMARY KEY,owner TEXT NOT NULL,heartbeat TEXT NOT NULL,status TEXT NOT NULL);
-        """)
-    try:
-        from .strategy import builtin_strategies
-        with connect() as con:
-            for item in builtin_strategies():
-                manifest = {k: v for k, v in item.items() if k != "source"}
-                source = item["source"]
-                con.execute("INSERT OR IGNORE INTO strategies VALUES(?,?,?,?,1,?)", (item["id"], dump(manifest), source, hashlib.sha256(source.encode()).hexdigest(), now()))
-    except ImportError:
-        pass
+        for statement in SCHEMA:
+            con.execute(statement)
+        con.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?) ON DUPLICATE KEY UPDATE version=VALUES(version)", ("mysql-001", now()))
+
+
+def init_db():
+    init_schema()
+    from .strategy import builtin_strategies
+    with connect() as con:
+        for item in builtin_strategies():
+            manifest = {k: v for k, v in item.items() if k != "source"}
+            source = item["source"]
+            con.execute("INSERT INTO strategies VALUES(?,?,?,?,1,?) ON DUPLICATE KEY UPDATE id=VALUES(id)",
+                        (item["id"], dump(manifest), source, hashlib.sha256(source.encode()).hexdigest(), now()))
+            saved = con.execute("SELECT * FROM strategies WHERE id=?", (item["id"],)).fetchone()
+            pin_strategy_version(con, saved["id"], parse(saved["manifest"]), saved["source"], saved["source_hash"])
+
+
+def pin_strategy_version(con, strategy_id, manifest, source, source_hash):
+    actual_hash = hashlib.sha256(source.encode()).hexdigest()
+    if actual_hash != source_hash:
+        raise ValueError("策略源码与版本哈希不一致")
+    version_id = hashlib.sha256((strategy_id + ":" + source_hash).encode()).hexdigest()
+    encoded = dump(manifest)
+    con.execute("INSERT INTO strategy_versions(id,strategy_id,version,manifest,source,source_hash,created_at) VALUES(?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE id=VALUES(id)",
+                (version_id, strategy_id, str(manifest.get("version", "")), encoded, source, source_hash, now()))
+    saved = con.execute("SELECT manifest,source FROM strategy_versions WHERE id=?", (version_id,)).fetchone()
+    if saved["source"] != source or parse(saved["manifest"]) != manifest:
+        raise ValueError("同一策略版本不可覆盖，必须保存为新版本")
+    return version_id
+
+
+def audit(con, actor_id, action, resource_type, resource_id, payload):
+    return con.execute("INSERT INTO audit_records(actor_id,action,resource_type,resource_id,payload,created_at) VALUES(?,?,?,?,?,?)",
+                       (actor_id, action, resource_type, resource_id, dump(payload or {}), now())).lastrowid
+
+
+def persist_fill(con, account_id, order, created_at=None):
+    """Store each paper fill and its order atomically with the account ledger.
+
+    IDs are account-scoped and deterministic, making historical backfill and
+    recovery idempotent. The original exchange/engine record remains intact.
+    """
+    at = created_at or now()
+    original_id = str(order["id"])
+    identity = hashlib.sha256((account_id + ":" + original_id).encode()).hexdigest()
+    encoded = dump(order)
+    con.execute("INSERT INTO orders(id,account_id,external_id,client_order_id,symbol,side,status,payload,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE id=VALUES(id)",
+                (identity, account_id, str(order.get("orderId", original_id)), str(order.get("clientOrderId", original_id)), order["symbol"], order["side"], order.get("status", "filled"), encoded, at, at))
+    saved = con.execute("SELECT payload FROM orders WHERE id=?", (identity,)).fetchone()
+    if parse(saved["payload"]) != order:
+        raise ValueError("订单 ID 与已持久化的成交不一致")
+    con.execute("INSERT INTO fills(id,account_id,order_id,external_id,symbol,quantity,price,fee,realized_pnl,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE id=VALUES(id)",
+                (identity, account_id, identity, str(order.get("tradeId", original_id)), order["symbol"], Decimal(str(order["quantity"])), Decimal(str(order["price"])), Decimal(str(order.get("fee", 0))), Decimal(str(order.get("realized_pnl", 0))), encoded, at))
+    return identity
 
 
 def log(level, message, *, strategy_id=None, account_id=None, details=None, source="system"):
@@ -82,15 +227,19 @@ def log(level, message, *, strategy_id=None, account_id=None, details=None, sour
         con.execute("INSERT INTO logs(level,strategy_id,account_id,message,details,source,created_at) VALUES(?,?,?,?,?,?,?)", (level,strategy_id,account_id,message,dump(details) if details else None,source,now()))
 
 
+def lock_instance(con, account_id):
+    return con.execute("SELECT * FROM instances WHERE account_id=? FOR UPDATE", (account_id,)).fetchone()
+
+
 def acquire_lease(account_id, owner, ttl=30):
-    """BEGIN IMMEDIATE serializes ownership; monotonically increasing fence invalidates predecessors."""
+    """InnoDB row lock serializes owners; expired leases advance the fencing token."""
     with connect() as con:
-        con.execute("BEGIN IMMEDIATE")
-        row = con.execute("SELECT * FROM instances WHERE account_id=?", (account_id,)).fetchone()
-        if not row or (row["lease_until"] > time.time() and row["owner"] != owner):
+        row = lock_instance(con, account_id)
+        instant = time.time()
+        if not row or (row["lease_until"] > instant and row["owner"] != owner):
             return None
-        fence = row["fence"] + (row["owner"] != owner or row["lease_until"] <= time.time())
-        con.execute("UPDATE instances SET owner=?,fence=?,lease_until=?,last_heartbeat=? WHERE account_id=?", (owner,fence,time.time()+ttl,now(),account_id))
+        fence = row["fence"] + int(row["owner"] != owner or row["lease_until"] <= instant)
+        con.execute("UPDATE instances SET owner=?,fence=?,lease_until=?,last_heartbeat=? WHERE account_id=?", (owner,fence,instant+ttl,now(),account_id))
         return fence
 
 
@@ -103,6 +252,7 @@ def execution_authorized(account_id, owner, fence, *, opening=False):
 def seed_demo():
     """Opt-in synthetic fixtures. They never represent exchange balances or executed trades."""
     from .security import hash_password
+    from .storage import write_candles, store_result
     init_db()
     with connect() as con:
         if con.execute("SELECT id FROM users WHERE username='admin'").fetchone():
@@ -144,7 +294,7 @@ def seed_demo():
                 previous=close
             candles[symbol]=rows
         serialized=dump(candles)
-        con.execute("INSERT INTO datasets VALUES(?,?,?,?,?,?,?,?,?)", ("demo-30m","演示行情 · BTC / ETH / SOL","futures","30m",dump(list(candles)),serialized,hashlib.sha256(serialized.encode()).hexdigest(),"synthetic",now()))
+        con.execute("INSERT INTO datasets VALUES(?,?,?,?,?,?,?,?,?)", ("demo-30m","演示行情 · BTC / ETH / SOL","futures","30m",dump(list(candles)),dump(write_candles(candles)),hashlib.sha256(serialized.encode()).hexdigest(),"synthetic",now()))
         for i in range(3):
             strat=strategies[0]
             config={"strategy_id":strat["id"],"parameters":{},"symbols":["BTCUSDT"],"market":"futures","initial_capital":10000,"fee_rate":.0004,"slippage_bps":2,"train_start":"2026-09-01","train_end":"2026-09-30","validation_start":"2026-10-01","validation_end":"2026-10-30","dataset_id":"demo-30m","seed":42}
@@ -153,7 +303,7 @@ def seed_demo():
             validation={**metrics,"total_return_pct":11.27-i*2,"max_drawdown_pct":6.12+i*.4,"profit_factor":1.59-i*.1,"sharpe":1.41-i*.12,"final_equity":11127-i*200}
             result={"metrics":metrics,"validation_metrics":validation,"curve":curve,"validation_curve":[{**p,"equity":round(10000+(p["equity"]-10000)*.72,2),"timestamp":p["timestamp"]+30*86400000} for p in curve],"orders":[],"decisions":[],"illustrative":True}
             provenance={"strategy_version":parse(strat["manifest"],{}).get("version","1.0.0"),"strategy_hash":strat["source_hash"],"data_hash":hashlib.sha256(serialized.encode()).hexdigest(),"engine_version":ENGINE_VERSION,"seed":42,"source":"demo","environment":"illustrative fixture"}
-            con.execute("INSERT INTO experiments(id,name,strategy_id,dataset_id,status,progress,config,provenance,result,created_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (f"demo-exp-{i+1}",f"趋势参数实验 #{i+1}",strat["id"],"demo-30m","completed",100,dump(config),dump(provenance),dump(result),now(),now()))
+            con.execute("INSERT INTO experiments(id,name,strategy_id,dataset_id,status,progress,config,provenance,result,created_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (f"demo-exp-{i+1}",f"趋势参数实验 #{i+1}",strat["id"],"demo-30m","completed",100,dump(config),dump(provenance),dump(store_result(result)),now(),now()))
         for level,message in [("debug","演示数据已载入：收益与订单均为示例，不代表实际交易"),("debug","控制服务启动；等待独立运行进程连接"),("error","实盘执行闸门关闭，禁止提交交易所订单"),("debug","策略接入协议已加载，上传策略将执行静态契约检查")]:
             con.execute("INSERT INTO logs(level,message,source,created_at) VALUES(?,?,?,?)", (level,message,"demo",now()))
     return True

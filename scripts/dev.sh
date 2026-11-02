@@ -8,7 +8,12 @@ if [ ! -x "$MK_PYTHON" ]; then
   exit 1
 fi
 export MK_DEMO="${MK_DEMO:-1}"
-export MK_DB_PATH="${MK_DB_PATH:-data/mk.sqlite3}"
+# All environments use MySQL; fail before starting partial service groups.
+: "${MK_DB_HOST:?Set MK_DB_HOST}"
+: "${MK_DB_NAME:?Set MK_DB_NAME to a dedicated development database}"
+: "${MK_DB_USER:?Set MK_DB_USER}"
+: "${MK_DB_PASSWORD:?Set MK_DB_PASSWORD}"
+export MK_ARTIFACT_ROOT="${MK_ARTIFACT_ROOT:-artifacts}"
 if [ "$MK_DEMO" = "1" ]; then
   if [ -n "${MK_DEMO_PASSWORD:-}" ]; then
     "$MK_PYTHON" -m backend.worker init-demo

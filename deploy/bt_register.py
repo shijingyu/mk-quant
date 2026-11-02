@@ -27,6 +27,22 @@ import resource
 import sys
 base=Path(__file__).resolve().parents[2]
 role=Path(__file__).resolve().parent.name
+# BaoTa may cache environment values at registration. Read the private role
+# file on every process start so configuration changes actually take effect.
+for line in (base/"config"/(role+".env")).read_text().splitlines():
+    line=line.strip()
+    if not line or line.startswith("#"):
+        continue
+    if line.startswith("export "):
+        line=line[7:].strip()
+    key,separator,value=line.partition("=")
+    if not separator or not key.strip().isidentifier():
+        raise RuntimeError("Invalid role environment configuration")
+    value=value.strip()
+    if len(value)>1 and value[0]==value[-1] and value[0] in (chr(34),chr(39)):
+        value=value[1:-1]
+    os.environ[key.strip()]=value
+os.environ.pop("MK_DB_PATH",None)
 os.chdir(str(base))
 os.environ["PYTHONPATH"]=str(base)
 os.environ["MK_ENABLE_LIVE"]="0"
@@ -38,7 +54,7 @@ if hasattr(os,"sched_getaffinity"):
         os.sched_setaffinity(0,{available[-1] if role=="backtest" else available[0]})
 if role=="backtest":
     os.nice(10)
-    ceiling=512*1024*1024
+    ceiling=int(os.getenv("MK_BACKTEST_ADDRESS_SPACE_MB","2048"))*1024*1024
     resource.setrlimit(resource.RLIMIT_AS,(ceiling,ceiling))
 if role!="api":
     os.environ.pop("MK_MASTER_KEY",None)

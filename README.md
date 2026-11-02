@@ -23,6 +23,11 @@ MK Quant 是面向 Binance USDT / USDC 现货与 U 本位永续的量化研究�
 
 ## 快速开始
 
+平台核心数据库仅使用 **MySQL / InnoDB**。开发、集成验证与生产共用同一套 schema、严格 SQL 模式、UTC 会话时区和 READ COMMITTED 事务隔离；没有文件数据库或内存数据库回退。当前部署与集成验证使用 MySQL 5.7.44。
+
+先准备独立的开发数据库和仅有该库权限的用户，设置 `MK_DB_HOST`、`MK_DB_PORT`、`MK_DB_NAME`、`MK_DB_USER`、`MK_DB_PASSWORD`，以及可写的 `MK_ARTIFACT_ROOT`。可以使用已有 MySQL，也可设置私有 `MK_DB_PASSWORD` / `MK_DB_ROOT_PASSWORD` 后运行 `docker compose -f compose.database.yaml up -d`：开发库为本机 3307 的 `mk_quant_dev`，集成库为 3308 的 `mk_quant_test`，两者使用独立用户和卷。完整步骤见 [数据库与文件存储](docs/DATABASE.md)。
+
+
 准备 Python 3.11、Node.js 22 和 npm。在项目根目录执行：
 
 ```bash
@@ -48,7 +53,9 @@ npm ci --prefix frontend
 
 ```bash
 export MK_DEMO=0
-export MK_DB_PATH=data/local.sqlite3
+export MK_DB_NAME=mk_quant_dev
+export MK_DB_USER=mk_quant_dev
+# 其余连接变量由本机私有环境提供
 .venv/bin/python -m backend.worker create-admin
 ./scripts/dev.sh
 ```
@@ -88,7 +95,12 @@ flowchart TB
 
 | 环境变量 | 用途 |
 | --- | --- |
-| `MK_DB_PATH` | SQLite 文件，默认 `data/mk.sqlite3`；各服务必须使用同一文件。 |
+| `MK_DB_HOST` / `MK_DB_PORT` | MySQL 地址与端口，端口默认 3306；应用数据库不直接暴露公网。 |
+| `MK_DB_NAME` / `MK_DB_USER` / `MK_DB_PASSWORD` | 按环境隔离的业务库与专用用户，缺少配置直接失败。 |
+| `MK_DB_SSL_CA` | 非回环远程数据库的可信 CA，校验证书与服务器身份；SSH 隧道及回环连接由本机边界保护。 |
+| `MK_ARTIFACT_ROOT` | 独立 Parquet 文件根目录，三个服务共享；禁止作为公网静态目录。 |
+| `MK_TEST_ALLOW_RESET` | 仅专用 `_test` 库设置 `1`，允许集成测试清理测试表。 |
+| `MK_BACKTEST_ADDRESS_SPACE_MB` | 回测子进程虚拟地址上限，默认 2048 MB；不等于物理内存配额。 |
 | `MK_DEMO` | `1` 启用合成演示数据；公网部署使用 `0`。 |
 | `MK_DEMO_PASSWORD` | 仅供新演示数据库初始化的自定义密码；可由初始化命令生成，不设固定默认值。 |
 | `MK_MASTER_KEY` | Fernet 主密钥，录入实盘凭据时需要；独立保存和备份，不能写入策略或源码。 |
@@ -97,7 +109,9 @@ flowchart TB
 | `MK_ENABLE_LIVE` | 保持 `0`；当前应用仍阻断正式实盘启动。 |
 | `MK_ACCOUNT_MEMORY_MB` | Linux 单账户进程地址空间上限，默认 384 MB。 |
 
-SQLite WAL 只适用于单台宿主机的本地文件系统，不应放入 NFS、跨主机共享目录或云同步目录运行正式服务。账户、命令、订单、账本、实验及日志持久化；备份应使用 SQLite 在线备份接口，不能只复制正在写入的主文件而遗漏 WAL。
+用户、账户、不可变策略版本、运行实例、控制命令、交易订单、成交、资金账本和审计记录统一保存在 MySQL，所有业务表显式使用 InnoDB。唯一索引、外键、行锁和事务维护账户唯一执行者及成交写入一致性。
+
+历史 K 线、回测完整曲线、订单与决策明细使用不可变 Parquet 文件，MySQL 保存内容版本、文件校验值和统计摘要。文件完成写入并持久化后才提交数据库引用；文件缺失或校验错误会明确失败。大曲线在列表/运行视图使用保留分桶极值的预览，最终统计与导出仍读取完整数据。备份使用 `deploy/backup.py`，同时包含 InnoDB 一致性 SQL 快照和独立文件；不能只备份其中一侧。
 
 行情时间以 Unix 时间戳存储，K 线和研究区间在界面使用北京时间（`Asia/Shanghai`）。每日/月度运行收益当前仍按 UTC 权益基准计算，不能把界面显示时区理解为统计结算时区已经切换。
 
@@ -110,10 +124,17 @@ SQLite WAL 只适用于单台宿主机的本地文件系统，不应放入 NFS�
 
 生产配置、管理员凭据、交易密钥、数据库、日志和备份不属于公开仓库。部署文档中的地址均为占位示例；请在自己的服务器配置真实域名和环境。不要在公网启用演示账户。更新源码时保留数据库与密钥；停止全部编排会停止执行服务，不能与单独重启 API 混淆。
 
+## 界面设计
+
+默认采用石墨侧栏、浅色工作区和深翡翠绿主要操作；保留完整夜间主题。中文使用系统无衬线字体，金融数字使用等宽数字特性而不是代码字形。模拟/实盘页共享资产概览、账户行操作和近期操作组件；回测工作台在桌面采用左配置右结果布局，手机顺序堆叠；策略卡片采用紧凑属性网格。真实零值使用中性色，缺失值与过期状态单独标记。详细规则与视口验收见 [界面设计系统](docs/DESIGN_SYSTEM.md)。
+
 ## 验证与目录
 
 ```bash
+# 指向专用 mk_quant_test 数据库，禁止指向生产库
+export MK_TEST_ALLOW_RESET=1
 .venv/bin/python -m pytest -q
+node --test frontend/src/time.test.js
 npm run build --prefix frontend
 ```
 
@@ -125,6 +146,8 @@ npm run build --prefix frontend
 | `backend/app.py` | 登录、权限、账户、行情和实验控制 API。 |
 | `backend/worker.py` | 回测、行情、账户进程与管理员 CLI。 |
 | `backend/strategy.py` | 策略声明、静态校验、参数和币种协议。 |
+| `backend/schema.py` / `backend/db.py` | MySQL schema、连接规范、行锁、版本、订单/成交及审计。 |
+| `backend/storage.py` | Parquet 版本文件、校验、读取与迁移回填。 |
 | `backend/engine.py` | 历史撮合、模拟账本和指标。 |
 | `backend/binance.py` | Binance 公开/签名 REST、账户检查与默认关闭的订单网关。 |
 | `backend/strategies/` | 可运行的策略示例。 |

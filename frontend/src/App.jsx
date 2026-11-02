@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useMemo, useRef, useId } from "react";
+import { createPortal } from "react-dom";
 import {
   formatBeijing,
   beijingInputToISO,
@@ -80,9 +81,17 @@ const FMT = new Intl.NumberFormat("en-US", {
 const money = (n) =>
   n == null || !Number.isFinite(Number(n)) ? "—" : FMT.format(Number(n));
 const pct = (n) =>
-  n == null ? "—" : `${Number(n) >= 0 ? "+" : ""}${Number(n).toFixed(2)}%`;
+  n == null || !Number.isFinite(Number(n))
+    ? "—"
+    : `${Number(n) > 0 ? "+" : ""}${Number(n).toFixed(2)}%`;
+const valueTone = (value) =>
+  value == null || !Number.isFinite(Number(value)) || Number(value) === 0
+    ? ""
+    : Number(value) > 0
+      ? "positive"
+      : "negative";
 const sum = (rows, key) =>
-  rows.length && rows.every((r) => r[key] == null)
+  rows.length && rows.some((r) => r[key] == null)
     ? null
     : rows.reduce((s, r) => s + (Number(r[key]) || 0), 0);
 const accountProfit = (a) =>
@@ -140,30 +149,22 @@ const stateClass = (s) =>
         ? "amber"
         : "muted";
 const navs = [
+  { group: "总览", items: [["overview", "总览", LayoutDashboard]] },
   {
-    group: "总览",
-    items: [["overview", "总览", LayoutDashboard]],
-  },
-  {
-    group: "策略与数据",
+    group: "研究",
     items: [
       ["datasets", "行情数据", Database],
       ["strategies", "策略管理", Blocks],
-    ],
-  },
-  {
-    group: "研究与验证",
-    items: [
       ["backtest", "回测工作台", FlaskConical],
       ["experiments", "实验记录", GitCompareArrows],
     ],
   },
   {
-    group: "账户与运行",
+    group: "交易运行",
     items: [
-      ["users", "用户管理", Users],
       ["paper", "模拟交易", Wallet],
       ["live", "实盘交易", Radio],
+      ["users", "用户管理", Users],
     ],
   },
   {
@@ -263,7 +264,6 @@ function Heading({ eyebrow, title, desc, children }) {
   return (
     <div className="page-heading">
       <div>
-        <div className="eyebrow">{eyebrow || "MK QUANT / WORKSPACE"}</div>
         <h1>{title}</h1>
         {desc && <p>{desc}</p>}
       </div>
@@ -289,9 +289,20 @@ function Empty({
   );
 }
 function Field({ label, hint, children }) {
+  const required = React.Children.toArray(children).some(
+    (child) => child?.props?.required,
+  );
   return (
     <label className="field">
-      <span>{label}</span>
+      <span>
+        {label}
+        {required && (
+          <span className="required-mark" aria-label="必填">
+            {" "}
+            *
+          </span>
+        )}
+      </span>
       {children}
       {hint && <small>{hint}</small>}
     </label>
@@ -300,6 +311,8 @@ function Field({ label, hint, children }) {
 function Modal({ title, subtitle, onClose, children, wide = false }) {
   useEffect(() => {
     const old = document.activeElement;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
     const handler = (e) => {
       if (e.key === "Escape") onClose();
       if (e.key === "Tab") {
@@ -307,7 +320,7 @@ function Modal({ title, subtitle, onClose, children, wide = false }) {
           ...document.querySelectorAll(
             ".modal button,.modal input,.modal select,.modal textarea",
           ),
-        ].filter((n) => !n.disabled);
+        ].filter((n) => !n.disabled && n.getClientRects().length > 0);
         const first = items[0],
           last = items.at(-1);
         if (e.shiftKey && document.activeElement === first) {
@@ -323,6 +336,7 @@ function Modal({ title, subtitle, onClose, children, wide = false }) {
     document.querySelector(".modal button")?.focus();
     return () => {
       document.removeEventListener("keydown", handler);
+      document.body.style.overflow = previousOverflow;
       old?.focus();
     };
   }, []);
@@ -403,7 +417,7 @@ function Chart({ data = [], height = 270, comparison = false }) {
             dataKey="label"
             axisLine={false}
             tickLine={false}
-            tick={{ fill: "var(--muted)", fontSize: 11 }}
+            tick={{ fill: "var(--muted)", fontSize: 12 }}
             minTickGap={45}
             dy={10}
           />
@@ -411,7 +425,7 @@ function Chart({ data = [], height = 270, comparison = false }) {
             axisLine={false}
             tickLine={false}
             domain={["auto", "auto"]}
-            tick={{ fill: "var(--muted)", fontSize: 11 }}
+            tick={{ fill: "var(--muted)", fontSize: 12 }}
             tickFormatter={(n) =>
               Math.abs(n) >= 1000 ? `${(n / 1000).toFixed(1)}k` : n.toFixed(0)
             }
@@ -427,7 +441,7 @@ function Chart({ data = [], height = 270, comparison = false }) {
               background: "var(--panel)",
               border: "1px solid var(--border)",
               borderRadius: 8,
-              fontSize: 12,
+              fontSize: 13,
               color: "var(--text)",
             }}
             formatter={(v, n) => [
@@ -497,7 +511,7 @@ function Stat({
       </div>
       <div className="stat-number">
         {value}
-        <small>{unit}</small>
+        {value != null && value !== "—" && <small>{unit}</small>}
       </div>
       <div
         className={`stat-sub ${trend === "up" ? "positive" : trend === "down" ? "negative" : ""}`}
@@ -516,11 +530,11 @@ function Stat({
 export default function App() {
   const [theme, setTheme] = useState(() => {
     try {
-      return localStorage.getItem("mk-quant-theme") === "light"
-        ? "light"
-        : "dark";
+      return localStorage.getItem("mk-quant-theme") === "dark"
+        ? "dark"
+        : "light";
     } catch {
-      return "dark";
+      return "light";
     }
   });
   useEffect(() => {
@@ -587,6 +601,9 @@ export default function App() {
     addEventListener("hashchange", fn);
     return () => removeEventListener("hashchange", fn);
   }, []);
+  useEffect(() => {
+    window.scrollTo({ top: 0, left: 0, behavior: "instant" });
+  }, [page]);
   const go = (p) => {
     location.hash = p;
     setPage(p);
@@ -651,6 +668,7 @@ export default function App() {
             : navs
           ).map((g) => (
             <div className="nav-group" key={g.group}>
+              <div className="nav-group-title">{g.group}</div>
               {g.items.map(([id, label, Icon]) => (
                 <button
                   key={id}
@@ -714,21 +732,6 @@ export default function App() {
                 <small>{isClient ? "客户" : "管理员"}</small>
               </span>
             </button>
-            <Btn
-              className="logout-button"
-              icon={LogOut}
-              onClick={async () => {
-                try {
-                  await api("/logout", {});
-                  setData(null);
-                  setModal(null);
-                } catch (e) {
-                  notify(e.message);
-                }
-              }}
-            >
-              退出登录
-            </Btn>
           </div>
         </header>
         <main>
@@ -803,14 +806,8 @@ export default function App() {
             </>
           )}
           <footer>
-            <span>
-              <span className="status-dot" /> MK Quant Engine{" "}
-              <code>v0.1.0</code>
-            </span>
-            <span>
-              研究 · 验证 · 执行 <span className="footer-separator">/</span>{" "}
-              数据来源与运行状态分别标记
-            </span>
+            <span>MK Quant</span>
+            <span>北京时间 UTC+8 · 数据与执行状态以最新回执为准</span>
           </footer>
         </main>
       </div>
@@ -1037,7 +1034,7 @@ function Overview({ data, go, setModal, updated, refresh }) {
   const all = data.accounts || [],
     equity = sum(accounts, "equity"),
     profit =
-      accounts.length && accounts.every((a) => accountProfit(a) == null)
+      accounts.length && accounts.some((a) => accountProfit(a) == null)
         ? null
         : accounts.reduce((total, a) => total + (accountProfit(a) || 0), 0),
     initial = sum(accounts, "initial_equity"),
@@ -1093,7 +1090,7 @@ function Overview({ data, go, setModal, updated, refresh }) {
             <Database size={13} />
             {accounts.some((a) => a.source === "demo")
               ? "包含示例数据 · 不代表实际收益"
-              : "部分账户未验证 · 汇总仅含已知数据"}
+              : "部分账户未验证 · 汇总暂不可用"}
           </span>
         )}
       </div>
@@ -1107,16 +1104,20 @@ function Overview({ data, go, setModal, updated, refresh }) {
         />
         <Stat
           label="累计收益"
-          value={`${profit != null && profit >= 0 ? "+" : ""}${money(profit)}`}
+          value={`${profit != null && profit > 0 ? "+" : ""}${money(profit)}`}
           icon={TrendingUp}
           sub={`${pct(profit == null ? null : initial ? (profit / initial) * 100 : 0)} 累计收益率`}
-          trend={profit >= 0 ? "up" : "down"}
+          trend={profit > 0 ? "up" : profit < 0 ? "down" : undefined}
         />
         <Stat
           label="保证金占用"
           value={money(sum(accounts, "margin_used"))}
           icon={Shield}
-          sub={`占总权益 ${equity ? ((sum(accounts, "margin_used") / equity) * 100).toFixed(2) : "0.00"}%`}
+          sub={
+            equity != null && sum(accounts, "margin_used") != null
+              ? `占总权益 ${equity ? ((sum(accounts, "margin_used") / equity) * 100).toFixed(2) : "0.00"}%`
+              : "暂无完整保证金快照"
+          }
         />
         <Stat
           label="策略运行实例"
@@ -1151,13 +1152,11 @@ function Overview({ data, go, setModal, updated, refresh }) {
             <div>
               <span>区间权益变化</span>
               <strong
-                className={
-                  curve.length && curve.at(-1).equity < curve[0].equity
-                    ? "negative"
-                    : "positive"
-                }
+                className={valueTone(
+                  curve.length ? curve.at(-1).equity - curve[0].equity : null,
+                )}
               >
-                {curve.length
+                {curve.length && curve[0].equity
                   ? pct((curve.at(-1).equity / curve[0].equity - 1) * 100)
                   : "—"}
                 <ArrowUpRight size={18} />
@@ -1174,20 +1173,21 @@ function Overview({ data, go, setModal, updated, refresh }) {
             <span>
               <Shield size={13} />
               最大账户回撤{" "}
-              <b className="negative">
-                {accounts.length
-                  ? `${Math.max(...accounts.map((a) => Number(a.max_drawdown_pct) || 0)).toFixed(2)}%`
+              <b
+                className={
+                  accounts.some((a) => a.max_drawdown_pct > 0) ? "negative" : ""
+                }
+              >
+                {accounts.length &&
+                !accounts.some((a) => a.max_drawdown_pct == null)
+                  ? `${Math.max(...accounts.map((a) => Number(a.max_drawdown_pct))).toFixed(2)}%`
                   : "—"}
               </b>
             </span>
             <span>
               浮动盈亏{" "}
-              <b
-                className={
-                  sum(accounts, "unrealized_pnl") >= 0 ? "positive" : "negative"
-                }
-              >
-                {sum(accounts, "unrealized_pnl") >= 0 ? "+" : ""}
+              <b className={valueTone(sum(accounts, "unrealized_pnl"))}>
+                {sum(accounts, "unrealized_pnl") > 0 ? "+" : ""}
                 {money(sum(accounts, "unrealized_pnl"))} U
               </b>
             </span>
@@ -1314,7 +1314,9 @@ function Overview({ data, go, setModal, updated, refresh }) {
                   </small>
                 </div>
                 <Badge status={e.status} />
-                <span className="experiment-return positive">
+                <span
+                  className={`experiment-return ${valueTone(e.metrics?.total_return)}`}
+                >
                   {pct(
                     e.metrics?.total_return != null
                       ? e.metrics.total_return * 100
@@ -1330,7 +1332,7 @@ function Overview({ data, go, setModal, updated, refresh }) {
         </section>
         <section className="panel quickstart">
           <span className="quickstart-label">
-            <Code2 size={15} /> BUILT FOR YOUR STRATEGY
+            <Code2 size={15} /> 策略开发
           </span>
           <h2>你的逻辑，统一的执行语言。</h2>
           <p>
@@ -1352,42 +1354,249 @@ function Overview({ data, go, setModal, updated, refresh }) {
   );
 }
 
+function AssetOverview({ accounts }) {
+  const metrics = [
+    ["浮动盈亏", "unrealized_pnl", "未平仓头寸的账面变动"],
+    ["保证金占用", "margin_used", "当前持仓占用资金"],
+    ["累计已平仓收益", "realized_pnl", "已扣除成交手续费"],
+  ];
+  const equity = sum(accounts, "equity");
+  const stale = accounts.some((a) => a.stale);
+  return (
+    <section className="asset-overview" aria-label="账户资产概览">
+      <div className="asset-primary">
+        <div className="asset-label">
+          账户总权益 <span className="unit">U</span>
+        </div>
+        <strong
+          className="asset-value"
+          title={
+            equity == null
+              ? "存在未取得资金快照的账户，合计暂不可用"
+              : undefined
+          }
+        >
+          {money(equity)}
+        </strong>
+        <div className="asset-context">
+          <span>{accounts.length} 个账户</span>
+          <span>
+            {accounts.filter((a) => a.status === "running").length} 个运行中
+          </span>
+          {stale && <span className="data-stale">部分数据已过期</span>}
+        </div>
+      </div>
+      <div className="asset-secondary">
+        {metrics.map(([label, key, help]) => {
+          const value = sum(accounts, key);
+          return (
+            <div className="asset-metric" key={key}>
+              <span>
+                {label} <small>U</small>
+              </span>
+              <strong className={key === "margin_used" ? "" : valueTone(value)}>
+                {money(value)}
+              </strong>
+              <small>{value == null ? "账户资金快照不完整" : help}</small>
+            </div>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+function AccountActions({ account: a, setModal, compact = false }) {
+  const [open, setOpen] = useState(false),
+    [position, setPosition] = useState({});
+  const trigger = useRef(null),
+    menu = useRef(null);
+  const disabledReason = a.source === "demo" ? "示例账户不可执行运行操作" : "";
+  useEffect(() => {
+    if (!open) return;
+    const close = (event) => {
+      if (
+        !menu.current?.contains(event.target) &&
+        !trigger.current?.contains(event.target)
+      )
+        setOpen(false);
+    };
+    const key = (event) => {
+      if (event.key === "Escape") {
+        setOpen(false);
+        trigger.current?.focus();
+      } else if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+        event.preventDefault();
+        const items = [
+          ...(menu.current?.querySelectorAll("button:not(:disabled)") || []),
+        ];
+        const index = items.indexOf(document.activeElement);
+        const next =
+          event.key === "Home"
+            ? 0
+            : event.key === "End"
+              ? items.length - 1
+              : (index + (event.key === "ArrowUp" ? -1 : 1) + items.length) %
+                items.length;
+        items[next]?.focus();
+      }
+    };
+    const reposition = () => {
+      const r = trigger.current?.getBoundingClientRect();
+      if (r)
+        setPosition({
+          left: Math.max(12, Math.min(r.right - 232, window.innerWidth - 244)),
+          ...(window.innerHeight - r.bottom < 300
+            ? { bottom: window.innerHeight - r.top + 8 }
+            : { top: r.bottom + 8 }),
+        });
+    };
+    reposition();
+    menu.current?.querySelector("button:not(:disabled)")?.focus();
+    document.addEventListener("pointerdown", close);
+    document.addEventListener("keydown", key);
+    window.addEventListener("resize", reposition);
+    window.addEventListener("scroll", reposition, true);
+    return () => {
+      document.removeEventListener("pointerdown", close);
+      document.removeEventListener("keydown", key);
+      window.removeEventListener("resize", reposition);
+      window.removeEventListener("scroll", reposition, true);
+    };
+  }, [open]);
+  const command = (action) => {
+    setOpen(false);
+    setModal({ type: "command", action, accounts: [a] });
+  };
+  return (
+    <div className="account-row-actions">
+      <button
+        className="row-link"
+        onClick={() => setModal({ type: "client", account: a })}
+        aria-label={`查看 ${a.name}`}
+      >
+        查看
+      </button>
+      {!compact && (
+        <button
+          className="row-link"
+          onClick={() => setModal({ type: "account", account: a })}
+          disabled={a.status !== "stopped"}
+          title={
+            a.status !== "stopped" ? "停止运行并确认后可修改配置" : undefined
+          }
+          aria-label={`配置 ${a.name}`}
+        >
+          配置
+        </button>
+      )}
+      {!compact && (
+        <button
+          ref={trigger}
+          className="icon-btn"
+          onClick={() => setOpen(!open)}
+          aria-label={`更多操作 ${a.name}`}
+          aria-expanded={open}
+          aria-haspopup="menu"
+        >
+          <MoreHorizontal size={18} />
+        </button>
+      )}
+      {open &&
+        createPortal(
+          <div
+            ref={menu}
+            className="account-menu"
+            style={position}
+            role="menu"
+            aria-label={`${a.name} 的操作`}
+          >
+            <div className="menu-account">
+              {a.name}
+              <small>{a.strategy_name || "未分配策略"}</small>
+            </div>
+            {a.mode === "live" && (
+              <button
+                role="menuitem"
+                onClick={() => {
+                  setOpen(false);
+                  setModal({ type: "check", account: a });
+                }}
+              >
+                <Shield size={16} />
+                账户接入检查
+              </button>
+            )}
+            <button
+              role="menuitem"
+              disabled={
+                !!disabledReason || ["paused", "stopped"].includes(a.status)
+              }
+              title={disabledReason}
+              onClick={() => command("pause")}
+            >
+              <Pause size={16} />
+              停止开仓
+            </button>
+            <button
+              role="menuitem"
+              disabled={!!disabledReason || a.status === "running"}
+              title={disabledReason}
+              onClick={() => command("resume")}
+            >
+              <Play size={16} />
+              恢复运行
+            </button>
+            <div className="menu-danger">
+              <small>影响此账户的全部策略持仓</small>
+              <button
+                role="menuitem"
+                disabled={!!disabledReason}
+                title={disabledReason}
+                onClick={() => command("flatten")}
+              >
+                <Square size={16} />
+                平仓并停止
+              </button>
+            </div>
+            {(disabledReason || a.stale) && (
+              <p className="menu-note">
+                {disabledReason || "数据已过期，控制指令将等待执行端确认。"}
+              </p>
+            )}
+          </div>,
+          document.body,
+        )}
+    </div>
+  );
+}
 function AccountTable({ accounts, setModal, compact = false }) {
   return accounts.length ? (
-    <div className="table-wrap">
-      <table>
+    <div className="table-wrap account-table-wrap">
+      <table className="account-table">
         <thead>
           <tr>
             <th>账户 / 策略</th>
-            <th>交易环境</th>
-            <th>
+            <th>状态</th>
+            <th className="numeric">
               权益资金 <small>U</small>
             </th>
-            <th>
+            <th className="numeric">
               累计收益 <small>U</small>
             </th>
-            <th>
+            <th className="numeric">
               保证金占用 <small>U</small>
             </th>
-            <th>运行状态</th>
-            {compact ? (
-              <th>权益走势</th>
-            ) : (
-              <>
-                <th>多 / 空持仓</th>
-                <th>胜率 / PF</th>
-                <th>最大回撤</th>
-                <th>今日 / 月收益 U</th>
-                <th>运行天数</th>
-              </>
-            )}
-            <th />
+            {!compact && <th className="numeric">持仓 多 / 空</th>}
+            <th className="actions-heading">操作</th>
           </tr>
         </thead>
         <tbody>
           {accounts.map((a, i) => (
-            <tr key={a.id}>
-              <td>
+            <tr
+              key={a.id}
+              className={a.stale ? "account-row stale-row" : "account-row"}
+            >
+              <td data-label="账户">
                 <button
                   className="account-name"
                   onClick={() => setModal({ type: "client", account: a })}
@@ -1403,8 +1612,6 @@ function AccountTable({ accounts, setModal, compact = false }) {
                     </small>
                   </span>
                 </button>
-              </td>
-              <td>
                 <span
                   className={`market-tag ${a.mode === "live" ? "purple" : ""}`}
                 >
@@ -1412,79 +1619,60 @@ function AccountTable({ accounts, setModal, compact = false }) {
                   {a.mode === "live" ? "实盘" : "模拟"}
                 </span>
               </td>
-              <td className="numeric">
-                <strong>{money(a.equity)}</strong>
-                <small>初始 {money(a.initial_equity)}</small>
-              </td>
-              <td
-                className={`numeric ${accountProfit(a) >= 0 ? "positive" : "negative"}`}
-              >
-                <strong>
-                  {accountProfit(a) != null && accountProfit(a) >= 0 ? "+" : ""}
-                  {money(accountProfit(a))}
-                </strong>
-                <small>{pct(a.return_pct)}</small>
-              </td>
-              <td className="numeric">
-                {money(a.margin_used)}
-                <small>
-                  {a.equity
-                    ? (((a.margin_used || 0) / a.equity) * 100).toFixed(1)
-                    : "0.0"}
-                  % 占用
+              <td data-label="状态">
+                <Badge status={a.status} />
+                <small className="account-freshness">
+                  {a.stale
+                    ? "数据已过期"
+                    : a.last_heartbeat
+                      ? `${formatBeijing(a.last_heartbeat, { year: undefined, month: undefined, day: undefined, second: "2-digit" })} 更新`
+                      : "等待首次回执"}
                 </small>
               </td>
-              <td>
-                <Badge status={a.status} />
-                {a.last_heartbeat && (
-                  <small className="dim">
-                    心跳{" "}
-                    {new Date(a.last_heartbeat).toLocaleTimeString("zh-CN", {
-                      timeZone: "Asia/Shanghai",
-                    })}
-                  </small>
-                )}
+              <td data-label="权益资金 U" className="numeric">
+                <strong>{money(a.equity)}</strong>
+                <small>
+                  {a.equity == null
+                    ? "尚无账户快照"
+                    : `初始 ${money(a.initial_equity)}`}
+                </small>
               </td>
-              {compact && (
-                <td>
-                  <MiniChart data={a.curve || []} />
+              <td
+                data-label="累计收益 U"
+                className={`numeric ${valueTone(accountProfit(a))}`}
+              >
+                <strong>{money(accountProfit(a))}</strong>
+                <small>
+                  {accountProfit(a) == null
+                    ? "资金快照不完整"
+                    : pct(a.return_pct)}
+                </small>
+              </td>
+              <td data-label="保证金占用 U" className="numeric">
+                <strong>{money(a.margin_used)}</strong>
+                <small>
+                  {a.margin_used == null || a.equity == null
+                    ? "尚无保证金快照"
+                    : a.equity > 0
+                      ? `${((a.margin_used / a.equity) * 100).toFixed(1)}% 占用`
+                      : a.margin_used === 0
+                        ? "0.0% 占用"
+                        : "占用比例不可用"}
+                </small>
+              </td>
+              {!compact && (
+                <td data-label="持仓 多 / 空" className="numeric">
+                  <span>{a.long_count ?? "—"}</span>
+                  <span className="numeric-divider"> / </span>
+                  <span>{a.short_count ?? "—"}</span>
                 </td>
               )}
-              {!compact && (
-                <>
-                  <td className="numeric">
-                    {a.long_count ?? "—"} / {a.short_count ?? "—"}
-                  </td>
-                  <td className="numeric">
-                    {a.win_rate == null
-                      ? "—"
-                      : `${Number(a.win_rate).toFixed(2)}%`}
-                    <small>
-                      PF{" "}
-                      {a.profit_factor == null ? "—" : money(a.profit_factor)}
-                    </small>
-                  </td>
-                  <td className="numeric negative">
-                    {a.max_drawdown_pct == null
-                      ? "—"
-                      : `${Number(a.max_drawdown_pct).toFixed(2)}%`}
-                    <small>{money(a.max_drawdown_u)} U</small>
-                  </td>
-                  <td className="numeric">
-                    {money(a.today_pnl)}
-                    <small>月 {money(a.month_pnl)}</small>
-                  </td>
-                  <td className="numeric">{a.running_days ?? "—"}</td>
-                </>
-              )}
-              <td>
-                <button
-                  className="icon-btn"
-                  aria-label={`管理 ${a.name}`}
-                  onClick={() => setModal({ type: "account", account: a })}
-                >
-                  <Ellipsis size={19} />
-                </button>
+              <td data-label="操作" className="account-action-cell">
+                <AccountActions
+                  account={a}
+                  setModal={setModal}
+                  compact={compact}
+                />
               </td>
             </tr>
           ))}
@@ -1492,7 +1680,88 @@ function AccountTable({ accounts, setModal, compact = false }) {
       </table>
     </div>
   ) : (
-    <Empty title="还没有账户" desc="由管理员创建账户并分配策略。" />
+    <Empty
+      title="还没有账户"
+      desc="创建账户并分配策略后，资金与运行情况会显示在这里。"
+    />
+  );
+}
+function RecentOperations({ commands, accounts }) {
+  const recent = commands.filter((c) =>
+    accounts.some((a) => a.id === c.account_id),
+  );
+  const active = recent.filter(
+    (c) => !["completed", "cancelled"].includes(c.status),
+  );
+  const complete = recent.filter((c) =>
+    ["completed", "cancelled"].includes(c.status),
+  );
+  const entries = (items) => (
+    <div className="operation-list">
+      {items.map((c) => (
+        <div
+          className={`operation-item ${c.status === "failed" ? "needs-attention" : ""}`}
+          key={c.id}
+        >
+          <div className="operation-main">
+            <strong>
+              {accounts.find((a) => a.id === c.account_id)?.name || "账户"}
+            </strong>
+            <span>
+              {{ pause: "停止开仓", flatten: "平仓并停止", resume: "恢复运行" }[
+                c.action
+              ] || c.action}
+            </span>
+            <Badge status={c.status} />
+          </div>
+          <div className="operation-detail">
+            <span className={c.error ? "negative" : ""}>
+              {c.error ||
+                c.result?.message ||
+                (c.status === "pending" ? "等待执行端确认" : "执行结果已保存")}
+            </span>
+            <span>
+              {formatBeijing(c.created_at)} · <code>{c.id.slice(0, 10)}</code>
+            </span>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+  return (
+    <section className="panel recent-operations">
+      <div className="panel-heading">
+        <div>
+          <h2>
+            近期操作{" "}
+            {active.length > 0 && (
+              <span className="count-pill">{active.length} 待关注</span>
+            )}
+          </h2>
+          <p>运行指令以执行端确认结果为准。</p>
+        </div>
+        <History size={18} />
+      </div>
+      {active.length ? (
+        entries(active.slice(0, 8))
+      ) : (
+        <div className="operations-clear">
+          <CheckCircle2 size={18} />
+          <span>
+            {recent.length ? "当前没有待处理的运行指令" : "暂无运行操作"}
+          </span>
+        </div>
+      )}
+      {!!complete.length && (
+        <details className="operation-history">
+          <summary>
+            已完成的操作 <span>{complete.length}</span>
+            <ChevronDown size={15} />
+          </summary>
+          {entries(complete.slice(0, 20))}
+        </details>
+      )}
+    </section>
   );
 }
 function Accounts({
@@ -1513,35 +1782,31 @@ function Accounts({
         .toLowerCase()
         .includes(q.toLowerCase()),
   );
-  const action = (type, ids) =>
-    setModal({
-      type: "command",
-      action: type,
-      accounts: filtered.filter((a) => (ids ? ids.includes(a.id) : true)),
-    });
+  const allForPage = accounts.filter(
+    (a) => page === "users" || a.mode === page,
+  );
+  const action = (action) =>
+    setModal({ type: "command", action, accounts: filtered });
+  useEffect(() => {
+    setTab("accounts");
+    setQ("");
+  }, [page]);
   return (
     <>
       <Heading
-        eyebrow={
-          page === "users"
-            ? "ACCOUNT MANAGEMENT"
-            : page === "live"
-              ? "LIVE TRADING"
-              : "PAPER TRADING"
-        }
         title={titles[page]}
         desc={
           page === "users"
-            ? "集中管理账户、策略分配和接入要求。一个账户，一个策略实例。"
+            ? "管理客户、账户与策略分配。"
             : page === "live"
-              ? "接入检查、风险控制与真实账户的运行管理。"
-              : "用统一的策略接口与模拟账本验证执行行为。"
+              ? "跟踪真实账户的资金、持仓与运行状态。"
+              : "观察策略表现，验证执行行为。"
         }
       >
         <Btn
           kind="primary"
           icon={Plus}
-          onClick={() => setModal({ type: "account" })}
+          onClick={() => setModal({ type: "account", account: undefined })}
         >
           新建账户
         </Btn>
@@ -1550,42 +1815,13 @@ function Accounts({
         <div className="notice amber">
           <ShieldAlert size={18} />
           <div>
-            <strong>真实下单默认关闭</strong>
-            <span>
-              接入检查会返回账户实际状态与调整建议。完成部署验收前，实盘恢复运行会被执行端拒绝。
-            </span>
+            <strong>真实下单未启用</strong>
+            <span>账户接入检查可用，完成实盘执行验收后才能恢复真实交易。</span>
           </div>
         </div>
       )}
-      {page !== "users" && (
-        <div className="stats-grid">
-          <Stat
-            label="账户总权益"
-            value={money(sum(filtered, "equity"))}
-            icon={Wallet}
-            sub={`${filtered.length} 个账户`}
-          />
-          <Stat
-            label="浮动盈亏"
-            value={money(sum(filtered, "unrealized_pnl"))}
-            icon={Activity}
-            sub="来自最后一条账本记录"
-          />
-          <Stat
-            label="保证金占用"
-            value={money(sum(filtered, "margin_used"))}
-            icon={Shield}
-            sub="按账户汇总"
-          />
-          <Stat
-            label="累计已平仓收益"
-            value={money(sum(filtered, "realized_pnl"))}
-            icon={TrendingUp}
-            sub="扣除成交手续费"
-          />
-        </div>
-      )}
-      <section className="panel">
+      {page !== "users" && <AssetOverview accounts={allForPage} />}
+      <section className="panel accounts-workspace">
         <div className="panel-toolbar">
           <div className="tabs">
             <button
@@ -1599,13 +1835,14 @@ function Accounts({
                 className={tab === "strategies" ? "active" : ""}
                 onClick={() => setTab("strategies")}
               >
-                按策略汇总
+                策略汇总
               </button>
             )}
           </div>
           <label className="search-input">
-            <Search size={15} />
+            <Search size={17} />
             <input
+              aria-label="搜索账户、手机号或策略"
               placeholder="搜索账户、手机号或策略"
               value={q}
               onChange={(e) => setQ(e.target.value)}
@@ -1613,162 +1850,82 @@ function Accounts({
           </label>
         </div>
         {tab === "accounts" ? (
-          <>
-            <AccountTable accounts={filtered} setModal={setModal} />
-            <div className="account-actions-list">
-              {filtered.map((a) => (
-                <div key={a.id}>
-                  <strong>{a.name}</strong>
-                  <span className="dim">{(a.symbols || []).join(" / ")}</span>
-                  <div>
-                    <Btn
-                      icon={ExternalLink}
-                      onClick={() => setModal({ type: "client", account: a })}
-                    >
-                      客户端
-                    </Btn>
-                    {a.mode === "live" && (
-                      <Btn
-                        icon={Shield}
-                        onClick={() => setModal({ type: "check", account: a })}
-                      >
-                        接入检查
-                      </Btn>
-                    )}
-                    <Btn
-                      icon={SlidersHorizontal}
-                      onClick={() => setModal({ type: "account", account: a })}
-                    >
-                      配置
-                    </Btn>
-                    <Btn icon={Pause} onClick={() => action("pause", [a.id])}>
-                      停止开仓
-                    </Btn>
-                    <Btn icon={Play} onClick={() => action("resume", [a.id])}>
-                      恢复
-                    </Btn>
-                    <Btn
-                      kind="danger-ghost"
-                      icon={Square}
-                      onClick={() => action("flatten", [a.id])}
-                    >
-                      平仓并停止
-                    </Btn>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </>
+          <AccountTable accounts={filtered} setModal={setModal} />
         ) : (
           <div className="table-wrap">
-            <table>
+            <table className="strategy-summary-table">
               <thead>
                 <tr>
-                  <th>策略</th>
-                  <th>版本</th>
-                  <th>客户数</th>
-                  <th>总权益 U</th>
-                  <th>浮盈亏 U</th>
-                  <th>已平仓收益 U</th>
-                  <th>持仓数</th>
+                  <th>策略 / 版本</th>
+                  <th className="numeric">客户数</th>
+                  <th className="numeric">总权益 U</th>
+                  <th className="numeric">浮动盈亏 U</th>
+                  <th className="numeric">已平仓收益 U</th>
+                  <th className="numeric">持仓数</th>
                 </tr>
               </thead>
               <tbody>
-                {strategies.map((s) => {
-                  const aa = filtered.filter((a) => a.strategy_id === s.id);
-                  return (
-                    <tr key={s.id}>
-                      <td>{s.name}</td>
-                      <td className="mono">{s.version}</td>
-                      <td>{aa.length}</td>
-                      <td>{money(sum(aa, "equity"))}</td>
-                      <td className="positive">
-                        {money(sum(aa, "unrealized_pnl"))}
-                      </td>
-                      <td>{money(sum(aa, "realized_pnl"))}</td>
-                      <td>
-                        {aa.reduce((n, a) => n + (a.positions?.length || 0), 0)}
-                      </td>
-                    </tr>
-                  );
-                })}
+                {strategies
+                  .filter((s) => filtered.some((a) => a.strategy_id === s.id))
+                  .map((s) => {
+                    const aa = filtered.filter((a) => a.strategy_id === s.id);
+                    return (
+                      <tr key={s.id}>
+                        <td>
+                          <strong>{s.name}</strong>
+                          <small>v{s.version}</small>
+                        </td>
+                        <td className="numeric">{aa.length}</td>
+                        <td className="numeric">{money(sum(aa, "equity"))}</td>
+                        <td
+                          className={`numeric ${valueTone(sum(aa, "unrealized_pnl"))}`}
+                        >
+                          {money(sum(aa, "unrealized_pnl"))}
+                        </td>
+                        <td
+                          className={`numeric ${valueTone(sum(aa, "realized_pnl"))}`}
+                        >
+                          {money(sum(aa, "realized_pnl"))}
+                        </td>
+                        <td className="numeric">
+                          {aa.reduce(
+                            (n, a) => n + (a.positions?.length || 0),
+                            0,
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
               </tbody>
             </table>
+            {!filtered.length && (
+              <Empty
+                title="暂无运行策略"
+                desc="创建账户并分配策略后显示汇总。"
+              />
+            )}
           </div>
         )}
-      </section>
-      <section className="panel">
-        <div className="panel-heading">
-          <div>
-            <h2>控制指令回执</h2>
-            <p>状态来自独立执行进程；失败原因与任务编号持久保留。</p>
-          </div>
+        <div className="table-footnote">
+          <span>{filtered.length} 个账户 · 金额单位 U</span>
+          <span>完整指标、订单与资金明细可在「查看」中读取</span>
         </div>
-        {commands.filter((c) => filtered.some((a) => a.id === c.account_id))
-          .length ? (
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>任务编号</th>
-                  <th>账户</th>
-                  <th>操作</th>
-                  <th>状态</th>
-                  <th>失败原因 / 结果</th>
-                </tr>
-              </thead>
-              <tbody>
-                {commands
-                  .filter((c) => filtered.some((a) => a.id === c.account_id))
-                  .slice(0, 12)
-                  .map((c) => (
-                    <tr key={c.id}>
-                      <td>
-                        <code>{c.id.slice(0, 10)}</code>
-                      </td>
-                      <td>
-                        {accounts.find((a) => a.id === c.account_id)?.name ||
-                          c.account_id}
-                      </td>
-                      <td>
-                        {{
-                          pause: "停止开仓",
-                          flatten: "平仓并停止",
-                          resume: "恢复运行",
-                        }[c.action] || c.action}
-                      </td>
-                      <td>
-                        <Badge status={c.status} />
-                      </td>
-                      <td className={c.error ? "negative" : "dim"}>
-                        {c.error || c.result?.message || "—"}
-                      </td>
-                    </tr>
-                  ))}
-              </tbody>
-            </table>
-          </div>
-        ) : (
-          <Empty
-            title="暂无控制指令"
-            desc="运行操作提交后会在这里显示执行回执。"
-          />
-        )}
       </section>
+      <RecentOperations commands={commands} accounts={filtered} />
       {page !== "users" && (
-        <section className="danger-zone">
-          <div>
-            <ShieldAlert size={21} />
-            <div>
-              <h3>全局运行控制</h3>
-              <p>
-                影响当前列表全部 {filtered.length} 个
-                {page === "live" ? "实盘" : "模拟"}
-                账户。操作需要两次确认，并等待执行端回执。
-              </p>
-            </div>
-          </div>
-          <div>
+        <details className="danger-zone">
+          <summary>
+            <ShieldAlert size={19} />
+            <span>
+              <strong>全局运行控制</strong>
+              <small>
+                影响当前筛选的 {filtered.length} 个
+                {page === "live" ? "实盘" : "模拟"}账户，操作需两次确认。
+              </small>
+            </span>
+            <ChevronDown size={17} />
+          </summary>
+          <div className="danger-zone-actions">
             <Btn disabled={!filtered.length} onClick={() => action("pause")}>
               全部停止开仓
             </Btn>
@@ -1783,7 +1940,7 @@ function Accounts({
               全部平仓并停止
             </Btn>
           </div>
-        </section>
+        </details>
       )}
     </>
   );
@@ -2070,7 +2227,7 @@ function ClientView({ account: a, user }) {
       <div className="client-heading">
         <div>
           <div className="eyebrow">
-            MY ACCOUNT / {a.mode === "live" ? "LIVE" : "PAPER"}
+            {a.mode === "live" ? "实盘交易账户" : "模拟交易账户"}
           </div>
           <h1>{a.name}的账户</h1>
           <p>
@@ -2100,11 +2257,7 @@ function ClientView({ account: a, user }) {
         <strong>{money(a.equity)}</strong>
         <p
           className={
-            accountProfit(a) == null
-              ? "dim"
-              : accountProfit(a) >= 0
-                ? "positive"
-                : "negative"
+            accountProfit(a) == null ? "dim" : valueTone(accountProfit(a))
           }
         >
           累计收益 {money(accountProfit(a))} U <span>{pct(a.return_pct)}</span>
@@ -2229,10 +2382,10 @@ function ClientView({ account: a, user }) {
                 <tr>
                   <th>交易对</th>
                   <th>方向</th>
-                  <th>数量</th>
-                  <th>平均价格</th>
-                  <th>浮盈亏 U</th>
-                  <th>保证金 U</th>
+                  <th className="numeric">数量</th>
+                  <th className="numeric">平均价格</th>
+                  <th className="numeric">浮盈亏 U</th>
+                  <th className="numeric">保证金 U</th>
                 </tr>
               </thead>
               <tbody>
@@ -2242,16 +2395,12 @@ function ClientView({ account: a, user }) {
                     <td className={p.quantity >= 0 ? "positive" : "negative"}>
                       {p.quantity >= 0 ? "多头" : "空头"}
                     </td>
-                    <td>{Math.abs(p.quantity)}</td>
-                    <td>{money(p.average_price)}</td>
-                    <td
-                      className={
-                        p.unrealized_pnl >= 0 ? "positive" : "negative"
-                      }
-                    >
+                    <td className="numeric">{Math.abs(p.quantity)}</td>
+                    <td className="numeric">{money(p.average_price)}</td>
+                    <td className={`numeric ${valueTone(p.unrealized_pnl)}`}>
                       {money(p.unrealized_pnl)}
                     </td>
-                    <td>{money(p.margin_used)}</td>
+                    <td className="numeric">{money(p.margin_used)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -2276,9 +2425,9 @@ function ClientView({ account: a, user }) {
                 <tr>
                   <th>交易对</th>
                   <th>方向</th>
-                  <th>数量</th>
-                  <th>成交价格</th>
-                  <th>已实现盈亏 U</th>
+                  <th className="numeric">数量</th>
+                  <th className="numeric">成交价格</th>
+                  <th className="numeric">已实现盈亏 U</th>
                   <th>状态</th>
                 </tr>
               </thead>
@@ -2290,9 +2439,11 @@ function ClientView({ account: a, user }) {
                       {o.side === "buy" ? "买入" : "卖出"}
                       {o.position_side ? ` · ${o.position_side}` : ""}
                     </td>
-                    <td>{o.quantity}</td>
-                    <td>{money(o.price)}</td>
-                    <td>{money(o.realized_pnl)}</td>
+                    <td className="numeric">{o.quantity}</td>
+                    <td className="numeric">{money(o.price)}</td>
+                    <td className={`numeric ${valueTone(o.realized_pnl)}`}>
+                      {money(o.realized_pnl)}
+                    </td>
                     <td>{o.status || "已成交"}</td>
                   </tr>
                 ))}
@@ -2568,7 +2719,7 @@ function Datasets({ data, mutate, notify }) {
                   <th>周期</th>
                   <th>开始时间</th>
                   <th>结束时间</th>
-                  <th>数据量</th>
+                  <th className="numeric">数据量</th>
                   <th>版本</th>
                   <th>来源</th>
                 </tr>
@@ -2584,7 +2735,11 @@ function Datasets({ data, mutate, notify }) {
                     <td className="mono">{d.interval}</td>
                     <td className="mono">{formatBeijing(d.start)}</td>
                     <td className="mono">{formatBeijing(d.end)}</td>
-                    <td>{d.row_count ?? d.count ?? "—"}</td>
+                    <td className="numeric">
+                      {d.row_count != null || d.count != null
+                        ? Number(d.row_count ?? d.count).toLocaleString("en-US")
+                        : "—"}
+                    </td>
                     <td>
                       <code>
                         {(d.version || d.sha256 || d.hash || d.id).slice(0, 10)}
@@ -2611,6 +2766,7 @@ function Datasets({ data, mutate, notify }) {
 }
 function Strategies({ strategies, mutate, notify, go }) {
   const [selected, setSelected] = useState(null),
+    [detail, setDetail] = useState(null),
     [source, setSource] = useState(""),
     [name, setName] = useState(""),
     [err, setErr] = useState(""),
@@ -2643,14 +2799,16 @@ function Strategies({ strategies, mutate, notify, go }) {
             <section className="panel strategy-card" key={s.id}>
               <div className="strategy-card-top">
                 <div className={`strategy-icon color-${i % 4}`}>
-                  <Blocks size={23} />
+                  <Blocks size={20} />
                 </div>
-                <span className="tag mono">v{s.version}</span>
+                <div className="strategy-title">
+                  <h2>{s.name}</h2>
+                  <span>v{s.version}</span>
+                </div>
                 <Badge status={s.trusted ? "completed" : "pending"}>
                   {s.trusted ? "可运行" : "待审核"}
                 </Badge>
               </div>
-              <h2>{s.name}</h2>
               <p>{s.description || m.description || "框架标准策略接口"}</p>
               <div className="strategy-tags">
                 <span>
@@ -2708,6 +2866,7 @@ function Strategies({ strategies, mutate, notify, go }) {
                 </span>
               </div>
               <div className="strategy-card-bottom">
+                <Btn onClick={() => setDetail(s)}>详情</Btn>
                 <Btn
                   icon={Code2}
                   onClick={() => {
@@ -2716,7 +2875,7 @@ function Strategies({ strategies, mutate, notify, go }) {
                     setName(s.name);
                   }}
                 >
-                  查看 / 编辑代码
+                  编辑
                 </Btn>
                 <Btn
                   kind="primary-ghost"
@@ -2733,19 +2892,116 @@ function Strategies({ strategies, mutate, notify, go }) {
           );
         })}
       </div>
-      <div className="notice">
-        <Shield size={17} />
-        <div>
-          <strong>保存时静态校验策略契约</strong>
-          <span>
-            检查必须字段与 on_bar
-            接口。策略代码仅在独立工作进程执行，上传代码须来自可信管理员。
-          </span>
-        </div>
+      <div className="strategy-help">
+        <CircleHelp size={16} />
+        <span>策略保存时会校验账户要求与参数定义。</span>
         <button className="text-btn" onClick={() => go("protocol")}>
-          查看协议 <ArrowRight size={14} />
+          接入文档 <ArrowRight size={14} />
         </button>
       </div>
+      {detail && (
+        <Modal
+          wide
+          title={detail.name}
+          subtitle={`版本 ${detail.version} · ${detail.trusted ? "可运行" : "待审核"}`}
+          onClose={() => setDetail(null)}
+        >
+          <p className="strategy-description">
+            {detail.description ||
+              detail.manifest?.description ||
+              "暂无策略说明"}
+          </p>
+          <div className="strategy-detail-modal">
+            <div>
+              <span>交易市场</span>
+              <strong>
+                {(detail.manifest || detail).market === "spot"
+                  ? "现货，无杠杆、无做空"
+                  : "U 本位永续"}
+              </strong>
+            </div>
+            <div>
+              <span>最低资金</span>
+              <strong>
+                {money((detail.manifest || detail).account?.min_capital)} U
+              </strong>
+            </div>
+            <div>
+              <span>持仓模式</span>
+              <strong>
+                {((detail.manifest || detail).account?.position_modes || [])
+                  .map(
+                    (v) => ({ one_way: "单向持仓", hedge: "双向持仓" })[v] || v,
+                  )
+                  .join(" / ") || "—"}
+              </strong>
+            </div>
+            <div>
+              <span>保证金模式</span>
+              <strong>
+                {((detail.manifest || detail).account?.margin_modes || [])
+                  .map(
+                    (v) =>
+                      ({ cross: "全仓", isolated: "逐仓", cash: "现货现金" })[
+                        v
+                      ] || v,
+                  )
+                  .join(" / ") || "—"}
+              </strong>
+            </div>
+          </div>
+          <h3 className="form-section-title">默认参数</h3>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>参数</th>
+                  <th>默认值</th>
+                  <th>说明</th>
+                </tr>
+              </thead>
+              <tbody>
+                {Object.entries(
+                  (detail.manifest || detail).parameters?.properties || {},
+                ).map(([key, p]) => (
+                  <tr key={key}>
+                    <td>{p.title || key}</td>
+                    <td>
+                      {typeof p.default === "boolean"
+                        ? p.default
+                          ? "允许"
+                          : "不允许"
+                        : String(p.default ?? "—")}
+                    </td>
+                    <td>{p.description || "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="modal-footer">
+            <Btn
+              onClick={() => {
+                setDetail(null);
+                go("protocol");
+              }}
+            >
+              接入协议
+            </Btn>
+            <Btn
+              kind="primary"
+              onClick={() => {
+                setSelected(detail);
+                setSource(detail.source || "");
+                setName(detail.name);
+                setDetail(null);
+              }}
+            >
+              编辑策略
+            </Btn>
+          </div>
+        </Modal>
+      )}
       {selected && (
         <Modal
           wide
@@ -2862,9 +3118,9 @@ function MetricComparison({ train = {}, validation = {} }) {
         <thead>
           <tr>
             <th>指标</th>
-            <th>回测集</th>
-            <th>验证集</th>
-            <th>差异</th>
+            <th className="numeric">回测集</th>
+            <th className="numeric">验证集</th>
+            <th className="numeric">差异</th>
           </tr>
         </thead>
         <tbody>
@@ -2880,9 +3136,9 @@ function MetricComparison({ train = {}, validation = {} }) {
             return (
               <tr key={key}>
                 <td>{label}</td>
-                <td className="mono">{format(train[key])}</td>
-                <td className="mono">{format(validation[key])}</td>
-                <td className="mono dim">
+                <td className="numeric">{format(train[key])}</td>
+                <td className="numeric">{format(validation[key])}</td>
+                <td className="numeric dim">
                   {train[key] != null && validation[key] != null
                     ? format(validation[key] - train[key])
                     : "—"}
@@ -2931,7 +3187,7 @@ function Backtest({ data, mutate, notify, go }) {
   const change = (k, v) => setForm((f) => ({ ...f, [k]: v }));
   const job =
     (data.experiments || []).find((e) => e.id === active) ||
-    (data.experiments || [])[0];
+    (data.experiments || []).find((e) => e.strategy_id === sid);
   const pvalues = Object.fromEntries(
     Object.entries(props).map(([k, p]) => [k, params[k] ?? p.default]),
   );
@@ -3015,7 +3271,7 @@ function Backtest({ data, mutate, notify, go }) {
             <h2>
               <SlidersHorizontal size={17} /> 实验配置
             </h2>
-            <span className="tag">NEW EXPERIMENT</span>
+            <span className="config-context">配置</span>
           </div>
           <form
             className="panel-body"
@@ -3082,333 +3338,345 @@ function Backtest({ data, mutate, notify, go }) {
               }
             }}
           >
-            <div className="form-grid experiment-identity">
-              <Field label="实验名称">
-                <input
-                  value={form.name}
-                  placeholder="留空按策略命名"
-                  onChange={(e) => change("name", e.target.value)}
-                />
-              </Field>
-              <Field label="策略">
-                <select
-                  value={sid}
-                  onChange={(e) => {
-                    setSid(e.target.value);
-                    setParams({});
-                  }}
-                >
-                  {strategies.map((s) => (
-                    <option key={s.id} value={s.id}>
-                      {s.name} · v{s.version}
-                    </option>
-                  ))}
-                </select>
-              </Field>
-            </div>
-            <div className="strategy-requirements">
-              <Shield size={14} />
-              <span>
-                {manifest.market === "spot"
-                  ? "现货 · 禁止做空 · 1×"
-                  : "U 本位永续"}{" "}
-                · 最低资金 {manifest.account?.min_capital ?? "—"} U
-              </span>
-            </div>
-            <div className="backtest-form-tabs" aria-label="实验配置分组">
-              {[
-                ["strategy", "策略与参数"],
-                ["data", "行情与区间"],
-                ["execution", "资金与费用"],
-              ].map(([key, label], index) => (
-                <button
-                  type="button"
-                  key={key}
-                  aria-pressed={configTab === key}
-                  className={configTab === key ? "active" : ""}
-                  onClick={() => setConfigTab(key)}
-                >
-                  <span>{String(index + 1).padStart(2, "0")}</span>
-                  {label}
-                </button>
-              ))}
-            </div>
-            <fieldset
-              className="config-tab-panel"
-              hidden={configTab !== "strategy"}
-              disabled={configTab !== "strategy"}
-            >
-              <div className="config-section-grid">
-                <section>
-                  <h3 className="form-section-title">
-                    策略参数 <span>{Object.keys(props).length}</span>
-                  </h3>
-                  <div className="form-grid">
-                    {Object.entries(props).map(([k, p]) => (
-                      <Field key={k} label={p.title || k} hint={p.description}>
-                        <ParameterInput
-                          spec={p}
-                          value={params[k] ?? p.default}
-                          onChange={(value) =>
-                            setParams({ ...params, [k]: value })
-                          }
-                        />
-                      </Field>
-                    ))}
-                  </div>
-                  {Object.keys(props).length === 0 && (
-                    <p className="dim">此策略没有需要调整的参数。</p>
-                  )}
-                </section>
-                <section>
-                  <h3 className="form-section-title">参数预设</h3>
-                  <Field label="参数预设名称">
-                    <input
-                      placeholder="输入名称后另存为"
-                      value={preset}
-                      onChange={(e) => setPreset(e.target.value)}
-                    />
-                  </Field>
-                  <div className="preset-row">
-                    <select
-                      aria-label="加载参数预设"
-                      value=""
-                      onChange={(e) => {
-                        const p = presets[Number(e.target.value)];
-                        setSid(p.strategy_id);
-                        setParams(p.parameters);
-                        notify("预设已加载");
-                      }}
-                    >
-                      <option value="">加载服务器参数预设</option>
-                      {presets.map((p, i) => (
-                        <option key={i} value={i}>
-                          {p.name}
-                        </option>
-                      ))}
-                    </select>
-                    <Btn type="button" icon={Copy} onClick={savePreset}>
-                      另存为
-                    </Btn>
-                  </div>
-                </section>
-              </div>
-            </fieldset>
-            <fieldset
-              className="config-tab-panel"
-              hidden={configTab !== "data"}
-              disabled={configTab !== "data"}
-            >
-              <div className="form-grid">
-                <Field label="K 线数据集">
+            <div className="backtest-config-scroll">
+              <div className="form-grid experiment-identity">
+                <Field label="实验名称">
+                  <input
+                    value={form.name}
+                    placeholder="留空按策略命名"
+                    onChange={(e) => change("name", e.target.value)}
+                  />
+                </Field>
+                <Field label="策略">
                   <select
-                    required
-                    value={form.dataset_id}
+                    value={sid}
                     onChange={(e) => {
-                      change("dataset_id", e.target.value);
-                      const d = datasets.find((x) => x.id === e.target.value);
-                      if (d?.symbols) change("symbols", d.symbols.join(","));
+                      setSid(e.target.value);
+                      setParams({});
                     }}
                   >
-                    <option value="">请选择数据集</option>
-                    {datasets.map((d) => (
-                      <option key={d.id} value={d.id}>
-                        {d.name}{" "}
-                        {["demo", "synthetic"].includes(d.source)
-                          ? "[合成数据]"
-                          : ""}
+                    {strategies.map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {s.name} · v{s.version}
                       </option>
                     ))}
                   </select>
                 </Field>
-                <Field label="交易对">
-                  <input
-                    value={form.symbols}
-                    required
-                    onChange={(e) =>
-                      change("symbols", e.target.value.toUpperCase())
-                    }
-                  />
-                </Field>
               </div>
-              <p className="fee-source">
-                数据覆盖（北京时间）：
-                {formatBeijing(
-                  datasets.find((d) => d.id === form.dataset_id)?.start,
-                )}{" "}
-                —{" "}
-                {formatBeijing(
-                  datasets.find((d) => d.id === form.dataset_id)?.end,
-                )}
-                ，结束为末根 K 线开盘时间。
-              </p>
-              <div className="config-section-grid">
-                <div className="date-group">
-                  <span>
-                    <i />
-                    回测集 · 北京时间
-                  </span>
-                  <div className="form-grid">
-                    <Field label="开始">
-                      <input
-                        type="datetime-local"
-                        step="1"
-                        required
-                        value={form.train_start}
-                        onChange={(e) => change("train_start", e.target.value)}
-                      />
-                    </Field>
-                    <Field label="结束（不含）">
-                      <input
-                        type="datetime-local"
-                        step="1"
-                        required
-                        value={form.train_end}
-                        onChange={(e) => change("train_end", e.target.value)}
-                      />
-                    </Field>
-                  </div>
-                </div>
-                <div className="date-group validation">
-                  <span>
-                    <i />
-                    验证集 · 北京时间
-                  </span>
-                  <div className="form-grid">
-                    <Field label="开始">
-                      <input
-                        type="datetime-local"
-                        step="1"
-                        min={form.train_end}
-                        required
-                        value={form.validation_start}
-                        onChange={(e) =>
-                          change("validation_start", e.target.value)
-                        }
-                      />
-                    </Field>
-                    <Field label="结束（不含）">
-                      <input
-                        type="datetime-local"
-                        step="1"
-                        required
-                        value={form.validation_end}
-                        onChange={(e) =>
-                          change("validation_end", e.target.value)
-                        }
-                      />
-                    </Field>
-                  </div>
-                </div>
+              <div className="strategy-requirements">
+                <Shield size={14} />
+                <span>
+                  {manifest.market === "spot"
+                    ? "现货 · 禁止做空 · 1×"
+                    : "U 本位永续"}{" "}
+                  · 最低资金 {manifest.account?.min_capital ?? "—"} U
+                </span>
               </div>
-            </fieldset>
-            <fieldset
-              className="config-tab-panel"
-              hidden={configTab !== "execution"}
-              disabled={configTab !== "execution"}
-            >
-              <div className="config-section-grid">
-                <section>
-                  <h3 className="form-section-title">账户与实验环境</h3>
-                  <div className="form-grid">
-                    <Field label="初始资金（U）">
+              <div className="backtest-form-tabs" aria-label="实验配置分组">
+                {[
+                  ["strategy", "策略与参数"],
+                  ["data", "行情与区间"],
+                  ["execution", "资金与费用"],
+                ].map(([key, label], index) => (
+                  <button
+                    type="button"
+                    key={key}
+                    aria-pressed={configTab === key}
+                    className={configTab === key ? "active" : ""}
+                    onClick={() => setConfigTab(key)}
+                  >
+                    <span>{String(index + 1).padStart(2, "0")}</span>
+                    {label}
+                  </button>
+                ))}
+              </div>
+              <fieldset
+                className="config-tab-panel"
+                hidden={configTab !== "strategy"}
+                disabled={configTab !== "strategy"}
+              >
+                <div className="config-section-grid">
+                  <section>
+                    <h3 className="form-section-title">
+                      策略参数 <span>{Object.keys(props).length}</span>
+                    </h3>
+                    <div className="form-grid">
+                      {Object.entries(props).map(([k, p]) => (
+                        <Field
+                          key={k}
+                          label={p.title || k}
+                          hint={p.description}
+                        >
+                          <ParameterInput
+                            spec={p}
+                            value={params[k] ?? p.default}
+                            onChange={(value) =>
+                              setParams({ ...params, [k]: value })
+                            }
+                          />
+                        </Field>
+                      ))}
+                    </div>
+                    {Object.keys(props).length === 0 && (
+                      <p className="dim">此策略没有需要调整的参数。</p>
+                    )}
+                  </section>
+                  <section>
+                    <h3 className="form-section-title">参数预设</h3>
+                    <Field label="参数预设名称">
                       <input
-                        type="number"
-                        min={manifest.account?.min_capital || 1}
-                        required
-                        value={form.initial_capital}
-                        onChange={(e) =>
-                          change("initial_capital", e.target.value)
-                        }
+                        placeholder="输入名称后另存为"
+                        value={preset}
+                        onChange={(e) => setPreset(e.target.value)}
                       />
                     </Field>
-                    <Field label="杠杆">
-                      <input
-                        type="number"
-                        min="1"
-                        max={
-                          manifest.market === "spot"
-                            ? 1
-                            : manifest.account?.leverage_max || 1
-                        }
-                        value={form.leverage}
-                        onChange={(e) => change("leverage", e.target.value)}
-                      />
-                    </Field>
-                  </div>
-                  <Field
-                    label="随机种子"
-                    hint="与策略、参数、数据版本一同保存，便于复现实验"
-                  >
-                    <input
-                      type="number"
-                      step="1"
-                      value={form.seed}
-                      onChange={(e) => change("seed", e.target.value)}
-                    />
-                  </Field>
-                </section>
-                <section>
-                  <h3 className="form-section-title">交易成本</h3>
-                  <Field
-                    label="读取币安账户费率"
-                    hint="个人费率需要已接入的实盘凭证，公开 K 线接口不提供个人费率。"
-                  >
                     <div className="preset-row">
                       <select
-                        value={feeAccount}
-                        onChange={(e) => setFeeAccount(e.target.value)}
+                        aria-label="加载参数预设"
+                        value=""
+                        onChange={(e) => {
+                          const p = presets[Number(e.target.value)];
+                          setSid(p.strategy_id);
+                          setParams(p.parameters);
+                          notify("预设已加载");
+                        }}
                       >
-                        <option value="">选择具备凭证的账户</option>
-                        {(data.accounts || [])
-                          .filter((a) => a.mode === "live" && a.has_credentials)
-                          .map((a) => (
-                            <option key={a.id} value={a.id}>
-                              {a.name}
-                            </option>
-                          ))}
+                        <option value="">加载服务器参数预设</option>
+                        {presets.map((p, i) => (
+                          <option key={i} value={i}>
+                            {p.name}
+                          </option>
+                        ))}
                       </select>
-                      <Btn
-                        type="button"
-                        icon={feeBusy ? Loader2 : RefreshCw}
-                        disabled={!feeAccount || feeBusy}
-                        onClick={readFee}
-                      >
-                        读取
+                      <Btn type="button" icon={Copy} onClick={savePreset}>
+                        另存为
                       </Btn>
                     </div>
+                  </section>
+                </div>
+              </fieldset>
+              <fieldset
+                className="config-tab-panel"
+                hidden={configTab !== "data"}
+                disabled={configTab !== "data"}
+              >
+                <div className="form-grid">
+                  <Field label="K 线数据集">
+                    <select
+                      required
+                      value={form.dataset_id}
+                      onChange={(e) => {
+                        change("dataset_id", e.target.value);
+                        const d = datasets.find((x) => x.id === e.target.value);
+                        if (d?.symbols) change("symbols", d.symbols.join(","));
+                      }}
+                    >
+                      <option value="">请选择数据集</option>
+                      {datasets.map((d) => (
+                        <option key={d.id} value={d.id}>
+                          {d.name}{" "}
+                          {["demo", "synthetic"].includes(d.source)
+                            ? "[合成数据]"
+                            : ""}
+                        </option>
+                      ))}
+                    </select>
                   </Field>
-                  <p className="fee-source">当前费率来源：{feeSource}</p>
-                  <div className="form-grid">
+                  <Field label="交易对">
+                    <input
+                      value={form.symbols}
+                      required
+                      onChange={(e) =>
+                        change("symbols", e.target.value.toUpperCase())
+                      }
+                    />
+                  </Field>
+                </div>
+                <p className="fee-source">
+                  数据覆盖（北京时间）：
+                  {formatBeijing(
+                    datasets.find((d) => d.id === form.dataset_id)?.start,
+                  )}{" "}
+                  —{" "}
+                  {formatBeijing(
+                    datasets.find((d) => d.id === form.dataset_id)?.end,
+                  )}
+                  ，结束为末根 K 线开盘时间。
+                </p>
+                <div className="config-section-grid">
+                  <div className="date-group">
+                    <span>
+                      <i />
+                      回测集 · 北京时间
+                    </span>
+                    <div className="form-grid">
+                      <Field label="开始">
+                        <input
+                          type="datetime-local"
+                          step="1"
+                          required
+                          value={form.train_start}
+                          onChange={(e) =>
+                            change("train_start", e.target.value)
+                          }
+                        />
+                      </Field>
+                      <Field label="结束（不含）">
+                        <input
+                          type="datetime-local"
+                          step="1"
+                          required
+                          value={form.train_end}
+                          onChange={(e) => change("train_end", e.target.value)}
+                        />
+                      </Field>
+                    </div>
+                  </div>
+                  <div className="date-group validation">
+                    <span>
+                      <i />
+                      验证集 · 北京时间
+                    </span>
+                    <div className="form-grid">
+                      <Field label="开始">
+                        <input
+                          type="datetime-local"
+                          step="1"
+                          min={form.train_end}
+                          required
+                          value={form.validation_start}
+                          onChange={(e) =>
+                            change("validation_start", e.target.value)
+                          }
+                        />
+                      </Field>
+                      <Field label="结束（不含）">
+                        <input
+                          type="datetime-local"
+                          step="1"
+                          required
+                          value={form.validation_end}
+                          onChange={(e) =>
+                            change("validation_end", e.target.value)
+                          }
+                        />
+                      </Field>
+                    </div>
+                  </div>
+                </div>
+              </fieldset>
+              <fieldset
+                className="config-tab-panel"
+                hidden={configTab !== "execution"}
+                disabled={configTab !== "execution"}
+              >
+                <div className="config-section-grid">
+                  <section>
+                    <h3 className="form-section-title">账户与实验环境</h3>
+                    <div className="form-grid">
+                      <Field label="初始资金（U）">
+                        <input
+                          type="number"
+                          min={manifest.account?.min_capital || 1}
+                          required
+                          value={form.initial_capital}
+                          onChange={(e) =>
+                            change("initial_capital", e.target.value)
+                          }
+                        />
+                      </Field>
+                      <Field label="杠杆">
+                        <input
+                          type="number"
+                          min="1"
+                          max={
+                            manifest.market === "spot"
+                              ? 1
+                              : manifest.account?.leverage_max || 1
+                          }
+                          value={form.leverage}
+                          onChange={(e) => change("leverage", e.target.value)}
+                        />
+                      </Field>
+                    </div>
                     <Field
-                      label="手续费率"
-                      hint="默认估计值，可按账户实际费率修改"
+                      label="随机种子"
+                      hint="与策略、参数、数据版本一同保存，便于复现实验"
                     >
                       <input
                         type="number"
-                        min="0"
-                        max="0.1"
-                        step="0.00001"
-                        value={form.fee_rate}
-                        onChange={(e) => {
-                          change("fee_rate", e.target.value);
-                          setFeeSource("手动配置");
-                        }}
+                        step="1"
+                        value={form.seed}
+                        onChange={(e) => change("seed", e.target.value)}
                       />
                     </Field>
-                    <Field label="滑点（基点）" hint="1 bp = 0.01%">
-                      <input
-                        type="number"
-                        min="0"
-                        step="0.1"
-                        value={form.slippage_bps}
-                        onChange={(e) => change("slippage_bps", e.target.value)}
-                      />
+                  </section>
+                  <section>
+                    <h3 className="form-section-title">交易成本</h3>
+                    <Field
+                      label="读取币安账户费率"
+                      hint="个人费率需要已接入的实盘凭证，公开 K 线接口不提供个人费率。"
+                    >
+                      <div className="preset-row">
+                        <select
+                          value={feeAccount}
+                          onChange={(e) => setFeeAccount(e.target.value)}
+                        >
+                          <option value="">选择具备凭证的账户</option>
+                          {(data.accounts || [])
+                            .filter(
+                              (a) => a.mode === "live" && a.has_credentials,
+                            )
+                            .map((a) => (
+                              <option key={a.id} value={a.id}>
+                                {a.name}
+                              </option>
+                            ))}
+                        </select>
+                        <Btn
+                          type="button"
+                          icon={feeBusy ? Loader2 : RefreshCw}
+                          disabled={!feeAccount || feeBusy}
+                          onClick={readFee}
+                        >
+                          读取
+                        </Btn>
+                      </div>
                     </Field>
-                  </div>
-                </section>
-              </div>
-            </fieldset>
+                    <p className="fee-source">当前费率来源：{feeSource}</p>
+                    <div className="form-grid">
+                      <Field
+                        label="手续费率"
+                        hint="默认估计值，可按账户实际费率修改"
+                      >
+                        <input
+                          type="number"
+                          min="0"
+                          max="0.1"
+                          step="0.00001"
+                          value={form.fee_rate}
+                          onChange={(e) => {
+                            change("fee_rate", e.target.value);
+                            setFeeSource("手动配置");
+                          }}
+                        />
+                      </Field>
+                      <Field label="滑点（基点）" hint="1 bp = 0.01%">
+                        <input
+                          type="number"
+                          min="0"
+                          step="0.1"
+                          value={form.slippage_bps}
+                          onChange={(e) =>
+                            change("slippage_bps", e.target.value)
+                          }
+                        />
+                      </Field>
+                    </div>
+                  </section>
+                </div>
+              </fieldset>
+            </div>
             {err && <div className="inline-error">{err}</div>}
             <div className="experiment-summary">
               <div>
@@ -3430,6 +3698,68 @@ function Backtest({ data, mutate, notify, go }) {
           </form>
         </section>
         <div className="backtest-results">
+          <section className="panel result-overview">
+            <div className="panel-heading">
+              <div>
+                <h2>实验结果</h2>
+                <p>
+                  {job
+                    ? `${active ? "当前实验" : "最近实验"} · ${job.name || job.strategy_name}`
+                    : "选择策略与数据，开始第一次实验。"}
+                </p>
+              </div>
+              {job && <Badge status={job.status} />}
+            </div>
+            <div className="result-metrics">
+              {[
+                ["最终权益", job?.metrics?.final_equity, "U"],
+                [
+                  "总收益率",
+                  job?.metrics?.total_return != null
+                    ? job.metrics.total_return * 100
+                    : null,
+                  "%",
+                ],
+                [
+                  "最大回撤",
+                  job?.metrics?.max_drawdown != null
+                    ? job.metrics.max_drawdown * 100
+                    : null,
+                  "%",
+                ],
+                ["成交订单", job?.metrics?.total_orders, "笔"],
+              ].map(([label, value, unit]) => (
+                <div key={label}>
+                  <span>{label}</span>
+                  <strong
+                    className={
+                      label === "总收益率"
+                        ? valueTone(value)
+                        : label === "最大回撤" && value > 0
+                          ? "negative"
+                          : ""
+                    }
+                  >
+                    {value == null
+                      ? "—"
+                      : unit === "%"
+                        ? `${Number(value).toFixed(2)}`
+                        : unit === "笔"
+                          ? value
+                          : money(value)}
+                    <small>{unit}</small>
+                  </strong>
+                </div>
+              ))}
+            </div>
+            {job && job.status !== "completed" && (
+              <p className="result-incomplete">
+                {["queued", "running"].includes(job.status)
+                  ? "实验进行中，统计结果尚未完成。"
+                  : "实验未完成，详情可在实验记录中查看。"}
+              </p>
+            )}
+          </section>
           <section className="panel">
             <div className="panel-heading">
               <div>
@@ -3447,7 +3777,20 @@ function Backtest({ data, mutate, notify, go }) {
                 <progress max="1" value={job.progress || 0} />
               </div>
             )}
-            <Chart data={job?.curve || []} height={290} />
+            {job ? (
+              <Chart data={job.curve || []} height={320} />
+            ) : (
+              <Empty
+                icon={FlaskConical}
+                title="等待运行回测"
+                desc="设置左侧参数后点击「开始回测」，这里会显示权益曲线与实验结果。"
+              />
+            )}
+            {job?.curve_sampling && (
+              <p className="chart-data-note">
+                概览按区间保留极值 · 实验详情包含完整数据
+              </p>
+            )}
             {job?.error && <div className="inline-error">{job.error}</div>}
           </section>
           <section className="panel">
@@ -3552,10 +3895,10 @@ function Experiments({ data, mutate, notify, go }) {
                 <th>实验 / 策略</th>
                 <th>创建时间 · 北京时间</th>
                 <th>状态</th>
-                <th>回测收益</th>
-                <th>验证收益</th>
-                <th>最大回撤</th>
-                <th>夏普</th>
+                <th className="numeric">回测收益</th>
+                <th className="numeric">验证收益</th>
+                <th className="numeric">最大回撤</th>
+                <th className="numeric">夏普</th>
                 <th>操作</th>
               </tr>
             </thead>
@@ -3594,7 +3937,7 @@ function Experiments({ data, mutate, notify, go }) {
                     <Badge status={e.status} />
                   </td>
                   <td
-                    className={`mono ${e.metrics?.total_return == null ? "" : e.metrics.total_return >= 0 ? "positive" : "negative"}`}
+                    className={`mono numeric ${valueTone(e.metrics?.total_return)}`}
                   >
                     {pct(
                       e.metrics?.total_return != null
@@ -3603,7 +3946,7 @@ function Experiments({ data, mutate, notify, go }) {
                     )}
                   </td>
                   <td
-                    className={`mono ${e.validation_metrics?.total_return == null ? "" : e.validation_metrics.total_return >= 0 ? "positive" : "negative"}`}
+                    className={`mono numeric ${valueTone(e.validation_metrics?.total_return)}`}
                   >
                     {pct(
                       e.validation_metrics?.total_return != null
@@ -3611,12 +3954,14 @@ function Experiments({ data, mutate, notify, go }) {
                         : null,
                     )}
                   </td>
-                  <td className="negative mono">
+                  <td
+                    className={`mono numeric ${e.metrics?.max_drawdown > 0 ? "negative" : ""}`}
+                  >
                     {e.metrics?.max_drawdown != null
                       ? `${(e.metrics.max_drawdown * 100).toFixed(2)}%`
                       : "—"}
                   </td>
-                  <td className="mono">{money(e.metrics?.sharpe)}</td>
+                  <td className="numeric">{money(e.metrics?.sharpe)}</td>
                   <td>
                     <div className="row-buttons">
                       <button
@@ -3682,7 +4027,9 @@ function Experiments({ data, mutate, notify, go }) {
                 <tr>
                   <th>指标 / 参数</th>
                   {compared.map((e) => (
-                    <th key={e.id}>{e.name || e.id.slice(0, 8)}</th>
+                    <th className="numeric" key={e.id}>
+                      {e.name || e.id.slice(0, 8)}
+                    </th>
                   ))}
                 </tr>
               </thead>
@@ -3691,7 +4038,7 @@ function Experiments({ data, mutate, notify, go }) {
                   <tr key={key}>
                     <td>{label}</td>
                     {compared.map((e) => (
-                      <td className="mono" key={e.id}>
+                      <td className="numeric" key={e.id}>
                         {e.metrics?.[key] != null
                           ? unit === "%"
                             ? `${(e.metrics[key] * 100).toFixed(2)}%`
@@ -4228,8 +4575,8 @@ function ParameterInput({ spec, value, onChange }) {
         value={String(Boolean(value))}
         onChange={(e) => onChange(e.target.value === "true")}
       >
-        <option value="true">开启 / true</option>
-        <option value="false">关闭 / false</option>
+        <option value="true">允许</option>
+        <option value="false">不允许</option>
       </select>
     );
   if (spec.enum)

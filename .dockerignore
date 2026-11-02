@@ -33,3 +33,6 @@ htmlcov
 *.tgz
 *.zip
 *-credentials.json
+
+*.sql
+*.sql.gz

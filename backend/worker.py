@@ -18,12 +18,12 @@ import sys
 import time
 import traceback
 
-from . import db
+from . import db, storage
 
 
 def service(name,owner):
     with db.connect() as con:
-        con.execute("INSERT INTO services VALUES(?,?,?,'online') ON CONFLICT(name) DO UPDATE SET owner=excluded.owner,heartbeat=excluded.heartbeat,status='online'",(name,owner,db.now()))
+        con.execute("INSERT INTO services VALUES(?,?,?,'online') ON DUPLICATE KEY UPDATE owner=VALUES(owner),heartbeat=VALUES(heartbeat),status='online'",(name,owner,db.now()))
 
 
 def ui_metrics(m):
@@ -39,19 +39,32 @@ def ui_metrics(m):
 def run_experiment(id):
     from .engine import run_backtest,BacktestCancelled
     with db.connect() as con:
-        row=con.execute("SELECT * FROM experiments WHERE id=?",(id,)).fetchone()
+        row=con.execute("SELECT * FROM experiments WHERE id=? FOR UPDATE",(id,)).fetchone()
         if not row or row["status"] not in {"queued","running"}:
             return
+        if row["status"]=="running" and row["worker_pid"] not in {None,os.getpid()}:
+            return
+        if row["cancel_requested"]:
+            con.execute("UPDATE experiments SET status='cancelled',completed_at=? WHERE id=?",(db.now(),id))
+            return
         strategy=con.execute("SELECT * FROM strategies WHERE id=?",(row["strategy_id"],)).fetchone()
+        config=db.parse(row["config"],{})
+        provenance=db.parse(row["provenance"],{})
+        version=con.execute("SELECT * FROM strategy_versions WHERE id=?",(config.get("strategy_version_id",provenance.get("strategy_version_id","")),)).fetchone()
+        if not version:
+            version=con.execute("SELECT * FROM strategy_versions WHERE strategy_id=? AND source_hash=?",(row["strategy_id"],provenance.get("strategy_hash",""))).fetchone()
+        if version and strategy:
+            strategy={**dict(version),"trusted":strategy["trusted"]}
         dataset=con.execute("SELECT * FROM datasets WHERE id=?",(row["dataset_id"],)).fetchone()
         con.execute("UPDATE experiments SET status='running',worker_pid=?,started_at=? WHERE id=?",(os.getpid(),db.now(),id))
     partial={"curve":[],"validation_curve":[],"metrics":{},"validation_metrics":{},"incomplete":True}
     try:
         if not strategy or not strategy["trusted"]:
             raise ValueError("自定义代码未经离线安全审核，禁止执行")
-        config=db.parse(row["config"],{})
+        if not version or strategy["source_hash"]!=provenance.get("strategy_hash"):
+            raise ValueError("实验固定的策略版本缺失或不匹配，拒绝使用变化后的源码")
         manifest=db.parse(strategy["manifest"],{})
-        candles=db.parse(dataset["candles"],{})
+        candles=storage.read_candles(dataset["candles"], symbols=config["symbols"], start=config["ranges_ms"][0], end=config["ranges_ms"][3])
         ranges=config["ranges_ms"]
         random.seed(config["seed"])
         filters=None
@@ -69,16 +82,22 @@ def run_experiment(id):
             def progress(event):
                 partial[curve_key].extend(event.get("equity",[]))
                 value=min(99.9,(i+event["processed"]/max(event["total"],1))*50)
+                preview={**partial,"curve":storage.curve_preview(partial["curve"]),"validation_curve":storage.curve_preview(partial["validation_curve"]),"curve_sampling":"bucket_min_max_preserves_extrema"}
                 with db.connect() as con:
-                    con.execute("UPDATE experiments SET progress=?,result=? WHERE id=?",(value,db.dump(partial),id))
+                    con.execute("UPDATE experiments SET progress=?,result=? WHERE id=? AND status='running'",(value,db.dump(preview),id))
             output[split]=run_backtest(strategy["source"],config["parameters"],data,config["initial_capital"],config["fee_rate"],config["slippage_bps"],market=config["market"],leverage=config.get("leverage",manifest["account"]["leverage_min"]),symbol_filters=filters,progress=progress,cancelled=cancelled)
             partial["metrics" if split=="train" else "validation_metrics"]=ui_metrics(output[split]["metrics"])
         if cancelled():
             raise BacktestCancelled("任务取消")
         result={"metrics":ui_metrics(output["train"]["metrics"]),"validation_metrics":ui_metrics(output["validation"]["metrics"]),"curve":output["train"]["equity"],"validation_curve":output["validation"]["equity"],"orders":[dict(o,split=split) for split,r in output.items() for o in r["orders"]],"decisions":[dict(o,split=split) for split,r in output.items() for o in r["decisions"]],"assumptions":output["train"]["assumptions"],"incomplete":False}
         result["differences"]={k:result["validation_metrics"][k]-v for k,v in result["metrics"].items() if isinstance(v,(int,float)) and isinstance(result["validation_metrics"].get(k),(int,float))}
+        stored_result=storage.store_result(result)
         with db.connect() as con:
-            con.execute("UPDATE experiments SET status='completed',progress=100,result=?,completed_at=?,error=NULL WHERE id=?",(db.dump(result),db.now(),id))
+            current=con.execute("SELECT cancel_requested FROM experiments WHERE id=? FOR UPDATE",(id,)).fetchone()
+            if current and current["cancel_requested"]:
+                raise BacktestCancelled("任务取消")
+            con.execute("UPDATE experiments SET status='completed',progress=100,result=?,completed_at=?,error=NULL WHERE id=?",(db.dump(stored_result),db.now(),id))
+            db.audit(con,None,"experiment.complete","experiment",id,{"strategy_version_id":version["id"],"artifact_counts":{key:manifest["count"] for key,manifest in stored_result["artifacts"].items()}})
         db.log("debug","回测及验证集完成",strategy_id=row["strategy_id"],details={"experiment_id":id})
     except BacktestCancelled:
         with db.connect() as con:
@@ -94,7 +113,7 @@ def _child_limits():
     import resource
     resource.setrlimit(resource.RLIMIT_CPU,(300,305))
     if sys.platform.startswith("linux"):
-        memory=1024*1024*1024
+        memory=int(os.getenv("MK_BACKTEST_ADDRESS_SPACE_MB","2048"))*1024*1024
         inherited=resource.getrlimit(resource.RLIMIT_AS)[1]
         if inherited!=resource.RLIM_INFINITY:
             memory=min(memory,inherited)
@@ -128,8 +147,7 @@ def backtest_loop(once=False):
                     if time.time()-datetime.fromisoformat(job["started_at"]).timestamp()>60:
                         con.execute("UPDATE experiments SET status='failed',error='原回测工作进程已退出，完整统计未完成；可重跑',completed_at=? WHERE id=? AND status='running'",(db.now(),job["id"]))
         with db.connect() as con:
-            con.execute("BEGIN IMMEDIATE")
-            row=con.execute("SELECT id FROM experiments WHERE status='queued' AND cancel_requested=0 ORDER BY created_at LIMIT 1").fetchone()
+            row=con.execute("SELECT id FROM experiments WHERE status='queued' AND cancel_requested=0 ORDER BY created_at,id LIMIT 1 FOR UPDATE").fetchone()
             if row:
                 con.execute("UPDATE experiments SET status='running',started_at=? WHERE id=? AND status='queued'",(db.now(),row["id"]))
         if row:
@@ -180,8 +198,8 @@ def _monitor_job(child,job_id,owner,started):
 
 
 def ensure_market_cache():
-    with db.connect() as con:
-        con.execute("CREATE TABLE IF NOT EXISTS market_cache(market TEXT NOT NULL,symbol TEXT NOT NULL,interval TEXT NOT NULL,candles TEXT NOT NULL,filters TEXT NOT NULL,fetched_at REAL NOT NULL,PRIMARY KEY(market,symbol,interval))")
+    # DDL belongs to the shared versioned InnoDB schema, never actor ticks.
+    return None
 
 
 def market_loop(once=False):
@@ -207,7 +225,7 @@ def market_loop(once=False):
                 candles=client.klines(symbol,"1m",end-1000*60000,end)
                 candles=[c for c in candles if c["timestamp"]<end]
                 with db.connect() as con:
-                    con.execute("INSERT INTO market_cache VALUES(?,?,'1m',?,?,?) ON CONFLICT(market,symbol,interval) DO UPDATE SET candles=excluded.candles,filters=excluded.filters,fetched_at=excluded.fetched_at",(market,symbol,db.dump(candles),db.dump(item.get("filters",item)),time.time()))
+                    con.execute("INSERT INTO market_cache VALUES(?,?,'1m',?,?,?) ON DUPLICATE KEY UPDATE candles=VALUES(candles),filters=VALUES(filters),fetched_at=VALUES(fetched_at)",(market,symbol,db.dump(candles),db.dump(item.get("filters",item)),time.time()))
             except Exception as exc:
                 db.log("error","共享行情更新失败",details={"symbol":symbol,"market":market,"exception":type(exc).__name__})
         if once:
@@ -269,10 +287,19 @@ def runtime_tick(account_id,owner):
         commands=con.execute("SELECT * FROM commands WHERE account_id=? AND status IN ('pending','running') ORDER BY created_at",(account_id,)).fetchall()
         strategy=con.execute("SELECT * FROM strategies WHERE id=?",(account["strategy_id"],)).fetchone()
         saved=con.execute("SELECT payload FROM ledger WHERE account_id=? AND kind='snapshot' ORDER BY created_at DESC LIMIT 1",(account_id,)).fetchone()
+    def current_lease(con):
+        lease=db.lock_instance(con,account_id)
+        return bool(lease and lease["owner"]==owner and lease["fence"]==fence
+                    and lease["lease_until"]>time.time()
+                    and lease["desired_state"]==instance["desired_state"]
+                    and lease["config_revision"]==instance["config_revision"])
     if account["mode"]=="live" or account["source"]=="demo":
         with db.connect() as con:
+            if not current_lease(con):
+                return True
             for command in commands:
                 con.execute("UPDATE commands SET status='failed',error=?,completed_at=? WHERE id=?",("演示账户或实盘执行闸门关闭；未向交易所下单",db.now(),command["id"]))
+                db.audit(con,None,"command.fail","command",command["id"],{"account_id":account_id,"reason":"execution_gate_closed","fence":fence})
             con.execute("UPDATE instances SET observed_state='stopped',desired_state='stopped',error=? WHERE account_id=?",("执行闸门关闭",account_id))
         return False
     manifest=db.parse(strategy["manifest"],{})
@@ -296,11 +323,16 @@ def runtime_tick(account_id,owner):
     if not fresh:
         if mode=="stopped" and not any(p.quantity for p in ledger.positions.values()):
             with db.connect() as con:
+                if not current_lease(con):
+                    return True
                 if commands:
                     con.execute("UPDATE commands SET status='completed',completed_at=?,result=? WHERE id=?",(db.now(),db.dump({"message":"无持仓，已停止"}),commands[0]["id"]))
+                    db.audit(con,None,"command.complete","command",commands[0]["id"],{"account_id":account_id,"observed_state":"stopped","fence":fence})
                 con.execute("UPDATE instances SET observed_state='stopped',last_heartbeat=?,error=NULL WHERE account_id=?",(db.now(),account_id))
             return False
         with db.connect() as con:
+            if not current_lease(con):
+                return True
             con.execute("UPDATE instances SET observed_state='starting',error='等待新鲜的共享行情，禁止开仓',last_heartbeat=? WHERE account_id=?",(db.now(),account_id))
         return True
     histories={s:db.parse(c["candles"],[]) for s,c in zip(symbols,cached)}
@@ -310,6 +342,8 @@ def runtime_tick(account_id,owner):
     timestamp=max(common)
     if int(time.time()*1000)-timestamp>150000:
         with db.connect() as con:
+            if not current_lease(con):
+                return True
             con.execute("UPDATE instances SET observed_state='starting',error='最后一根完整 K 线已过期，禁止开仓',last_heartbeat=? WHERE account_id=? AND owner=?",(db.now(),account_id,owner))
         return True
     bars={s:next(c for c in reversed(rows) if c["timestamp"]==timestamp) for s,rows in histories.items()}
@@ -319,6 +353,8 @@ def runtime_tick(account_id,owner):
     old_order_count=len(ledger.orders)
     if timestamp==last and not commands:
         with db.connect() as con:
+            if not current_lease(con):
+                return True
             con.execute("UPDATE instances SET last_heartbeat=?,observed_state=?,error=NULL WHERE account_id=? AND owner=? AND fence=?",(db.now(),mode,account_id,owner,fence))
         return mode!="stopped"
     risk=[]
@@ -370,20 +406,20 @@ def runtime_tick(account_id,owner):
     metrics={"today_pnl":period_pnl(day_start),"month_pnl":period_pnl(month_start),"running_days":max(1,int((timestamp-curve[0]["timestamp"])/86400000)+1) if curve else 0,**ledger.account(),**stats,"return_pct":stats["total_return_pct"],"max_drawdown_u":stats["max_drawdown_amount"],"position_count":len(positions),"long_count":sum(p["quantity"]>0 for p in positions),"short_count":sum(p["quantity"]<0 for p in positions),"curve":curve,"positions":positions,"orders":ledger.orders,"display":display,"data_updated_at":db.now(),"risk":risk,"execution_model":{"fee_rate":float(ledger.fee_rate),"slippage_bps":2,"fee_source":"documented_simulation_assumption","interval":"1m","funding_included":False,"liquidation_simulated":False}}
     snapshot={"balance":str(ledger.balance),"fees":str(ledger.fees),"positions":{s:{"quantity":str(p.quantity),"average_price":str(p.average_price),"entry_fees":str(p.entry_fees)} for s,p in ledger.positions.items()},"orders":ledger.orders,"closed_pnls":[str(v) for v in ledger.closed_pnls],"pending":pending,"strategy_state":strategy_state,"revision":revision,"last_timestamp":timestamp,"bar_index":snapshot.get("bar_index",0)+(timestamp>last),"curve":curve}
     with db.connect() as con:
-        con.execute("BEGIN IMMEDIATE")
-        lease=con.execute("SELECT * FROM instances WHERE account_id=?",(account_id,)).fetchone()
-        if lease["owner"]!=owner or lease["fence"]!=fence or lease["lease_until"]<=time.time() or lease["desired_state"]!=instance["desired_state"]:
+        if not current_lease(con):
             return True
         for order in ledger.orders[old_order_count:]:
+            db.persist_fill(con,account_id,order)
             con.execute("INSERT INTO ledger VALUES(?,?,?,?,?,?)",(db.uid(),account_id,"fill",f"{account_id}:{order['id']}",db.dump(order),db.now()))
         if timestamp>last:
-            con.execute("INSERT OR IGNORE INTO ledger VALUES(?,?,?,?,?,?)",(db.uid(),account_id,"valuation",f"valuation:{account_id}:{timestamp}",db.dump(curve[-1]),db.now()))
-        con.execute("INSERT INTO ledger VALUES(?,?,?,?,?,?) ON CONFLICT(reference) DO UPDATE SET payload=excluded.payload,created_at=excluded.created_at",(db.uid(),account_id,"snapshot",f"snapshot:{account_id}",db.dump(snapshot),db.now()))
+            con.execute("INSERT IGNORE INTO ledger VALUES(?,?,?,?,?,?)",(db.uid(),account_id,"valuation",f"valuation:{account_id}:{timestamp}",db.dump(curve[-1]),db.now()))
+        con.execute("INSERT INTO ledger VALUES(?,?,?,?,?,?) ON DUPLICATE KEY UPDATE payload=VALUES(payload),created_at=VALUES(created_at)",(db.uid(),account_id,"snapshot",f"snapshot:{account_id}",db.dump(snapshot),db.now()))
         con.execute("UPDATE accounts SET metrics=? WHERE id=?",(db.dump(metrics),account_id))
         con.execute("UPDATE instances SET observed_state=?,last_heartbeat=?,error=NULL WHERE account_id=?",(mode,db.now(),account_id))
         con.execute("INSERT INTO runtime_events(account_id,fence,event,payload,created_at) VALUES(?,?,?,?,?)",(account_id,fence,"paper_tick",db.dump({"timestamp":timestamp,"mode":mode,"risk":risk}),db.now()))
         if commands:
             con.execute("UPDATE commands SET status='completed',completed_at=?,result=? WHERE id=?",(db.now(),db.dump({"observed_state":mode,"fence":fence}),commands[0]["id"]))
+            db.audit(con,None,"command.complete","command",commands[0]["id"],{"account_id":account_id,"observed_state":mode,"fence":fence})
     return mode!="stopped" or len(commands)>1
 
 
@@ -394,8 +430,11 @@ def account_loop(account_id,once=False):
             keep_running=runtime_tick(account_id,owner)
         except Exception as exc:
             with db.connect() as con:
-                con.execute("UPDATE instances SET observed_state='error',desired_state='stopped',error=? WHERE account_id=? AND owner=?",(str(exc)[:2000],account_id,owner))
-                con.execute("UPDATE commands SET status='failed',completed_at=?,error=? WHERE account_id=? AND status IN ('pending','running')",(db.now(),str(exc)[:2000],account_id))
+                lease=db.lock_instance(con,account_id)
+                if lease and lease["owner"]==owner and lease["lease_until"]>time.time():
+                    con.execute("UPDATE instances SET observed_state='error',desired_state='stopped',error=? WHERE account_id=?",(str(exc)[:2000],account_id))
+                    con.execute("UPDATE commands SET status='failed',completed_at=?,error=? WHERE account_id=? AND status IN ('pending','running')",(db.now(),str(exc)[:2000],account_id))
+                    db.audit(con,None,"instance.fail","account",account_id,{"error":str(exc)[:2000],"fence":lease["fence"]})
             db.log("error","模拟运行进程异常，停止继续开仓",account_id=account_id,details={"error":str(exc)[:2000]})
             return
         if once or not keep_running:
@@ -475,22 +514,24 @@ def main():
             if not row or row["source_hash"]!=args.source_hash or hashlib.sha256(row["source"].encode()).hexdigest()!=args.source_hash:
                 parser.error("策略不存在或源码哈希不匹配，未启用")
             con.execute("UPDATE strategies SET trusted=1 WHERE id=?",(args.id,))
+            db.audit(con,None,"strategy.trust","strategy",args.id,{"source_hash":args.source_hash})
         db.log("debug","通过本地 CLI 批准可信策略代码",strategy_id=args.id,details={"source_hash":args.source_hash})
         print("已启用该精确源码版本。进程资源限制不等于恶意代码沙箱；仅运行已审查的可信策略。")
     elif args.mode=="create-admin":
         import getpass
         from .security import hash_password
         import secrets
-        import sqlite3
         username=(args.username or input("管理员登录名: ")).strip()
         if not username or len(username)>120:
             parser.error("管理员用户名长度必须为 1–120 字符")
         password=secrets.token_urlsafe(24) if args.generate_password else getpass.getpass("密码（至少 10 位）: ")
         try:
             with db.connect() as con:
-                con.execute("INSERT INTO users VALUES(?,?,?,?,?,?,?)",(db.uid(),username,username,None,hash_password(password),"admin",db.now()))
-        except (sqlite3.IntegrityError, ValueError) as exc:
-            parser.error("管理员账号已存在，未覆盖原密码" if isinstance(exc,sqlite3.IntegrityError) else str(exc))
+                user_id=db.uid()
+                con.execute("INSERT INTO users VALUES(?,?,?,?,?,?,?)",(user_id,username,username,None,hash_password(password),"admin",db.now()))
+                db.audit(con,None,"user.create_admin","user",user_id,{})
+        except (db.IntegrityError, ValueError) as exc:
+            parser.error("管理员账号已存在，未覆盖原密码" if isinstance(exc,db.IntegrityError) else str(exc))
         db.log("debug","通过本地 CLI 创建管理员",details={"username":username})
         print(db.dump({"username":username,"password":password,"created":True}) if args.generate_password else "管理员已创建")
     elif args.mode=="backtest":backtest_loop(args.once)

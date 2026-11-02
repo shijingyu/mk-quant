@@ -11,7 +11,7 @@ FROM python:3.11-slim AS backend
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    MK_DB_PATH=/data/mk.sqlite3 \
+    MK_ARTIFACT_ROOT=/data/artifacts \
     MK_ENABLE_LIVE=0 \
     MK_DEMO=0
 WORKDIR /app

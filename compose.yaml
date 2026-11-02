@@ -1,43 +1,64 @@
 name: mk-quant
 
+x-db-environment: &db-environment
+  MK_DB_HOST: mysql
+  MK_DB_PORT: "3306"
+  MK_DB_SSL_MODE: disabled  # isolated, internal Docker database network only
+  MK_DB_NAME: mk_quant
+  MK_DB_USER: mk_quant
+  MK_DB_PASSWORD: ${MK_DB_PASSWORD:?Set a private database password}
+  MK_ARTIFACT_ROOT: /data/artifacts
+  MK_ENABLE_LIVE: "0"
+  MK_DEMO: "0"
+
 x-backend: &backend
   image: mk-quant-backend:local
-  build:
-    context: .
-    target: backend
+  build: {context: ., target: backend}
   restart: unless-stopped
   init: true
   read_only: true
   user: "10001:10001"
-  security_opt:
-    - no-new-privileges:true
-  cap_drop:
-    - ALL
-  tmpfs:
-    - /tmp:size=64m,mode=1777
-  volumes:
-    - mk-data:/data
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+  tmpfs: ["/tmp:size=64m,mode=1777"]
+  volumes: ["mk-artifacts:/data"]
   stop_grace_period: 30s
+  depends_on:
+    mysql: {condition: service_healthy}
   logging:
     driver: json-file
-    options:
-      max-size: "10m"
-      max-file: "3"
+    options: {max-size: 10m, max-file: "3"}
 
 services:
+  mysql:
+    image: mysql:5.7.44
+    platform: linux/amd64
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: mk_quant
+      MYSQL_USER: mk_quant
+      MYSQL_PASSWORD: ${MK_DB_PASSWORD:?Set a private database password}
+      MYSQL_ROOT_PASSWORD: ${MK_DB_ROOT_PASSWORD:?Set a separate private root password}
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_bin", "--default-storage-engine=InnoDB", "--transaction-isolation=READ-COMMITTED", "--default-time-zone=+00:00", "--sql-mode=STRICT_ALL_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ZERO_DATE,NO_ZERO_IN_DATE,NO_ENGINE_SUBSTITUTION"]
+    volumes: ["mysql-data:/var/lib/mysql"]
+    networks: [database]
+    mem_limit: 1g
+    healthcheck:
+      test: [CMD-SHELL, "mysqladmin ping -h 127.0.0.1 --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
   api:
     <<: *backend
     command: ["python", "-m", "uvicorn", "backend.app:app", "--host", "0.0.0.0", "--port", "8765", "--proxy-headers", "--forwarded-allow-ips", "*"]
-    ports:
-      - "127.0.0.1:8765:8765"
+    ports: ["127.0.0.1:8765:8765"]
     environment:
-      MK_DB_PATH: /data/mk.sqlite3
-      MK_ENABLE_LIVE: "0"
-      MK_DEMO: "0"
-      # Supplied by the operator. Empty means credential encryption stays disabled.
+      <<: *db-environment
       MK_MASTER_KEY: ${MK_MASTER_KEY:-}
       MK_COOKIE_SECURE: ${MK_COOKIE_SECURE:-0}
       MK_ALLOWED_ORIGINS: ${MK_ALLOWED_ORIGINS:-http://localhost:8080,http://127.0.0.1:8080}
+    networks: [database, web]
     cpus: "0.75"
     mem_limit: 768m
     pids_limit: 128
@@ -46,60 +67,50 @@ services:
     <<: *backend
     command: ["python", "-m", "backend.worker", "backtest"]
     environment:
-      MK_DB_PATH: /data/mk.sqlite3
-      MK_ENABLE_LIVE: "0"
-      MK_DEMO: "0"
-    # Experiments use persisted historical datasets; no exchange/network access.
-    network_mode: none
+      <<: *db-environment
+      MK_BACKTEST_ADDRESS_SPACE_MB: "2048"
+    # Can reach MySQL only; no public internet or credential master key.
+    networks: [database]
     cpus: "1.0"
-    mem_limit: 1g
+    mem_limit: 768m
     pids_limit: 64
-    healthcheck:
-      disable: true
+    healthcheck: {disable: true}
 
   runtime:
     <<: *backend
     command: ["python", "-m", "backend.worker", "runtime"]
-    environment:
-      MK_DB_PATH: /data/mk.sqlite3
-      MK_ENABLE_LIVE: "0"
-      MK_DEMO: "0"
-    # Runtime owns the shared public-market poller and isolated paper actors.
-    # It is independent from api lifecycle and receives no credential master key.
+    environment: *db-environment
+    networks: [database, market]
     cpus: "2.0"
-    mem_limit: 2g
+    mem_limit: 1g
     pids_limit: 256
-    healthcheck:
-      disable: true
+    healthcheck: {disable: true}
 
   frontend:
     image: mk-quant-frontend:local
-    build:
-      context: .
-      target: frontend
+    build: {context: ., target: frontend}
     restart: unless-stopped
     init: true
     read_only: true
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    tmpfs:
-      - /tmp:size=32m,mode=1777
-    ports:
-      - "127.0.0.1:${MK_HTTP_PORT:-8080}:8080"
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    tmpfs: ["/tmp:size=32m,mode=1777"]
+    ports: ["127.0.0.1:${MK_HTTP_PORT:-8080}:8080"]
+    networks: [web]
     depends_on:
-      api:
-        condition: service_healthy
+      api: {condition: service_healthy}
     cpus: "0.25"
     mem_limit: 128m
     pids_limit: 64
     logging:
       driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+      options: {max-size: 10m, max-file: "3"}
+
+networks:
+  database: {internal: true}
+  web: {}
+  market: {}
 
 volumes:
-  # SQLite WAL requires local filesystem locking. Single-host storage only.
-  mk-data:
+  mysql-data: {}
+  mk-artifacts: {}
