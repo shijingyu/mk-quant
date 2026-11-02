@@ -452,9 +452,9 @@ function Chart({ data = [], height = 270, comparison = false }) {
             domain={["auto", "auto"]}
             tick={{ fill: "var(--muted)", fontSize: 12 }}
             tickFormatter={(n) =>
-              Math.abs(n) >= 1000 ? `${(n / 1000).toFixed(1)}k` : n.toFixed(0)
+              Number(n).toLocaleString("en-US", { maximumFractionDigits: 2 })
             }
-            width={53}
+            width={78}
           />
           <Tooltip
             labelFormatter={(label, payload) =>
