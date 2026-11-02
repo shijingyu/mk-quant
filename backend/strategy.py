@@ -9,7 +9,9 @@ Every call sees completed bars only. ``context`` contains ``params``, current
 ``candles`` keyed by symbol, trailing ``history`` keyed by symbol, ``positions``,
 ``account``, ``timestamp``, ``bar_index``, ``log(level, message, data=None)`` and
 ``emit(**display_fields)``. Return order intents with symbol, side, quantity and
-optional reduce_only/reason. They execute at the next common bar's open.
+optional reduce_only/reason. The default model executes at the next common
+bar's open. maker_grid_v1 provides persistent post-only limit orders, hedge
+lots and execution_events, with the conservative OHLC rules in the protocol.
 Keep persistent instance fields (``self.*``) JSON-compatible: the paper worker
 serializes/restores the instance dictionary between bars and after restarts.
 Do not keep mutable trading state in class/module globals or mutate inputs.
@@ -91,6 +93,15 @@ def validate_manifest(manifest: dict) -> dict:
         _require(account["margin_modes"] == ["cash"], "现货策略的保证金模式必须为 cash")
     else:
         _require("cash" not in account["margin_modes"], "合约策略不可使用 cash 保证金模式")
+
+    execution = result.get("execution")
+    if execution is not None:
+        _require(isinstance(execution, dict), "execution 必须为执行模型声明")
+        _require(execution.get("model") in {"market_next_open_v1", "maker_grid_v1"}, "不支持的 execution.model")
+        if execution["model"] == "maker_grid_v1":
+            _require(result["market"] == "futures", "Maker 网格模型仅支持合约")
+            _require(account["position_modes"] == ["hedge"], "Maker 网格必须声明双向持仓 hedge")
+            _require(account["margin_modes"] == ["cross"], "Maker 网格当前仅支持全仓权益模型 cross")
 
     schema = result.get("parameters")
     _require(isinstance(schema, dict) and schema.get("type") == "object", "parameters 必须声明 object 类型参数结构")
@@ -231,7 +242,7 @@ def load_strategy(source: str):
 
 def builtin_strategies() -> list[dict]:
     strategies = []
-    for filename in ("momentum.py", "spot_dca.py"):
+    for filename in ("momentum.py", "spot_dca.py", "usdc_hedge_grid.py"):
         source = (Path(__file__).parent / "strategies" / filename).read_text(encoding="utf-8")
         manifest = validate_strategy_source(source)
         manifest["source"] = source

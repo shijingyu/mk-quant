@@ -21,6 +21,7 @@ import {
   ChevronRight,
   CircleHelp,
   Clock3,
+  ClipboardList,
   Code2,
   Coins,
   Copy,
@@ -80,6 +81,28 @@ const FMT = new Intl.NumberFormat("en-US", {
 });
 const money = (n) =>
   n == null || !Number.isFinite(Number(n)) ? "—" : FMT.format(Number(n));
+const strategyManifest = (strategy) => strategy?.manifest || strategy || {};
+const isMakerStrategy = (strategy) =>
+  strategyManifest(strategy).execution?.model === "maker_grid_v1";
+const strategySymbols = (strategy, fallback = ["BTCUSDT"]) => {
+  const values = strategyManifest(strategy).symbols?.values;
+  return Array.isArray(values) && values.length ? values : fallback;
+};
+const tradeNumber = (value) =>
+  value == null || !Number.isFinite(Number(value))
+    ? "—"
+    : Number(value).toLocaleString("en-US", { maximumFractionDigits: 12 });
+function MakerNotice({ compact = false }) {
+  return (
+    <div className={`notice amber maker-notice ${compact ? "compact" : ""}`}>
+      <ShieldAlert size={16} />
+      <span>
+        Maker-only：止损触发后可能被拒或持续未成交，不会使用 Taker
+        后备平仓。OHLC 回测与模拟不保证实盘成交。
+      </span>
+    </div>
+  );
+}
 const pct = (n) =>
   n == null || !Number.isFinite(Number(n))
     ? "—"
@@ -139,13 +162,14 @@ const labelStatus = {
   blocked: "接入未通过",
   stale: "状态过期",
   stopping: "停止中",
+  flattening: "正在平仓",
 };
 const stateClass = (s) =>
   ["running", "completed", "ok", "passed", "pass"].includes(s)
     ? "green"
     : ["failed", "error", "blocked", "fail"].includes(s)
       ? "red"
-      : ["pending", "queued", "stopping", "stale"].includes(s)
+      : ["pending", "queued", "stopping", "flattening", "stale"].includes(s)
         ? "amber"
         : "muted";
 const navs = [
@@ -172,6 +196,7 @@ const navs = [
     items: [
       ["logs", "运行日志", Terminal],
       ["protocol", "策略接入协议", BookOpen],
+      ["todo", "to-do", ClipboardList],
     ],
   },
 ];
@@ -579,7 +604,12 @@ export default function App() {
                 accounts: (previous.accounts || []).map((a) => ({
                   ...a,
                   stale: true,
-                  status: ["running", "paused", "starting"].includes(a.status)
+                  status: [
+                    "running",
+                    "paused",
+                    "starting",
+                    "flattening",
+                  ].includes(a.status)
                     ? "unknown"
                     : a.status,
                 })),
@@ -803,6 +833,7 @@ export default function App() {
                 <Logs logs={data.logs || []} strategies={strategies} />
               )}
               {page === "protocol" && <Protocol notify={notify} />}
+              {page === "todo" && <Todo />}
             </>
           )}
           <footer>
@@ -893,7 +924,15 @@ export default function App() {
               复制客户链接
             </Btn>
           </div>
-          <ClientView account={modal.account} />
+          <ClientView
+            account={
+              data.accounts.find((account) => account.id === modal.account.id) || {
+                ...modal.account,
+                stale: true,
+                status: "unknown",
+              }
+            }
+          />
         </Modal>
       )}
     </div>
@@ -1953,7 +1992,7 @@ function AccountForm({ account, strategies, mutate, notify, onClose }) {
       mode: account?.mode || "paper",
       initial_equity: account?.initial_equity || 10000,
       strategy_id: account?.strategy_id || strategies[0]?.id || "",
-      symbols: (account?.symbols || ["BTCUSDT"]).join(","),
+      symbols: (account?.symbols || strategySymbols(strategies[0])).join(","),
       api_key: "",
       api_secret: "",
       config: account?.config || {},
@@ -1962,6 +2001,7 @@ function AccountForm({ account, strategies, mutate, notify, onClose }) {
     [err, setErr] = useState("");
   const change = (k, v) => setForm((f) => ({ ...f, [k]: v }));
   const strategy = strategies.find((s) => s.id === form.strategy_id);
+  const maker = isMakerStrategy(strategy);
   const params =
     strategy?.manifest?.parameters?.properties ||
     strategy?.parameters?.properties ||
@@ -1979,6 +2019,18 @@ function AccountForm({ account, strategies, mutate, notify, onClose }) {
           setBusy(true);
           setErr("");
           try {
+            const selectedSymbols = form.symbols
+              .split(/[,，\s]+/)
+              .filter(Boolean);
+            if (
+              maker &&
+              selectedSymbols.some(
+                (symbol) => !strategySymbols(strategy).includes(symbol),
+              )
+            )
+              throw new Error(
+                `该策略仅允许：${strategySymbols(strategy).join(" / ")}`,
+              );
             const body = {
               ...form,
               symbols: form.symbols.split(/[,，\s]+/).filter(Boolean),
@@ -2046,8 +2098,15 @@ function AccountForm({ account, strategies, mutate, notify, onClose }) {
             <select
               value={form.strategy_id}
               onChange={(e) => {
-                change("strategy_id", e.target.value);
-                change("config", {});
+                const selected = strategies.find(
+                  (s) => s.id === e.target.value,
+                );
+                setForm((f) => ({
+                  ...f,
+                  strategy_id: e.target.value,
+                  config: {},
+                  symbols: strategySymbols(selected).join(","),
+                }));
               }}
             >
               {strategies.map((s) => (
@@ -2057,7 +2116,14 @@ function AccountForm({ account, strategies, mutate, notify, onClose }) {
               ))}
             </select>
           </Field>
-          <Field label="交易对" hint="多个币种用逗号分隔，提交时校验策略约束">
+          <Field
+            label="交易对"
+            hint={
+              maker
+                ? `允许选 1–${strategySymbols(strategy).length} 币：${strategySymbols(strategy).join(" / ")}`
+                : "多个币种用逗号分隔，提交时校验策略约束"
+            }
+          >
             <input
               required
               value={form.symbols}
@@ -2099,6 +2165,7 @@ function AccountForm({ account, strategies, mutate, notify, onClose }) {
             </>
           )}
         </div>
+        {maker && <MakerNotice />}
         <div className="section-divider" />
         <h3>策略参数</h3>
         <div className="form-grid">
@@ -2152,7 +2219,7 @@ function CommandModal({ action, accounts, mutate, notify, onClose }) {
         <ShieldAlert size={28} />
         <p>
           {action === "flatten"
-            ? "将请求取消模拟待成交意图、平掉受管理模拟仓位并停止策略。实盘执行仍受验收闸门保护。"
+            ? "将请求撤销待成交开仓单并平掉受管理持仓；执行端确认全部成交后才停止。Maker 平仓可能持续未成交，期间状态为正在平仓，无 Taker 后备。实盘执行仍受验收闸门保护。"
             : action === "pause"
               ? "停止新开仓，继续管理已有持仓。页面状态将在执行端确认后更新。"
               : "将重新检查账户与策略约束。未通过接入检查的实盘账户不会下单。"}
@@ -2202,6 +2269,171 @@ function CommandModal({ action, accounts, mutate, notify, onClose }) {
     </Modal>
   );
 }
+const positionName = (side, quantity) => {
+  const normalized = String(side || "").toUpperCase();
+  if (normalized === "LONG") return "多头";
+  if (normalized === "SHORT") return "空头";
+  if (quantity != null && Number(quantity) !== 0)
+    return Number(quantity) > 0 ? "多头" : "空头";
+  return "—";
+};
+const orderRoleName = (role) =>
+  ({
+    entry: "入场",
+    take_profit: "止盈",
+    tp: "止盈",
+    stop_loss: "止损",
+    sl: "止损",
+    manual_exit: "手动退出",
+    manual: "手动退出",
+    flatten: "平仓并停止",
+  })[role] ||
+  role ||
+  "—";
+function openOrderState(order) {
+  const status = String(order.status || "").toUpperCase();
+  if (status === "PENDING_TRIGGER" || status === "UNTRIGGERED")
+    return ["pending", "条件未触发"];
+  if (status === "FILLED") return ["completed", "已成交"];
+  if (["CANCELED", "CANCELLED"].includes(status))
+    return ["cancelled", "已撤销"];
+  if (status === "REJECTED") return ["failed", "已拒单"];
+  if (status === "PARTIALLY_FILLED") return ["pending", "部分成交 · 余量挂单"];
+  if (order.triggered === true || status === "TRIGGERED")
+    return ["pending", "已触发 · 待成交"];
+  if (["NEW", "OPEN", "PENDING"].includes(status))
+    return ["pending", "挂单待成交"];
+  return ["unknown", status ? `状态未知 · ${status}` : "状态未知"];
+}
+function OpenOrders({ orders }) {
+  const known = Array.isArray(orders);
+  return (
+    <section className="panel open-orders-panel">
+      <div className="panel-heading">
+        <div>
+          <h2>当前挂单</h2>
+          <p>条件触发与实际成交分别记录；挂单不计入已成交收益。</p>
+        </div>
+        <span className="dim">
+          {known ? `${orders.length} 笔` : "快照缺失"}
+        </span>
+      </div>
+      {known && orders.length ? (
+        <div className="table-wrap">
+          <table className="open-orders-table">
+            <thead>
+              <tr>
+                <th>交易对 / 方向</th>
+                <th>用途</th>
+                <th>订单类型</th>
+                <th className="numeric">委托价格</th>
+                <th className="numeric">触发价格</th>
+                <th className="numeric">数量</th>
+                <th>状态</th>
+                <th>关联信息</th>
+              </tr>
+            </thead>
+            <tbody>
+              {orders.map((order, index) => {
+                const [state, label] = openOrderState(order);
+                const position = positionName(
+                  order.position_side ?? order.positionSide,
+                );
+                const side = String(order.side || "").toUpperCase();
+                const details = [
+                  ["客户订单号", order.client_order_id ?? order.clientOrderId],
+                  ["订单 ID", order.id ?? order.orderId],
+                  ["仓位批次", order.lot_id ?? order.lotId],
+                  ["父订单", order.parent_id ?? order.parentId],
+                  ["说明", order.reason],
+                ];
+                return (
+                  <tr key={order.id || order.client_order_id || index}>
+                    <td data-label="交易对 / 方向">
+                      <strong>{order.symbol || "—"}</strong>
+                      <small
+                        className={
+                          position === "多头"
+                            ? "positive"
+                            : position === "空头"
+                              ? "negative"
+                              : ""
+                        }
+                      >
+                        {position} ·{" "}
+                        {side === "BUY"
+                          ? "买入"
+                          : side === "SELL"
+                            ? "卖出"
+                            : "—"}
+                      </small>
+                    </td>
+                    <td data-label="用途">{orderRoleName(order.role)}</td>
+                    <td data-label="订单类型">
+                      {{
+                        LIMIT: "限价",
+                        STOP_LIMIT: "条件限价",
+                        STOP: "条件限价",
+                      }[String(order.type || "").toUpperCase()] ||
+                        order.type ||
+                        "—"}
+                      <small>
+                        {order.time_in_force ??
+                          order.timeInForce ??
+                          "有效期未知"}
+                      </small>
+                    </td>
+                    <td data-label="委托价格" className="numeric">
+                      {tradeNumber(order.price ?? order.limit_price)}
+                    </td>
+                    <td data-label="触发价格" className="numeric">
+                      {tradeNumber(order.stop_price ?? order.stopPrice)}
+                    </td>
+                    <td data-label="数量" className="numeric">
+                      {tradeNumber(order.quantity ?? order.origQty)}
+                    </td>
+                    <td data-label="状态">
+                      <Badge status={state}>{label}</Badge>
+                    </td>
+                    <td data-label="关联信息">
+                      <details className="order-metadata">
+                        <summary>详情</summary>
+                        <dl>
+                          {details.map(([name, value]) => (
+                            <div key={name}>
+                              <dt>{name}</dt>
+                              <dd>
+                                <code>
+                                  {value == null || value === ""
+                                    ? "—"
+                                    : String(value)}
+                                </code>
+                              </dd>
+                            </div>
+                          ))}
+                        </dl>
+                      </details>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <Empty
+          icon={ListFilter}
+          title={known ? "当前没有挂单" : "尚无挂单快照"}
+          desc={
+            known
+              ? "委托创建后，会显示价格、触发状态和关联仓位。"
+              : "等待执行端提供挂单快照，缺失数据不代表挂单数量为零。"
+          }
+        />
+      )}
+    </section>
+  );
+}
 function ClientView({ account: a, user }) {
   if (!a) return <Empty title="尚未分配交易账户" />;
   const positions = Array.isArray(a.positions)
@@ -2222,6 +2454,10 @@ function ClientView({ account: a, user }) {
     v ||
     "未知";
   const snapshotTime = a.data_updated_at || a.check_result?.checked_at;
+  const maker =
+    (a.execution_policy ||
+      a.execution_model?.model ||
+      a.manifest_execution?.model) === "maker_grid_v1";
   return (
     <div className="client-view">
       <div className="client-heading">
@@ -2248,6 +2484,15 @@ function ClientView({ account: a, user }) {
             <strong>{a.stale ? "账户数据过期或尚未验证" : "运行提示"}</strong>
             <span>{a.runtime_error || "当前数值不能视为实时交易所状态。"}</span>
           </div>
+        </div>
+      )}
+      {maker && <MakerNotice />}
+      {a.status === "flattening" && (
+        <div className="notice amber">
+          <Clock3 size={17} />
+          <span>
+            正在平仓：已有平仓委托仍待成交，账户尚未停止。以执行端确认的最终结果为准。
+          </span>
         </div>
       )}
       <div className="client-balance">
@@ -2319,6 +2564,18 @@ function ClientView({ account: a, user }) {
             <span>可用资金 U</span>
             <strong>{money(a.available)}</strong>
           </div>
+          {maker && (
+            <>
+              <div>
+                <span>开仓挂单预留保证金 U</span>
+                <strong>{money(a.pending_margin)}</strong>
+              </div>
+              <div>
+                <span>挂单手续费预留 U</span>
+                <strong>{money(a.pending_fee_reserve)}</strong>
+              </div>
+            </>
+          )}
           <div>
             <span>多头 / 空头持仓数</span>
             <strong>
@@ -2390,13 +2647,27 @@ function ClientView({ account: a, user }) {
               </thead>
               <tbody>
                 {positions.map((p, i) => (
-                  <tr key={p.symbol || i}>
+                  <tr key={`${p.symbol || i}:${p.position_side || "net"}`}>
                     <td>{p.symbol}</td>
-                    <td className={p.quantity >= 0 ? "positive" : "negative"}>
-                      {p.quantity >= 0 ? "多头" : "空头"}
+                    <td
+                      className={
+                        positionName(p.position_side, p.quantity) === "多头"
+                          ? "positive"
+                          : positionName(p.position_side, p.quantity) === "空头"
+                            ? "negative"
+                            : ""
+                      }
+                    >
+                      {positionName(p.position_side, p.quantity)}
                     </td>
-                    <td className="numeric">{Math.abs(p.quantity)}</td>
-                    <td className="numeric">{money(p.average_price)}</td>
+                    <td className="numeric">
+                      {p.quantity == null
+                        ? "—"
+                        : tradeNumber(Math.abs(p.quantity))}
+                    </td>
+                    <td className="numeric">
+                      {tradeNumber(p.average_price ?? p.entry_price)}
+                    </td>
                     <td className={`numeric ${valueTone(p.unrealized_pnl)}`}>
                       {money(p.unrealized_pnl)}
                     </td>
@@ -2413,9 +2684,10 @@ function ClientView({ account: a, user }) {
           />
         )}
       </section>
+      <OpenOrders orders={a.open_orders} />
       <section className="panel">
         <div className="panel-heading">
-          <h2>订单详情</h2>
+          <h2>成交与订单记录</h2>
           <span className="dim">{a.orders?.length || 0} 笔记录</span>
         </div>
         {a.orders?.length ? (
@@ -2435,16 +2707,41 @@ function ClientView({ account: a, user }) {
                 {a.orders.map((o, i) => (
                   <tr key={i}>
                     <td>{o.symbol}</td>
-                    <td className={o.side === "buy" ? "positive" : "negative"}>
-                      {o.side === "buy" ? "买入" : "卖出"}
-                      {o.position_side ? ` · ${o.position_side}` : ""}
+                    <td
+                      className={
+                        String(o.side || "").toLowerCase() === "buy"
+                          ? "positive"
+                          : String(o.side || "").toLowerCase() === "sell"
+                            ? "negative"
+                            : ""
+                      }
+                    >
+                      {String(o.side || "").toLowerCase() === "buy"
+                        ? "买入"
+                        : String(o.side || "").toLowerCase() === "sell"
+                          ? "卖出"
+                          : "—"}
+                      {o.position_side
+                        ? ` · ${positionName(o.position_side)}`
+                        : ""}
                     </td>
-                    <td className="numeric">{o.quantity}</td>
-                    <td className="numeric">{money(o.price)}</td>
+                    <td className="numeric">{tradeNumber(o.quantity)}</td>
+                    <td className="numeric">{tradeNumber(o.price)}</td>
                     <td className={`numeric ${valueTone(o.realized_pnl)}`}>
                       {money(o.realized_pnl)}
                     </td>
-                    <td>{o.status || "已成交"}</td>
+                    <td>
+                      {o.status
+                        ? {
+                            filled: "已成交",
+                            FILLED: "已成交",
+                            NEW: "待成交",
+                            PENDING_TRIGGER: "条件未触发",
+                            CANCELED: "已撤销",
+                            REJECTED: "已拒单",
+                          }[o.status] || o.status
+                        : "—"}
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -2806,7 +3103,11 @@ function Strategies({ strategies, mutate, notify, go }) {
                   <span>v{s.version}</span>
                 </div>
                 <Badge status={s.trusted ? "completed" : "pending"}>
-                  {s.trusted ? "可运行" : "待审核"}
+                  {s.trusted
+                    ? isMakerStrategy(s)
+                      ? "回测 / 模拟"
+                      : "可运行"
+                    : "待审核"}
                 </Badge>
               </div>
               <p>{s.description || m.description || "框架标准策略接口"}</p>
@@ -2815,7 +3116,7 @@ function Strategies({ strategies, mutate, notify, go }) {
                   {m.market === "spot" ? "现货 · 无杠杆" : "U 本位永续"}
                 </span>
                 <span>
-                  {m.symbols?.mode === "fixed"
+                  {m.symbols?.values?.length
                     ? (m.symbols.values || []).join(" / ")
                     : m.symbols?.mode === "multi"
                       ? "多币种策略"
@@ -2864,6 +3165,11 @@ function Strategies({ strategies, mutate, notify, go }) {
                   参数数量
                   <b>{Object.keys(m.parameters?.properties || {}).length} 项</b>
                 </span>
+                {isMakerStrategy(s) && (
+                  <span>
+                    执行模型<b>Maker 限价挂单</b>
+                  </span>
+                )}
               </div>
               <div className="strategy-card-bottom">
                 <Btn onClick={() => setDetail(s)}>详情</Btn>
@@ -2903,7 +3209,7 @@ function Strategies({ strategies, mutate, notify, go }) {
         <Modal
           wide
           title={detail.name}
-          subtitle={`版本 ${detail.version} · ${detail.trusted ? "可运行" : "待审核"}`}
+          subtitle={`版本 ${detail.version} · ${detail.trusted ? (isMakerStrategy(detail) ? "回测 / 模拟可用" : "可运行") : "待审核"}`}
           onClose={() => setDetail(null)}
         >
           <p className="strategy-description">
@@ -2950,6 +3256,21 @@ function Strategies({ strategies, mutate, notify, go }) {
               </strong>
             </div>
           </div>
+          <div className="strategy-execution-detail">
+            <span>交易对约束</span>
+            <strong>
+              {strategyManifest(detail).symbols?.values?.length
+                ? strategySymbols(detail).join(" / ")
+                : "交易对可配置"}
+            </strong>
+            <span>执行模型</span>
+            <strong>
+              {isMakerStrategy(detail)
+                ? "maker_grid_v1 · Maker 限价与条件限价挂单"
+                : "市价意图"}
+            </strong>
+          </div>
+          {isMakerStrategy(detail) && <MakerNotice />}
           <h3 className="form-section-title">默认参数</h3>
           <div className="table-wrap">
             <table>
@@ -3154,9 +3475,10 @@ function MetricComparison({ train = {}, validation = {} }) {
 function Backtest({ data, mutate, notify, go }) {
   const strategies = data.strategies || [],
     datasets = data.datasets || [];
-  const [sid, setSid] = useState(
-      sessionStorage.getItem("mk-strategy") || strategies[0]?.id || "",
-    ),
+  const initialStrategy =
+    strategies.find((x) => x.id === sessionStorage.getItem("mk-strategy")) ||
+    strategies[0];
+  const [sid, setSid] = useState(initialStrategy?.id || ""),
     [params, setParams] = useState({}),
     [preset, setPreset] = useState(""),
     [presets, setPresets] = useState([]),
@@ -3167,10 +3489,10 @@ function Backtest({ data, mutate, notify, go }) {
     [form, setForm] = useState({
       name: "",
       dataset_id: datasets[0]?.id || "",
-      symbols: "BTCUSDT",
+      symbols: strategySymbols(initialStrategy).join(","),
       initial_capital: 10000,
-      fee_rate: 0.0004,
-      slippage_bps: 2,
+      fee_rate: isMakerStrategy(initialStrategy) ? 0.0002 : 0.0004,
+      slippage_bps: isMakerStrategy(initialStrategy) ? 0 : 2,
       train_start: "2026-09-01T00:00",
       train_end: "2026-09-30T00:00",
       validation_start: "2026-10-01T00:00",
@@ -3183,7 +3505,20 @@ function Backtest({ data, mutate, notify, go }) {
     [err, setErr] = useState("");
   const s = strategies.find((x) => x.id === sid) || strategies[0],
     manifest = s?.manifest || s || {},
-    props = manifest.parameters?.properties || {};
+    props = manifest.parameters?.properties || {},
+    maker = isMakerStrategy(s);
+  const selectStrategy = (id) => {
+    const selected = strategies.find((strategy) => strategy.id === id);
+    setSid(id);
+    setParams({});
+    setForm((f) => ({
+      ...f,
+      symbols: strategySymbols(selected).join(","),
+      slippage_bps: isMakerStrategy(selected) ? 0 : 2,
+      fee_rate: isMakerStrategy(selected) ? 0.0002 : 0.0004,
+    }));
+    setFeeSource("手动配置 / 默认估计");
+  };
   const change = (k, v) => setForm((f) => ({ ...f, [k]: v }));
   const job =
     (data.experiments || []).find((e) => e.id === active) ||
@@ -3219,7 +3554,15 @@ function Backtest({ data, mutate, notify, go }) {
               ]),
           ),
           name: `${copy.name || "实验"} · 副本`,
-          symbols: (copy.symbols || []).join(","),
+          symbols: (
+            copy.symbols ||
+            strategySymbols(strategies.find((x) => x.id === copy.strategy_id))
+          ).join(","),
+          slippage_bps: isMakerStrategy(
+            strategies.find((x) => x.id === copy.strategy_id),
+          )
+            ? 0
+            : Number(copy.slippage_bps ?? f.slippage_bps),
         }));
         setFeeSource("复制实验的费用模型");
       } catch {
@@ -3247,11 +3590,17 @@ function Backtest({ data, mutate, notify, go }) {
       const result = await api(
         `/accounts/${feeAccount}/commission?symbol=${encodeURIComponent(symbol || "")}`,
       );
-      change("fee_rate", Number(result.rates.taker));
+      const fee = result.rates?.[maker ? "maker" : "taker"];
+      if (fee == null || !Number.isFinite(Number(fee)))
+        throw new Error(`账户未返回 ${maker ? "Maker" : "Taker"} 费率`);
+      change("fee_rate", Number(fee));
       setFeeSource(
-        `币安账户费率 · ${symbol} · ${formatBeijing(result.fetched_at)} 北京时间`,
+        `币安 ${maker ? "Maker" : "Taker"} 账户费率 · ${symbol} · ${formatBeijing(result.fetched_at)} 北京时间`,
       );
-      notify(result.rates.note || "已读取账户 Taker 费率，仍可手动调整");
+      notify(
+        result.rates.note ||
+          `已读取账户 ${maker ? "Maker" : "Taker"} 费率，仍可手动调整`,
+      );
     } catch (e) {
       notify(e.message);
     } finally {
@@ -3314,6 +3663,18 @@ function Backtest({ data, mutate, notify, go }) {
                     "请选择数据集与交易对，并按顺序设置不重叠的回测集和验证集区间",
                   );
                 }
+                if (
+                  maker &&
+                  form.symbols
+                    .split(/[,，\s]+/)
+                    .filter(Boolean)
+                    .some((symbol) => !strategySymbols(s).includes(symbol))
+                ) {
+                  setConfigTab("data");
+                  throw new Error(
+                    `该策略仅允许：${strategySymbols(s).join(" / ")}`,
+                  );
+                }
                 const r = await mutate("/experiments", {
                   ...form,
                   ...intervals,
@@ -3325,7 +3686,7 @@ function Backtest({ data, mutate, notify, go }) {
                   market: manifest.market || "futures",
                   initial_capital: Number(form.initial_capital),
                   fee_rate: Number(form.fee_rate),
-                  slippage_bps: Number(form.slippage_bps),
+                  slippage_bps: maker ? 0 : Number(form.slippage_bps),
                   seed: Number(form.seed),
                   leverage: Number(form.leverage),
                 });
@@ -3351,8 +3712,7 @@ function Backtest({ data, mutate, notify, go }) {
                   <select
                     value={sid}
                     onChange={(e) => {
-                      setSid(e.target.value);
-                      setParams({});
+                      selectStrategy(e.target.value);
                     }}
                   >
                     {strategies.map((s) => (
@@ -3372,6 +3732,7 @@ function Backtest({ data, mutate, notify, go }) {
                   · 最低资金 {manifest.account?.min_capital ?? "—"} U
                 </span>
               </div>
+              {maker && <MakerNotice compact />}
               <div className="backtest-form-tabs" aria-label="实验配置分组">
                 {[
                   ["strategy", "策略与参数"],
@@ -3436,7 +3797,7 @@ function Backtest({ data, mutate, notify, go }) {
                         value=""
                         onChange={(e) => {
                           const p = presets[Number(e.target.value)];
-                          setSid(p.strategy_id);
+                          selectStrategy(p.strategy_id);
                           setParams(p.parameters);
                           notify("预设已加载");
                         }}
@@ -3468,7 +3829,15 @@ function Backtest({ data, mutate, notify, go }) {
                       onChange={(e) => {
                         change("dataset_id", e.target.value);
                         const d = datasets.find((x) => x.id === e.target.value);
-                        if (d?.symbols) change("symbols", d.symbols.join(","));
+                        if (d?.symbols) {
+                          const selectedSymbols = maker
+                            ? d.symbols.filter((symbol) =>
+                                strategySymbols(s).includes(symbol),
+                              )
+                            : d.symbols;
+                          if (selectedSymbols.length)
+                            change("symbols", selectedSymbols.join(","));
+                        }
                       }}
                     >
                       <option value="">请选择数据集</option>
@@ -3482,7 +3851,14 @@ function Backtest({ data, mutate, notify, go }) {
                       ))}
                     </select>
                   </Field>
-                  <Field label="交易对">
+                  <Field
+                    label="交易对"
+                    hint={
+                      maker
+                        ? `可选：${strategySymbols(s).join(" / ")}`
+                        : undefined
+                    }
+                  >
                     <input
                       value={form.symbols}
                       required
@@ -3646,8 +4022,8 @@ function Backtest({ data, mutate, notify, go }) {
                     <p className="fee-source">当前费率来源：{feeSource}</p>
                     <div className="form-grid">
                       <Field
-                        label="手续费率"
-                        hint="默认估计值，可按账户实际费率修改"
+                        label={maker ? "Maker 手续费率" : "Taker 手续费率"}
+                        hint="默认值为估计，请按账户实际费率修改"
                       >
                         <input
                           type="number"
@@ -3661,12 +4037,20 @@ function Backtest({ data, mutate, notify, go }) {
                           }}
                         />
                       </Field>
-                      <Field label="滑点（基点）" hint="1 bp = 0.01%">
+                      <Field
+                        label="滑点（基点）"
+                        hint={
+                          maker
+                            ? "Maker 限价模型固定为 0；成交受挂单与触发规则约束"
+                            : "1 bp = 0.01%"
+                        }
+                      >
                         <input
                           type="number"
                           min="0"
                           step="0.1"
-                          value={form.slippage_bps}
+                          value={maker ? 0 : form.slippage_bps}
+                          disabled={maker}
                           onChange={(e) =>
                             change("slippage_bps", e.target.value)
                           }
@@ -3683,7 +4067,7 @@ function Backtest({ data, mutate, notify, go }) {
                 <strong>{s?.name || "请选择策略"}</strong>
                 <span>
                   {form.symbols || "未选交易对"} · {money(form.initial_capital)}{" "}
-                  U · {form.leverage}× · 手续费{" "}
+                  U · {form.leverage}× · {maker ? "Maker" : "Taker"} 费率{" "}
                   {pct(Number(form.fee_rate) * 100)}
                 </span>
               </div>
@@ -4375,9 +4759,40 @@ class Strategy:
         #          "quantity": context["params"]["quantity"],
         #          "reduce_only": False}]
 `;
+function Todo() {
+  return (
+    <>
+      <Heading title="to-do" desc="框架能力建设建议与策略职责。" />
+      <div className="todo-grid">
+        <section className="panel panel-body todo-panel">
+          <h2>建议框架提供：</h2>
+          <ul>
+            <li>行情订阅、历史窗口、指标预热。</li>
+            <li>统一时钟、定时任务和事件回调。</li>
+            <li>账户余额、可用资金、持仓和订单查询。</li>
+            <li>下单、撤单、改单、订单分组管理。</li>
+            <li>价格和数量规范化。</li>
+            <li>手续费、资金费、保证金和风险检查。</li>
+            <li>状态保存、恢复、日志、指标和报表。</li>
+            <li>常用指标与仓位计算工具，统一算法定义。</li>
+          </ul>
+        </section>
+        <section className="panel panel-body todo-panel">
+          <h2>策略负责：</h2>
+          <ul>
+            <li>什么时候交易。</li>
+            <li>交易哪些币。</li>
+            <li>目标仓位或挂单结构。</li>
+            <li>入场、加减仓、退出逻辑。</li>
+            <li>策略特有的状态与解释信息。</li>
+          </ul>
+        </section>
+      </div>
+    </>
+  );
+}
 function Protocol({ notify }) {
-  const [protocol, setProtocol] = useState(null),
-    [tab, setTab] = useState("protocol");
+  const [protocol, setProtocol] = useState(null);
   useEffect(() => {
     api("/protocol")
       .then(setProtocol)
@@ -4404,166 +4819,111 @@ function Protocol({ notify }) {
           复制接入模板
         </Btn>
       </Heading>
-      <div
-        className="tabs protocol-tabs"
-        role="tablist"
-        aria-label="策略开发资料"
-      >
-        <button
-          id="protocol-tab"
-          role="tab"
-          aria-selected={tab === "protocol"}
-          aria-controls="protocol-content"
-          className={tab === "protocol" ? "active" : ""}
-          onClick={() => setTab("protocol")}
-        >
-          接入协议
-        </button>
-        <button
-          id="todo-tab"
-          role="tab"
-          aria-selected={tab === "todo"}
-          aria-controls="todo-content"
-          className={tab === "todo" ? "active" : ""}
-          onClick={() => setTab("todo")}
-        >
-          to-do
-        </button>
-      </div>
-      {tab === "todo" ? (
-        <div
-          id="todo-content"
-          role="tabpanel"
-          aria-labelledby="todo-tab"
-          className="todo-grid"
-        >
-          <section className="panel panel-body todo-panel">
-            <h2>建议框架提供：</h2>
-            <ul>
-              <li>行情订阅、历史窗口、指标预热。</li>
-              <li>统一时钟、定时任务和事件回调。</li>
-              <li>账户余额、可用资金、持仓和订单查询。</li>
-              <li>下单、撤单、改单、订单分组管理。</li>
-              <li>价格和数量规范化。</li>
-              <li>手续费、资金费、保证金和风险检查。</li>
-              <li>状态保存、恢复、日志、指标和报表。</li>
-              <li>常用指标与仓位计算工具，统一算法定义。</li>
-            </ul>
-          </section>
-          <section className="panel panel-body todo-panel">
-            <h2>策略负责：</h2>
-            <ul>
-              <li>什么时候交易。</li>
-              <li>交易哪些币。</li>
-              <li>目标仓位或挂单结构。</li>
-              <li>入场、加减仓、退出逻辑。</li>
-              <li>策略特有的状态与解释信息。</li>
-            </ul>
-          </section>
+      <div id="protocol-content">
+        <div className="protocol-hero">
+          <div className="protocol-icon">
+            <Code2 size={34} />
+          </div>
+          <div>
+            <span className="tag mono">CONTRACT v1</span>
+            <h2>一个接口，贯穿研究与执行。</h2>
+            <p>
+              策略输出交易意图。框架校验约束、处理成交、记录决策，并计算统一指标。
+            </p>
+          </div>
         </div>
-      ) : (
-        <div
-          id="protocol-content"
-          role="tabpanel"
-          aria-labelledby="protocol-tab"
-        >
-          <div className="protocol-hero">
-            <div className="protocol-icon">
-              <Code2 size={34} />
-            </div>
-            <div>
-              <span className="tag mono">CONTRACT v1</span>
-              <h2>一个接口，贯穿研究与执行。</h2>
-              <p>
-                策略输出交易意图。框架校验约束、处理成交、记录决策，并计算统一指标。
-              </p>
-            </div>
-          </div>
-          <div className="protocol-flow">
-            {[
-              ["行情与时钟", Database],
-              ["Strategy.on_bar", Code2],
-              ["账户风控", Shield],
-              ["执行器与账本", Wallet],
-            ].map(([t, Icon], i) => (
-              <React.Fragment key={t}>
-                {i > 0 && <ArrowRight size={18} />}
-                <div>
-                  <Icon size={19} />
-                  {t}
-                </div>
-              </React.Fragment>
-            ))}
-          </div>
-          <div className="split-layout protocol-layout">
-            <section className="panel">
-              <div className="panel-heading">
-                <h2>必须声明的字段</h2>
+        <div className="protocol-flow">
+          {[
+            ["行情与时钟", Database],
+            ["Strategy.on_bar", Code2],
+            ["账户风控", Shield],
+            ["执行器与账本", Wallet],
+          ].map(([t, Icon], i) => (
+            <React.Fragment key={t}>
+              {i > 0 && <ArrowRight size={18} />}
+              <div>
+                <Icon size={19} />
+                {t}
               </div>
-              <div className="table-wrap">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>字段</th>
-                      <th>用途 / 约束</th>
+            </React.Fragment>
+          ))}
+        </div>
+        <div className="split-layout protocol-layout">
+          <section className="panel">
+            <div className="panel-heading">
+              <h2>必须声明的字段</h2>
+            </div>
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>字段</th>
+                    <th>用途 / 约束</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {[
+                    [
+                      "name / version / description",
+                      "策略名称、不可变版本、描述",
+                    ],
+                    ["market", "spot 或 futures；现货禁止杠杆与做空"],
+                    ["symbols", "固定币种、多币种数量或不限币种"],
+                    ["account", "持仓模式、保证金模式、杠杆范围、最低 U 资金"],
+                    [
+                      "parameters",
+                      "JSON Schema 参数定义、默认值与 description 帮助说明",
+                    ],
+                    [
+                      "execution.model",
+                      "maker_grid_v1 使用 Maker 限价、条件限价与双向订单模型；其他策略沿用原执行器",
+                    ],
+                    [
+                      "Strategy.on_bar(context)",
+                      "返回交易意图列表；不直接访问交易所",
+                    ],
+                    ['context["log"]', "debug / error 级别结构化日志"],
+                    ['context["emit"]', "策略阶段、指标、图表线和决策原因"],
+                  ].map(([k, v]) => (
+                    <tr key={k}>
+                      <td>
+                        <code>{k}</code>
+                      </td>
+                      <td>{v}</td>
                     </tr>
-                  </thead>
-                  <tbody>
-                    {[
-                      [
-                        "name / version / description",
-                        "策略名称、不可变版本、描述",
-                      ],
-                      ["market", "spot 或 futures；现货禁止杠杆与做空"],
-                      ["symbols", "固定币种、多币种数量或不限币种"],
-                      [
-                        "account",
-                        "持仓模式、保证金模式、杠杆范围、最低 U 资金",
-                      ],
-                      ["parameters", "JSON Schema 参数定义与默认值"],
-                      [
-                        "Strategy.on_bar(context)",
-                        "返回交易意图列表；不直接访问交易所",
-                      ],
-                      ['context["log"]', "debug / error 级别结构化日志"],
-                      ['context["emit"]', "策略阶段、指标、图表线和决策原因"],
-                    ].map(([k, v]) => (
-                      <tr key={k}>
-                        <td>
-                          <code>{k}</code>
-                        </td>
-                        <td>{v}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-              <div className="panel-body">
-                <div className="notice amber">
-                  <ShieldAlert size={18} />
-                  <div>
-                    <strong>执行边界</strong>
-                    <span>
-                      当前撮合支持市价意图与单向净持仓。双向持仓、资金费与强平模型尚未实现，不能据此评估正式实盘风险。
-                    </span>
-                  </div>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="panel-body">
+              <div className="notice amber">
+                <ShieldAlert size={18} />
+                <div>
+                  <strong>执行边界</strong>
+                  <span>
+                    市价策略沿用单向净持仓模型；maker_grid_v1 的 Maker
+                    限价、条件限价、订单关联与双向持仓已支持回测和模拟。OHLC
+                    无法还原盘口排队或保证实盘 Maker
+                    成交；止损触发后仍可能拒单或未成交，无 Taker
+                    后备。资金费与强平模型仍不完整，实盘执行继续受验收闸门保护。
+                  </span>
                 </div>
               </div>
-            </section>
-            <section className="panel code-panel">
-              <div className="editor-toolbar">
-                <span>
-                  <FileCode2 size={15} /> strategy_template.py
-                </span>
-                <span>PYTHON</span>
-              </div>
-              <pre className="code-block">
-                {typeof source === "string" ? source : protocolExample}
-              </pre>
-            </section>
-          </div>
+            </div>
+          </section>
+          <section className="panel code-panel">
+            <div className="editor-toolbar">
+              <span>
+                <FileCode2 size={15} /> strategy_template.py
+              </span>
+              <span>PYTHON</span>
+            </div>
+            <pre className="code-block">
+              {typeof source === "string" ? source : protocolExample}
+            </pre>
+          </section>
         </div>
-      )}
+      </div>
     </>
   );
 }

@@ -90,6 +90,10 @@ def run_experiment(id):
         if cancelled():
             raise BacktestCancelled("任务取消")
         result={"metrics":ui_metrics(output["train"]["metrics"]),"validation_metrics":ui_metrics(output["validation"]["metrics"]),"curve":output["train"]["equity"],"validation_curve":output["validation"]["equity"],"orders":[dict(o,split=split) for split,r in output.items() for o in r["orders"]],"decisions":[dict(o,split=split) for split,r in output.items() for o in r["decisions"]],"assumptions":output["train"]["assumptions"],"incomplete":False}
+        if manifest.get("execution",{}).get("model")=="maker_grid_v1":
+            result.update(open_orders=[dict(order,split=split) for split,value in output.items() for order in value["open_orders"]],
+                          lots=[dict(lot,split=split) for split,value in output.items() for lot in value["lots"]],
+                          account_summaries={split:value["account"] for split,value in output.items()})
         result["differences"]={k:result["validation_metrics"][k]-v for k,v in result["metrics"].items() if isinstance(v,(int,float)) and isinstance(result["validation_metrics"].get(k),(int,float))}
         stored_result=storage.store_result(result)
         with db.connect() as con:
@@ -210,7 +214,7 @@ def market_loop(once=False):
     while True:
         service("market",str(os.getpid()))
         with db.connect() as con:
-            rows=con.execute("SELECT a.symbols,s.manifest FROM accounts a JOIN instances i ON i.account_id=a.id JOIN strategies s ON s.id=a.strategy_id WHERE a.mode='paper' AND a.source!='demo' AND (i.desired_state IN ('running','paused') OR i.observed_state IN ('running','paused','starting','error') OR EXISTS (SELECT 1 FROM commands c WHERE c.account_id=a.id AND c.action='flatten' AND c.status IN ('pending','running')))").fetchall()
+            rows=con.execute("SELECT a.symbols,s.manifest FROM accounts a JOIN instances i ON i.account_id=a.id JOIN strategies s ON s.id=a.strategy_id WHERE a.mode='paper' AND a.source!='demo' AND (i.desired_state IN ('running','paused') OR i.observed_state IN ('running','paused','starting','error','flattening') OR EXISTS (SELECT 1 FROM commands c WHERE c.account_id=a.id AND c.action='flatten' AND c.status IN ('pending','running')))").fetchall()
         wanted=set()
         for row in rows:
             manifest=db.parse(row["manifest"],{})
@@ -237,7 +241,7 @@ def _restore_ledger(account,manifest,snapshot):
     from .engine import Ledger,Position
     D=lambda x:Decimal(str(x))
     execution=db.parse(account["metrics"],{}).get("execution_model",{})
-    fee=execution.get("fee_rate",.001 if manifest["market"]=="spot" else .0004)
+    fee=execution.get("fee_rate",.001 if manifest["market"]=="spot" else .0004) if execution.get("model")!="maker_grid_v1" else (.001 if manifest["market"]=="spot" else .0004)
     ledger=Ledger(D(account["initial_equity"]),manifest["market"],D(manifest["account"]["leverage_min"]),D(fee))
     if snapshot:
         ledger.balance=D(snapshot["balance"])
@@ -246,6 +250,49 @@ def _restore_ledger(account,manifest,snapshot):
         ledger.orders=snapshot["orders"]
         ledger.closed_pnls=[D(v) for v in snapshot["closed_pnls"]]
     return ledger
+
+
+def _period_starts(timestamp):
+    """Business-day/month cutoffs use Beijing time; stored timestamps stay UTC."""
+    from datetime import datetime, timedelta, timezone
+    current=datetime.fromtimestamp(timestamp/1000,timezone(timedelta(hours=8)))
+    day=current.replace(hour=0,minute=0,second=0,microsecond=0)
+    return day.timestamp()*1000,day.replace(day=1).timestamp()*1000
+
+
+def _convert_flat_snapshot(account,manifest,snapshot,target):
+    """Move a flat financial ledger between executors without resetting money."""
+    from .engine import Ledger, MakerOrderBook
+    source=snapshot.get("model","market_next_open_v1") if snapshot else target
+    if not snapshot or source==target:
+        return snapshot,None
+    if source=="maker_grid_v1":
+        book=MakerOrderBook.load(snapshot["book"])
+        if book.has_open_positions() or book.open_orders() or any(position.quantity for position in book.ledger.positions.values()):
+            raise ValueError("Maker 持仓或挂单未清空，拒绝切换执行模型")
+        previous=book.ledger
+        financial={"balance":str(previous.balance),"fees":str(previous.fees),"orders":copy.deepcopy(previous.orders),"closed_pnls":[str(value) for value in previous.closed_pnls]}
+    else:
+        if any(Decimal(str(position["quantity"])) for position in snapshot.get("positions",{}).values()) or snapshot.get("pending"):
+            raise ValueError("原执行模型仍有持仓或待执行意图，拒绝切换执行模型")
+        financial={key:copy.deepcopy(snapshot[key]) for key in ("balance","fees","orders","closed_pnls")}
+    common={"model":target,"curve":copy.deepcopy(snapshot.get("curve",[])),"last_timestamp":snapshot.get("last_timestamp",0),"strategy_state":{},"bar_index":0}
+    if target=="maker_grid_v1":
+        ledger=Ledger(account["initial_equity"],"futures",manifest["account"]["leverage_min"],Decimal(".0002"),position_mode="hedge")
+        ledger.balance=Decimal(financial["balance"]);ledger.fees=Decimal(financial["fees"])
+        ledger.orders=financial["orders"];ledger.closed_pnls=[Decimal(str(value)) for value in financial["closed_pnls"]]
+        converted={**common,"book":MakerOrderBook(ledger).dump()}
+    else:
+        converted={**common,**financial,"positions":{},"pending":[]}
+    return converted,snapshot
+
+
+def _archive_executor(con,account_id,snapshot,target):
+    if snapshot is None:
+        return
+    encoded=db.dump(snapshot);digest=hashlib.sha256(encoded.encode()).hexdigest()
+    con.execute("INSERT INTO ledger VALUES(?,?,?,?,?,?) ON DUPLICATE KEY UPDATE id=id",(db.uid(),account_id,"executor_archive",f"executor:{account_id}:{digest}",encoded,db.now()))
+    db.audit(con,None,"instance.model_change","account",account_id,{"from":snapshot.get("model","market_next_open_v1"),"to":target,"archived_sha256":digest})
 
 
 def _account_limits():
@@ -271,6 +318,198 @@ def strategy_deadline(seconds=10):
     finally:
         signal.setitimer(signal.ITIMER_REAL,0)
         signal.signal(signal.SIGALRM,previous)
+
+
+def maker_runtime_tick(account, instance, commands, strategy, snapshot, fence, current_lease):
+    """Advance a persisted Maker book; every mutation commits under one fence.
+
+    Missing candles never fill orders. Pausing cancels entries only; flattening
+    remains an in-progress command until its post-only exits really fill.
+    """
+    from .engine import Ledger, MakerOrderBook, calculate_metrics
+    from .strategy import load_strategy, validate_parameters
+    account_id=account["id"]
+    manifest=db.parse(strategy["manifest"],{})
+    if not strategy["trusted"] or manifest["market"]!="futures" or "hedge" not in manifest["account"]["position_modes"] or "cross" not in manifest["account"]["margin_modes"]:
+        raise ValueError("Maker 模拟执行需要可信合约策略、hedge 双向持仓和全仓模型")
+    snapshot,archived=_convert_flat_snapshot(account,manifest,snapshot,"maker_grid_v1")
+    revision={"strategy_id":account["strategy_id"],"source_hash":strategy["source_hash"],"config_revision":instance["config_revision"]}
+    command=commands[0] if commands else None
+    now_ms=int(time.time()*1000)
+    symbols=db.parse(account["symbols"],[])
+    with db.connect() as con:
+        cached=[con.execute("SELECT * FROM market_cache WHERE market='futures' AND symbol=? AND interval='1m'",(symbol,)).fetchone() for symbol in symbols]
+    fresh=bool(cached and all(row and time.time()-row["fetched_at"]<90 for row in cached))
+    histories={symbol:db.parse(row["candles"],[]) for symbol,row in zip(symbols,cached) if row}
+    common=set.intersection(*(set(bar["timestamp"] for bar in rows) for rows in histories.values())) if len(histories)==len(symbols) and histories else set()
+    timestamp=max(common) if common else None
+    closed_before=int(time.time()//60)*60000
+    fresh=bool(fresh and timestamp is not None and timestamp<closed_before and 0<now_ms-timestamp<=150000)
+    market_state={"timestamp":timestamp,"fresh":fresh}
+    unchanged_command=not command or (command["status"]=="running" and snapshot.get("last_command_id")==command["id"])
+    if archived is None and snapshot.get("revision")==revision and snapshot.get("market_state")==market_state and snapshot.get("desired_state")==instance["desired_state"] and snapshot.get("observed_state")==instance["observed_state"] and unchanged_command and instance["observed_state"]!="stopped":
+        # Most actor polls have no new candle. Do not reconstruct or reserialize
+        # the complete order history merely to confirm the same heartbeat.
+        with db.connect() as con:
+            if current_lease(con):
+                con.execute("UPDATE instances SET last_heartbeat=? WHERE account_id=?",(db.now(),account_id))
+        return True
+    if snapshot:
+        book=MakerOrderBook.load(snapshot["book"])
+    else:
+        book=MakerOrderBook(Ledger(account["initial_equity"],"futures",manifest["account"]["leverage_min"],Decimal(".0002"),position_mode="hedge"))
+    ledger=book.ledger
+    previous_orders={key:db.dump(value) for key,value in book.orders.items()}
+    fill_start=len(ledger.orders); event_start=len(book.events)
+    revision_changed=snapshot.get("revision")!=revision
+    execution_id=snapshot.get("execution_id") or db.uid()
+    strategy_state=copy.deepcopy(snapshot.get("strategy_state",{}))
+    strategy_error=snapshot.get("strategy_error")
+    previous_strategy_error=strategy_error
+    strategy_cursor=snapshot.get("strategy_event_cursor",0)
+    bar_index=snapshot.get("bar_index",0)
+    if revision_changed:
+        if snapshot and (book.has_open_positions() or book.open_orders()):
+            raise ValueError("Maker 持仓或挂单未清空，不能用新配置覆盖运行状态")
+        strategy_state={};strategy_error=None;strategy_cursor=len(book.events);bar_index=0
+        ledger.leverage=Decimal(str(manifest["account"]["leverage_min"]))
+        ledger.fee_rate=Decimal(".0002")
+        if snapshot.get("revision"):
+            archived=archived or snapshot
+        book=MakerOrderBook(ledger,book.symbol_filters,maker_fee_rate=Decimal(".0002"))
+        previous_orders={};event_start=0;strategy_cursor=0;execution_id=db.uid()
+    mode=instance["desired_state"]
+    if command:
+        mode={"pause":"paused","flatten":"stopped","resume":"running"}[command["action"]]
+        if command["action"]=="resume":
+            strategy_error=None;book.flattening=False
+        elif command["action"]=="flatten":
+            book.flattening=True
+    if mode!="running" or strategy_error:
+        book.cancel_entries(now_ms,"停止新增风险，保留已有 lot 的退出单")
+    # A stopped actor with remaining positions still manages protection. A
+    # failed strategy is never interpreted as an authorization for market exits.
+    if mode=="stopped" and book.has_open_positions() and not book.flattening:
+        mode="paused"
+        strategy_error=strategy_error or "账户已停止新增风险，但仍有持仓；继续处理已有保护单"
+    last=snapshot.get("last_timestamp",0)
+    new_bar=bool(fresh and timestamp>last)
+    risk=[];buffered_logs=[];display=copy.deepcopy(snapshot.get("display",{}))
+    data_error=None
+    if not fresh:
+        book.cancel_entries(now_ms,"共享行情缺失或过期，撤销开仓挂单；保留退出单")
+        data_error="等待完整且新鲜的多币种 K 线；未新增挂单或模拟成交，现有 lot 仍保留"
+    elif timestamp<last:
+        data_error="行情时间早于已持久化账本，拒绝倒序撮合"
+        fresh=False;new_bar=False
+        book.cancel_entries(now_ms,data_error)
+    bars={symbol:next(bar for bar in reversed(rows) if bar["timestamp"]==timestamp) for symbol,rows in histories.items()} if fresh else {}
+    if fresh:
+        book.symbol_filters={symbol:db.parse(row["filters"],{}) for symbol,row in zip(symbols,cached)}
+    if new_bar:
+        if last and timestamp-last>60000:
+            book.cancel_entries(timestamp,"行情断档，过期开仓挂单作废")
+            risk.append({"status":"warning","reason":"行情断档：缺失期间的成交先后与止损触发无法重建，仅处理当前完整 K 线上的保护单"})
+        book.process_bar(bars)
+    references={symbol:bar["close"] for symbol,bar in bars.items()}
+    if book.flattening:
+        if fresh:
+            book.request_flatten(timestamp,references)
+        mode="stopped"
+    elif new_bar and mode=="running" and not strategy_error:
+        try:
+            strategy_obj=load_strategy(strategy["source"])
+            strategy_obj.__dict__.update(copy.deepcopy(strategy_state))
+            def strategy_log(level,message,data=None):
+                if len(buffered_logs)<1000:
+                    buffered_logs.append(("error" if level=="error" else "debug",str(message)[:4000],data))
+            context={"params":validate_parameters(manifest,db.parse(account["config"],{})),"candles":copy.deepcopy(bars),
+                     "history":{symbol:[bar for bar in rows if bar["timestamp"]<=timestamp][-manifest["history_window"]:] for symbol,rows in histories.items()},
+                     "positions":ledger.position_snapshot(),"account":ledger.account(),"timestamp":timestamp,"bar_index":bar_index,
+                     "open_orders":book.open_orders(),"lots":book.lot_snapshot(),"execution_events":copy.deepcopy(book.events[strategy_cursor:]),
+                     "log":strategy_log,"emit":lambda **fields:display.update(fields)}
+            strategy_cursor=len(book.events)
+            with strategy_deadline():
+                intents=strategy_obj.on_bar(context)
+            next_state=copy.deepcopy(strategy_obj.__dict__);db.dump(next_state)
+            if not isinstance(intents,list) or len(intents)>1000 or any(not isinstance(intent,dict) for intent in intents):
+                raise ValueError("策略必须返回有限的委托意图列表")
+            submitted=book.submit_many(intents,timestamp,references)
+            rejected=[{"status":"rejected","order_id":result.get("id",result.get("client_order_id")),"reason":str(result.get("reason","委托未通过风险或精度检查"))[:1000]} for result in submitted if result.get("status")=="REJECTED"]
+            if rejected:
+                risk.extend(rejected[:20])
+                buffered_logs.append(("error","Maker 委托未被接受；未记作成交",{"rejected_count":len(rejected),"orders":rejected[:20]}))
+            strategy_state=next_state
+        except Exception as exc:
+            strategy_error=str(exc)[:2000]
+            book.cancel_entries(timestamp,"策略异常：停止开仓，已有保护单继续运行")
+            mode="paused"
+            buffered_logs.append(("error","Maker 策略异常；已有 lot 和保护单继续管理",{"error":strategy_error}))
+    lots=book.lot_snapshot()
+    if not book.flattening and any(lot.get("protection_status") in {"stop_rejected","unprotected"} for lot in lots):
+        strategy_error=strategy_error or "部分 lot 的止损被拒绝或保护不完整；已暂停新开仓，无市价回退"
+        book.cancel_entries(timestamp or now_ms,"已有 lot 保护异常，暂停新增风险")
+        mode="paused"
+    positions=[dict(value,direction="long" if value["position_side"]=="LONG" else "short") for value in ledger.position_snapshot().values()]
+    open_orders=book.open_orders()
+    stopped=mode=="stopped" and not book.has_open_positions() and not open_orders
+    observed="stopped" if stopped else "flattening" if book.flattening else "error" if strategy_error else "starting" if not fresh else mode
+    error=strategy_error or (None if stopped else data_error)
+    curve=list(snapshot.get("curve",[]))
+    if new_bar:
+        point={"timestamp":timestamp,"equity":float(ledger.equity()),"margin_used":float(ledger.margin()),"unrealized_pnl":float(ledger.unrealized()),"pending_margin":float(ledger.pending_margin)}
+        curve.append(point)
+    stats=ui_metrics(calculate_metrics(curve,ledger.orders,account["initial_equity"],closed_pnls=ledger.closed_pnls,account=ledger.account()))
+    metric_time=timestamp if fresh else last or now_ms
+    day_start,month_start=_period_starts(metric_time)
+    def period_pnl(start):
+        baseline=next((point["equity"] for point in reversed(curve) if point["timestamp"]<start),account["initial_equity"])
+        return float(ledger.equity())-baseline
+    previous_metrics=db.parse(account["metrics"],{})
+    metrics={**ledger.account(),**stats,"today_pnl":period_pnl(day_start),"month_pnl":period_pnl(month_start),
+             "running_days":max(1,int((metric_time-curve[0]["timestamp"])/86400000)+1) if curve else 0,
+             "return_pct":stats["total_return_pct"],"max_drawdown_u":stats["max_drawdown_amount"],"position_count":len(lots),
+             "long_count":sum(lot["position_side"]=="LONG" for lot in lots),"short_count":sum(lot["position_side"]=="SHORT" for lot in lots),
+             "curve":curve,"positions":positions,"orders":ledger.orders,"lots":lots,"open_orders":open_orders,"open_order_count":len(open_orders),
+             "execution_events":copy.deepcopy(book.events[-100:]),"display":display,"risk":risk,"strategy_error":strategy_error,
+             "data_updated_at":db.now() if fresh else previous_metrics.get("data_updated_at"),
+             "execution_model":{"model":"maker_grid_v1","fee_rate":float(book.maker_fee_rate),"maker_fee_rate":float(book.maker_fee_rate),
+                 "slippage_bps":0,"fee_source":"documented_simulation_assumption","interval":"1m","position_mode":"hedge",
+                 "funding_included":False,"liquidation_simulated":False,"liquidity":"simulated_maker","order_book_queue_simulated":False}}
+    snapshot={"model":"maker_grid_v1","book":book.dump(),"strategy_state":strategy_state,"strategy_error":strategy_error,
+              "strategy_event_cursor":strategy_cursor,"revision":revision,"last_timestamp":timestamp if new_bar else last,
+              "bar_index":bar_index+int(new_bar),"curve":curve,"display":display,"market_state":market_state,
+              "execution_id":execution_id,"last_command_id":command["id"] if command else None,"observed_state":observed,
+              "desired_state":"paused" if strategy_error and not book.flattening else instance["desired_state"]}
+    changed_orders=[dict(order,execution_id=execution_id) for key,order in book.orders.items() if previous_orders.get(key)!=db.dump(order)]
+    new_fills=[dict(fill,execution_id=execution_id) for fill in ledger.orders[fill_start:]]
+    command_status=None
+    if command:
+        command_status="running" if (command["action"]=="flatten" and not stopped) or (command["action"]=="resume" and not fresh) else "failed" if command["action"]=="resume" and strategy_error else "completed"
+    with db.connect() as con:
+        if not current_lease(con):
+            return True
+        _archive_executor(con,account_id,archived,"maker_grid_v1")
+        db.persist_maker_activity(con,account_id,changed_orders,new_fills)
+        if new_bar:
+            con.execute("INSERT IGNORE INTO ledger VALUES(?,?,?,?,?,?)",(db.uid(),account_id,"valuation",f"valuation:{account_id}:{timestamp}",db.dump(curve[-1]),db.now()))
+        con.execute("INSERT INTO ledger VALUES(?,?,?,?,?,?) ON DUPLICATE KEY UPDATE payload=VALUES(payload),created_at=VALUES(created_at)",(db.uid(),account_id,"snapshot",f"snapshot:{account_id}",db.dump(snapshot),db.now()))
+        con.execute("UPDATE accounts SET metrics=? WHERE id=?",(db.dump(metrics),account_id))
+        con.execute("UPDATE instances SET observed_state=?,last_heartbeat=?,error=? WHERE account_id=?",(observed,db.now(),error,account_id))
+        if strategy_error and not book.flattening:
+            con.execute("UPDATE instances SET desired_state='paused' WHERE account_id=?",(account_id,))
+        if book.events[event_start:] or new_bar or command:
+            con.execute("INSERT INTO runtime_events(account_id,fence,event,payload,created_at) VALUES(?,?,?,?,?)",(account_id,fence,"maker_tick",db.dump({"timestamp":timestamp,"mode":observed,"events":book.events[event_start:],"risk":risk}),db.now()))
+        for level,message,details in buffered_logs:
+            con.execute("INSERT INTO logs(level,strategy_id,account_id,message,details,source,created_at) VALUES(?,?,?,?,?,'strategy',?)",(level,account["strategy_id"],account_id,message,db.dump(details),db.now()))
+        if strategy_error and strategy_error!=previous_strategy_error:
+            db.audit(con,None,"instance.maker_risk","account",account_id,{"error":strategy_error,"fence":fence,"open_lots":len(lots)})
+        if command:
+            result={"observed_state":observed,"fence":fence,"open_lots":len(lots),"open_orders":len(open_orders),"model":"maker_grid_v1"}
+            con.execute("UPDATE commands SET status=?,completed_at=?,error=?,result=? WHERE id=?",(command_status,None if command_status=="running" else db.now(),strategy_error if command_status=="failed" else None,db.dump(result),command["id"]))
+            if command["status"]!=command_status:
+                db.audit(con,None,"command."+command_status,"command",command["id"],{"account_id":account_id,**result})
+    return not stopped or len(commands)>1
 
 
 def runtime_tick(account_id,owner):
@@ -303,11 +542,13 @@ def runtime_tick(account_id,owner):
             con.execute("UPDATE instances SET observed_state='stopped',desired_state='stopped',error=? WHERE account_id=?",("执行闸门关闭",account_id))
         return False
     manifest=db.parse(strategy["manifest"],{})
+    if manifest.get("execution",{}).get("model")=="maker_grid_v1":
+        return maker_runtime_tick(account,instance,commands,strategy,db.parse(saved["payload"],{}) if saved else {},fence,current_lease)
     if not strategy["trusted"] or "one_way" not in manifest["account"]["position_modes"]:
         raise ValueError("运行策略未经审核或不支持单向账本")
     if manifest["market"]=="futures" and "cross" not in manifest["account"]["margin_modes"]:
         raise ValueError("当前模拟账本仅实现全仓模型，不能运行仅支持逐仓的策略")
-    snapshot=db.parse(saved["payload"],{}) if saved else {}
+    snapshot,archived=_convert_flat_snapshot(account,manifest,db.parse(saved["payload"],{}) if saved else {},"market_next_open_v1")
     ledger=_restore_ledger(account,manifest,snapshot)
     revision={"strategy_id":account["strategy_id"],"source_hash":strategy["source_hash"],"config_revision":instance["config_revision"]}
     if snapshot.get("revision")!=revision:
@@ -351,7 +592,7 @@ def runtime_tick(account_id,owner):
     pending=snapshot.get("pending",[])
     last=snapshot.get("last_timestamp",0)
     old_order_count=len(ledger.orders)
-    if timestamp==last and not commands:
+    if timestamp==last and not commands and archived is None:
         with db.connect() as con:
             if not current_lease(con):
                 return True
@@ -392,22 +633,20 @@ def runtime_tick(account_id,owner):
         if mode=="paused":
             pending=[i for i in pending if i.get("reduce_only")]
     curve=snapshot.get("curve",[])
-    if timestamp>last or mode=="stopped":
+    if timestamp>last or (mode=="stopped" and len(ledger.orders)>old_order_count):
         curve.append({"timestamp":timestamp,"equity":float(ledger.equity()),"margin_used":float(ledger.margin()),"unrealized_pnl":float(ledger.unrealized())})
     stats=ui_metrics(calculate_metrics(curve,ledger.orders,account["initial_equity"],closed_pnls=ledger.closed_pnls,account=ledger.account()))
     positions=[dict(v,symbol=s,direction="long" if v["quantity"]>0 else "short") for s,v in ledger.position_snapshot().items()]
-    from datetime import datetime, timezone
-    current_dt=datetime.fromtimestamp(timestamp/1000,timezone.utc)
-    day_start=current_dt.replace(hour=0,minute=0,second=0,microsecond=0).timestamp()*1000
-    month_start=current_dt.replace(day=1,hour=0,minute=0,second=0,microsecond=0).timestamp()*1000
+    day_start,month_start=_period_starts(timestamp)
     def period_pnl(start):
         baseline=next((p["equity"] for p in reversed(curve) if p["timestamp"]<start),account["initial_equity"])
         return float(ledger.equity())-baseline
     metrics={"today_pnl":period_pnl(day_start),"month_pnl":period_pnl(month_start),"running_days":max(1,int((timestamp-curve[0]["timestamp"])/86400000)+1) if curve else 0,**ledger.account(),**stats,"return_pct":stats["total_return_pct"],"max_drawdown_u":stats["max_drawdown_amount"],"position_count":len(positions),"long_count":sum(p["quantity"]>0 for p in positions),"short_count":sum(p["quantity"]<0 for p in positions),"curve":curve,"positions":positions,"orders":ledger.orders,"display":display,"data_updated_at":db.now(),"risk":risk,"execution_model":{"fee_rate":float(ledger.fee_rate),"slippage_bps":2,"fee_source":"documented_simulation_assumption","interval":"1m","funding_included":False,"liquidation_simulated":False}}
-    snapshot={"balance":str(ledger.balance),"fees":str(ledger.fees),"positions":{s:{"quantity":str(p.quantity),"average_price":str(p.average_price),"entry_fees":str(p.entry_fees)} for s,p in ledger.positions.items()},"orders":ledger.orders,"closed_pnls":[str(v) for v in ledger.closed_pnls],"pending":pending,"strategy_state":strategy_state,"revision":revision,"last_timestamp":timestamp,"bar_index":snapshot.get("bar_index",0)+(timestamp>last),"curve":curve}
+    snapshot={"model":"market_next_open_v1","balance":str(ledger.balance),"fees":str(ledger.fees),"positions":{s:{"quantity":str(p.quantity),"average_price":str(p.average_price),"entry_fees":str(p.entry_fees)} for s,p in ledger.positions.items()},"orders":ledger.orders,"closed_pnls":[str(v) for v in ledger.closed_pnls],"pending":pending,"strategy_state":strategy_state,"revision":revision,"last_timestamp":timestamp,"bar_index":snapshot.get("bar_index",0)+(timestamp>last),"curve":curve}
     with db.connect() as con:
         if not current_lease(con):
             return True
+        _archive_executor(con,account_id,archived,"market_next_open_v1")
         for order in ledger.orders[old_order_count:]:
             db.persist_fill(con,account_id,order)
             con.execute("INSERT INTO ledger VALUES(?,?,?,?,?,?)",(db.uid(),account_id,"fill",f"{account_id}:{order['id']}",db.dump(order),db.now()))
@@ -458,7 +697,7 @@ def runtime_loop(once=False):
                             con.execute("UPDATE instances SET desired_state='stopped',observed_state='error',error='策略心跳超时，执行进程已隔离停止，需人工检查后恢复' WHERE account_id=?",(account_id,))
                             con.execute("UPDATE commands SET status='failed',completed_at=?,error='策略心跳超时' WHERE account_id=? AND status IN ('pending','running')",(db.now(),account_id))
             with db.connect() as con:
-                rows=con.execute("SELECT DISTINCT i.account_id FROM instances i LEFT JOIN commands c ON c.account_id=i.account_id WHERE i.desired_state IN ('running','paused') OR c.status='pending'").fetchall()
+                rows=con.execute("SELECT DISTINCT i.account_id FROM instances i JOIN accounts a ON a.id=i.account_id LEFT JOIN commands c ON c.account_id=i.account_id WHERE i.desired_state IN ('running','paused') OR i.observed_state='flattening' OR c.status IN ('pending','running') OR (JSON_UNQUOTE(JSON_EXTRACT(a.metrics,'$.execution_model.model'))='maker_grid_v1' AND (COALESCE(JSON_EXTRACT(a.metrics,'$.position_count'),0)>0 OR COALESCE(JSON_EXTRACT(a.metrics,'$.open_order_count'),0)>0))").fetchall()
             for row in rows:
                 id=row["account_id"]
                 if id not in children or children[id].poll() is not None:

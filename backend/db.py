@@ -18,7 +18,7 @@ import pymysql
 from pymysql.err import IntegrityError
 from .schema import SCHEMA, TABLES
 
-ENGINE_VERSION = "1.1.0"
+ENGINE_VERSION = "1.2.0"
 SQL_MODE = "STRICT_ALL_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ZERO_DATE,NO_ZERO_IN_DATE,NO_ENGINE_SUBSTITUTION"
 
 
@@ -220,6 +220,44 @@ def persist_fill(con, account_id, order, created_at=None):
     con.execute("INSERT INTO fills(id,account_id,order_id,external_id,symbol,quantity,price,fee,realized_pnl,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE id=VALUES(id)",
                 (identity, account_id, identity, str(order.get("tradeId", original_id)), order["symbol"], Decimal(str(order["quantity"])), Decimal(str(order["price"])), Decimal(str(order.get("fee", 0))), Decimal(str(order.get("realized_pnl", 0))), encoded, at))
     return identity
+
+
+def persist_maker_activity(con, account_id, orders, fills):
+    """Persist order lifecycles and only actual simulated fills in caller's fence.
+
+    Maker order IDs and fill IDs occupy separate namespaces from the original
+    market executor. The complete client ID, lot and bracket stay in payload;
+    long client IDs use a deterministic indexed representation, never truncation.
+    """
+    at = now()
+    def order_identity(client_id, generation):
+        return hashlib.sha256((account_id + ":maker-order:" + generation + ":" + str(client_id)).encode()).hexdigest()
+    for order in orders:
+        client_id = str(order["client_order_id"])
+        generation=str(order.get("execution_id","legacy"))
+        identity = order_identity(client_id,generation)
+        prefix="maker:"+generation+":"
+        indexed_id = prefix + (client_id if len(prefix)+len(client_id)<=128 else hashlib.sha256(client_id.encode()).hexdigest())
+        saved = con.execute("SELECT payload FROM orders WHERE id=?", (identity,)).fetchone()
+        if saved:
+            previous = parse(saved["payload"])
+            if any(previous.get(key) != order.get(key) for key in ("fingerprint", "client_order_id", "symbol", "side", "position_side", "lot_id", "execution_id")):
+                raise ValueError("Maker 委托身份与已持久化的订单不一致")
+        created = datetime.fromtimestamp(order["submitted_at"] / 1000, timezone.utc).isoformat()
+        con.execute("INSERT INTO orders(id,account_id,external_id,client_order_id,symbol,side,status,payload,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE status=VALUES(status),payload=VALUES(payload),updated_at=VALUES(updated_at)",
+                    (identity, account_id, None, indexed_id, str(order.get("symbol") or ""), str(order.get("side") or ""), order["status"], dump(order), created, at))
+    for fill in fills:
+        original_id = str(fill["id"])
+        identity = hashlib.sha256((account_id + ":maker-fill:" + original_id).encode()).hexdigest()
+        encoded = dump(fill)
+        created = datetime.fromtimestamp(fill["timestamp"] / 1000, timezone.utc).isoformat()
+        con.execute("INSERT INTO fills(id,account_id,order_id,external_id,symbol,quantity,price,fee,realized_pnl,payload,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE id=VALUES(id)",
+                    (identity, account_id, order_identity(fill["client_order_id"],str(fill.get("execution_id","legacy"))), "maker:" + original_id, fill["symbol"], Decimal(str(fill["quantity"])), Decimal(str(fill["price"])), Decimal(str(fill.get("fee", 0))), Decimal(str(fill.get("realized_pnl", 0))), encoded, created))
+        saved = con.execute("SELECT payload FROM fills WHERE id=?", (identity,)).fetchone()
+        if parse(saved["payload"]) != fill:
+            raise ValueError("Maker 成交身份与已持久化的成交不一致")
+        con.execute("INSERT INTO ledger VALUES(?,?,?,?,?,?) ON DUPLICATE KEY UPDATE id=id",
+                    (identity, account_id, "fill", f"maker-fill:{account_id}:{original_id}", encoded, created))
 
 
 def log(level, message, *, strategy_id=None, account_id=None, details=None, source="system"):

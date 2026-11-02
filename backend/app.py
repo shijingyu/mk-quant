@@ -151,10 +151,12 @@ def account_data(row, *, include_private=False):
     d.update(metrics)
     d["strategy_name"]=db.parse(strategy["manifest"],{}).get("name",d["strategy_id"]) if strategy else d["strategy_id"]
     d["strategy_version"]=db.parse(strategy["manifest"],{}).get("version","") if strategy else ""
+    d["manifest_execution"]=db.parse(strategy["manifest"],{}).get("execution",{}) if strategy else {}
+    d["execution_policy"]=d["manifest_execution"].get("model","market_next_open_v1")
     d["equity"]=metrics.get("equity",d["initial_equity"])
     for key in ("unrealized_pnl","realized_pnl","margin_used","return_pct","win_rate","profit_factor","max_drawdown_pct","max_drawdown_u","position_count","long_count","short_count","today_pnl","month_pnl","running_days"):
         d.setdefault(key,0)
-    for key in ("curve","orders","positions"):
+    for key in ("curve","orders","positions","open_orders","lots"):
         d.setdefault(key,[])
     if instance:
         d["status"]=instance["observed_state"]
@@ -162,7 +164,7 @@ def account_data(row, *, include_private=False):
         d["last_heartbeat"]=instance["last_heartbeat"]
         d["runtime_error"]=instance["error"]
         d["config_revision"]=instance["config_revision"]
-        d["stale"]=instance["observed_state"] in {"running","paused","starting"} and instance["lease_until"] <= time.time()
+        d["stale"]=instance["observed_state"] in {"running","paused","starting","flattening"} and instance["lease_until"] <= time.time()
         if d["stale"]:
             d["status"]="unknown"
     else:
@@ -348,6 +350,20 @@ def update_account(account_id:str,body:dict,current=Depends(admin)):
     strategy=strategy_row(strategy_id)
     symbols=body.get("symbols",db.parse(row["symbols"],[]))
     config=validate_config(db.parse(strategy["manifest"],{}),body.get("config",db.parse(row["config"],{})),symbols)
+    current_metrics=db.parse(row["metrics"],{})
+    changes_execution=(strategy_id!=row["strategy_id"] or symbols!=db.parse(row["symbols"],[]) or config!=db.parse(row["config"],{}))
+    if changes_execution and (current_metrics.get("positions") or current_metrics.get("open_orders")):
+        raise HTTPException(409,"账户仍有持仓或挂单，完成平仓撤单后才能修改策略、币种或参数")
+    if changes_execution and row["mode"]=="paper":
+        equity=current_metrics.get("equity",row["initial_equity"])
+        if body.get("initial_equity") is not None and body["initial_equity"]!=row["initial_equity"]:
+            equity=body["initial_equity"]
+        try:
+            equity=float(equity)
+            if not math.isfinite(equity) or equity<db.parse(strategy["manifest"],{})["account"]["min_capital"]:
+                raise ValueError()
+        except (ValueError,TypeError):
+            raise HTTPException(422,"当前模拟权益低于所选策略最低资金要求，不能切换策略或配置")
     if body.get("mode",row["mode"])!=row["mode"]:
         raise HTTPException(422,"请为另一运行环境创建独立账户，不能转换已有账本的市场环境")
     name=str(body.get("name",row["name"])).strip()
@@ -390,7 +406,8 @@ def update_account(account_id:str,body:dict,current=Depends(admin)):
                 raise ValueError("手机号不能为空")
             username=phone if current_user["username"]==current_user["phone"] else current_user["username"]
             con.execute("UPDATE users SET name=?,phone=?,username=?,password=? WHERE id=?",(name,phone,username,password or current_user["password"],row["user_id"]))
-            con.execute("UPDATE instances SET config_revision=config_revision+1 WHERE account_id=?",(account_id,))
+            if changes_execution or initial!=row["initial_equity"] or credentials!=row["credentials"]:
+                con.execute("UPDATE instances SET config_revision=config_revision+1 WHERE account_id=?",(account_id,))
             if password or credentials!=row["credentials"]:
                 con.execute("DELETE FROM sessions WHERE user_id=?",(row["user_id"],))
             db.audit(con,current["id"],"account.update","account",account_id,{"strategy_id":strategy_id,"symbols":symbols,"parameters":config,"password_changed":bool(password),"credentials_changed":credentials!=row["credentials"]})
@@ -655,14 +672,17 @@ def enqueue_experiment(body, *, persist=True, rules_snapshot=None, actor_id=None
         for start,end in (ranges[:2],ranges[2:]):
             if sum(start<=t<end for t in times)<2:
                 raise HTTPException(422,f"{symbol} 在选中区间不足 2 根 K 线")
+    maker=manifest.get("execution",{}).get("model")=="maker_grid_v1"
     try:
-        capital=float(body.get("initial_capital",10000)); fee=float(body.get("fee_rate",.0004)); slip=float(body.get("slippage_bps",2)); seed=int(body.get("seed",42))
+        capital=float(body.get("initial_capital",10000)); fee=float(body.get("fee_rate",.0002 if maker else .0004)); slip=float(body.get("slippage_bps",0 if maker else 2)); seed=int(body.get("seed",42))
         if not all(math.isfinite(x) for x in (capital,fee,slip)) or capital<=0 or not 0<=fee<=.1 or not 0<=slip<=1000:
             raise ValueError()
     except (ValueError,TypeError) as exc:
         raise HTTPException(422,"资金必须大于 0，费率范围 0–0.1，滑点范围 0–1000 bps") from exc
     if capital<manifest["account"]["min_capital"]:
         raise HTTPException(422,"初始资金低于策略最低资金要求")
+    if maker and slip!=0:
+        raise HTTPException(422,"Maker 网格使用限价撮合，滑点须为 0；手续费请填写 Maker 费率")
     try:
         leverage=float(body.get("leverage",manifest["account"]["leverage_min"]))
         if not math.isfinite(leverage) or not leverage.is_integer() or not manifest["account"]["leverage_min"]<=leverage<=manifest["account"]["leverage_max"]:
@@ -693,6 +713,8 @@ def enqueue_experiment(body, *, persist=True, rules_snapshot=None, actor_id=None
     config.update(parameters=params,symbols=symbols,initial_capital=capital,fee_rate=fee,slippage_bps=slip,seed=seed,market=manifest.get("market","futures"),leverage=int(leverage),ranges_ms=ranges,symbol_filters=filters)
     provenance={"strategy_version":manifest.get("version"),"strategy_hash":strategy["source_hash"],"parameters_hash":hashlib.sha256(db.dump(params).encode()).hexdigest(),"data_version":dataset["id"],"data_hash":dataset["sha256"],"engine_version":db.ENGINE_VERSION,"fee_model":{"taker_rate":fee,"source":"manual"},"slippage_model":{"bps":slip,"type":"fixed_adverse"},"seed":seed,"intervals":dict(zip(("train_start","train_end","validation_start","validation_end"),ranges)),"environment":{"python":platform.python_version(),"platform":platform.system()},"source":"synthetic" if dataset["source"]=="synthetic" else "historical"}
     provenance["symbol_filters"]={"source":filters_source,"rules":filters}
+    if maker:
+        provenance.update(execution_model="maker_grid_v1",position_mode="hedge",fee_model={"maker_rate":fee,"source":"manual"},slippage_model={"bps":0,"type":"post_only_limit_no_taker_fallback"})
     prepared={"id":db.uid(),"name":str(body.get("name") or manifest.get("name","策略")+" · 参数实验"),"strategy_id":strategy["id"],"dataset_id":dataset["id"],"config":config,"provenance":provenance,"strategy_snapshot":strategy}
     if not persist:
         return prepared
