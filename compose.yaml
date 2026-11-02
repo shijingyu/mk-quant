@@ -1,0 +1,105 @@
+name: mk-quant
+
+x-backend: &backend
+  image: mk-quant-backend:local
+  build:
+    context: .
+    target: backend
+  restart: unless-stopped
+  init: true
+  read_only: true
+  user: "10001:10001"
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+  volumes:
+    - mk-data:/data
+  stop_grace_period: 30s
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  api:
+    <<: *backend
+    command: ["python", "-m", "uvicorn", "backend.app:app", "--host", "0.0.0.0", "--port", "8765", "--proxy-headers", "--forwarded-allow-ips", "*"]
+    ports:
+      - "127.0.0.1:8765:8765"
+    environment:
+      MK_DB_PATH: /data/mk.sqlite3
+      MK_ENABLE_LIVE: "0"
+      MK_DEMO: "0"
+      # Supplied by the operator. Empty means credential encryption stays disabled.
+      MK_MASTER_KEY: ${MK_MASTER_KEY:-}
+      MK_COOKIE_SECURE: ${MK_COOKIE_SECURE:-0}
+      MK_ALLOWED_ORIGINS: ${MK_ALLOWED_ORIGINS:-http://localhost:8080,http://127.0.0.1:8080}
+    cpus: "0.75"
+    mem_limit: 768m
+    pids_limit: 128
+
+  backtest:
+    <<: *backend
+    command: ["python", "-m", "backend.worker", "backtest"]
+    environment:
+      MK_DB_PATH: /data/mk.sqlite3
+      MK_ENABLE_LIVE: "0"
+      MK_DEMO: "0"
+    # Experiments use persisted historical datasets; no exchange/network access.
+    network_mode: none
+    cpus: "1.0"
+    mem_limit: 1g
+    pids_limit: 64
+    healthcheck:
+      disable: true
+
+  runtime:
+    <<: *backend
+    command: ["python", "-m", "backend.worker", "runtime"]
+    environment:
+      MK_DB_PATH: /data/mk.sqlite3
+      MK_ENABLE_LIVE: "0"
+      MK_DEMO: "0"
+    # Runtime owns the shared public-market poller and isolated paper actors.
+    # It is independent from api lifecycle and receives no credential master key.
+    cpus: "2.0"
+    mem_limit: 2g
+    pids_limit: 256
+    healthcheck:
+      disable: true
+
+  frontend:
+    image: mk-quant-frontend:local
+    build:
+      context: .
+      target: frontend
+    restart: unless-stopped
+    init: true
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    ports:
+      - "127.0.0.1:${MK_HTTP_PORT:-8080}:8080"
+    depends_on:
+      api:
+        condition: service_healthy
+    cpus: "0.25"
+    mem_limit: 128m
+    pids_limit: 64
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  # SQLite WAL requires local filesystem locking. Single-host storage only.
+  mk-data:
