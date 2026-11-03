@@ -32,7 +32,7 @@ from .strategy import load_strategy, validate_parameters, validate_strategy_sour
 from .timeframes import MINUTE_MS, MinuteFrames
 
 
-ENGINE_VERSION = "1.3.0"
+ENGINE_VERSION = "1.4.0"
 ZERO = Decimal("0")
 ONE = Decimal("1")
 
@@ -77,6 +77,9 @@ def _timestamp(value):
 
 
 def _prepare_candles(candles):
+    from .research import CandleWindow
+    if isinstance(candles, CandleWindow):
+        return candles.prepare()
     if not isinstance(candles, dict) or not candles:
         raise ValueError("需要按交易对分组的 K 线数据")
     prepared = {}
@@ -432,7 +435,9 @@ class MakerOrderBook:
         self.orders[key] = order
         lot_id = order.get("lot_id")
         if isinstance(lot_id, str):
-            self._orders_by_lot.setdefault(lot_id, {})[key] = None
+            lot_orders=self._orders_by_lot.get(lot_id,{})
+            lot_orders[key]=None
+            self._orders_by_lot[lot_id]=lot_orders
         if order["status"] in self.OPEN:
             self._active_order_ids[key] = None
         else:
@@ -717,6 +722,7 @@ class MakerOrderBook:
                 for sibling in self._lot_orders(lot["id"]):
                     if sibling["id"] != order["id"] and sibling["status"] in self.OPEN:
                         self.cancel(sibling["id"], timestamp, "lot 已平仓，取消兄弟保护/手动退出单")
+                self.lots[lot["id"]]=lot
                 self._event("LOT_CLOSED", timestamp, order)
             else:
                 for sibling in self._lot_orders(lot["id"]):
@@ -832,11 +838,17 @@ def calculate_metrics(equity, orders, initial_capital, *, closed_pnls=None, acco
         dd_amount = peak - item["equity"]
         max_drawdown_amount = max(max_drawdown_amount, dd_amount)
         max_drawdown = max(max_drawdown, dd_amount / peak if peak > 0 else 0)
-    closed = [float(v) for v in closed_pnls] if closed_pnls is not None else [float(o["closed_trade_pnl"]) for o in orders if o.get("closed_trade_pnl") is not None]
-    wins = [value for value in closed if value > 0]
-    losses = [value for value in closed if value < 0]
-    longest = streak = 0
+    closed = (float(v) for v in closed_pnls) if closed_pnls is not None else (float(o["closed_trade_pnl"]) for o in orders if o.get("closed_trade_pnl") is not None)
+    closed_count = wins_count = losses_count = longest = streak = 0
+    win_sum = loss_sum = 0.0
     for value in closed:
+        closed_count += 1
+        if value > 0:
+            wins_count += 1
+            win_sum += value
+        if value < 0:
+            losses_count += 1
+            loss_sum += value
         streak = streak + 1 if value < 0 else 0
         longest = max(longest, streak)
     scale = 1000 if equity and equity[-1]["timestamp"] > 100000000000 else 1
@@ -858,11 +870,11 @@ def calculate_metrics(equity, orders, initial_capital, *, closed_pnls=None, acco
     return {
         "initial_equity": initial, "final_equity": final, "total_return": final / initial - 1,
         "annual_return": annual_return, "max_drawdown": max_drawdown,
-        "max_drawdown_amount": max_drawdown_amount, "win_rate": len(wins) / len(closed) if closed else None,
-        "profit_factor": sum(wins) / abs(sum(losses)) if losses else None, "sharpe": sharpe,
+        "max_drawdown_amount": max_drawdown_amount, "win_rate": wins_count / closed_count if closed_count else None,
+        "profit_factor": win_sum / abs(loss_sum) if losses_count else None, "sharpe": sharpe,
         "total_orders": len(orders), "long_orders": sum(o.get("direction") == "long" for o in orders),
         "short_orders": sum(o.get("direction") == "short" for o in orders),
-        "closed_trades": len(closed), "max_consecutive_losses": longest,
+        "closed_trades": closed_count, "max_consecutive_losses": longest,
         "realized_pnl": account.get("realized_pnl", final - initial),
         "unrealized_pnl": account.get("unrealized_pnl", 0.0), "margin_used": account.get("margin_used", 0.0),
         "total_fees": sum(order.get("fee", 0.0) for order in orders),
@@ -871,13 +883,13 @@ def calculate_metrics(equity, orders, initial_capital, *, closed_pnls=None, acco
 
 class SymbolAttribution:
     """Attribute one shared execution ledger; never rerun a multi-coin strategy."""
-    def __init__(self,ledger,symbols):
+    def __init__(self,ledger,symbols,series_factory=list):
         self.ledger=ledger
         self.symbols=sorted(symbols)
         part=ledger.initial/len(self.symbols)
         self.initial={symbol:part for symbol in self.symbols}
         self.initial[self.symbols[-1]]=ledger.initial-part*(len(self.symbols)-1)
-        self.curves={symbol:[] for symbol in self.symbols}
+        self.curves={symbol:series_factory() for symbol in self.symbols}
         self.peaks=dict(self.initial)
 
     def account(self,symbol,book=None):
@@ -918,7 +930,8 @@ class SymbolAttribution:
         results={}
         for symbol in self.symbols:
             account=self.account(symbol,book)
-            orders=[copy.deepcopy(order) for order in self.ledger.orders if order["symbol"]==symbol]
+            from .research import RecordView
+            orders=RecordView([(None,self.ledger.orders)],predicate=lambda row,symbol=symbol: row["symbol"]==symbol) if not isinstance(self.ledger.orders,list) else [copy.deepcopy(order) for order in self.ledger.orders if order["symbol"]==symbol]
             results[symbol]={"metrics":calculate_metrics(self.curves[symbol],orders,self.initial[symbol],account=account),
                 "equity":self.curves[symbol],"account":account,"orders":orders,
                 "allocation":{"method":"equal_initial_capital","initial_capital":_float(self.initial[symbol])}}
@@ -926,7 +939,7 @@ class SymbolAttribution:
 
 
 def run_backtest(strategy_source, params, candles, initial_capital, fee_rate, slippage_bps,
-                 market="futures", leverage=1, symbol_filters=None, progress=None, cancelled=None, *, base_interval="1m"):
+                 market="futures", leverage=1, symbol_filters=None, progress=None, cancelled=None, *, base_interval="1m", research_space=None):
     """Run a fresh deterministic strategy with optional batched progress callback.
 
     ``progress({processed,total,status,equity:[new points]})`` marks intermediate
@@ -956,6 +969,7 @@ def run_backtest(strategy_source, params, candles, initial_capital, fee_rate, sl
         raise ValueError("杠杆不符合策略声明范围")
     if market == "spot" and lev != ONE:
         raise ValueError("现货不可使用杠杆")
+    series_factory = research_space.sequence if research_space is not None else list
     prepared, timestamps = _prepare_candles(candles)
     symbols = sorted(prepared)
     validate_symbols(manifest, symbols)
@@ -965,13 +979,14 @@ def run_backtest(strategy_source, params, candles, initial_capital, fee_rate, sl
         if slippage != ZERO:
             raise ValueError("maker_grid_v1 使用限价成交模型，slippage_bps 必须为 0，不能套用市价滑点")
         return _run_maker_backtest(strategy_source, manifest, parameters, prepared, timestamps,
-                                  initial, fees, lev, symbol_filters, progress, cancelled)
+                                  initial, fees, lev, symbol_filters, progress, cancelled, series_factory, research_space)
     filters = {symbol: _filters_for(symbol, symbol_filters) for symbol in symbols}
     strategy = load_strategy(strategy_source)
     ledger = Ledger(initial, market, lev, fees)
+    ledger.orders, ledger.closed_pnls = series_factory(), series_factory()
     frames = MinuteFrames(symbols, manifest["timeframes"], manifest["history_window"])
-    attribution = SymbolAttribution(ledger, symbols)
-    curve, decisions, pending = [], [], []
+    attribution = SymbolAttribution(ledger, symbols, series_factory)
+    curve, decisions, pending = series_factory(), series_factory(), []
     peak = initial
     batch_start = 0
     batch_size = max(1, min(100, len(timestamps) // 30))
@@ -1053,13 +1068,22 @@ def run_backtest(strategy_source, params, candles, initial_capital, fee_rate, sl
 
 
 def _run_maker_backtest(source, manifest, parameters, prepared, timestamps,
-                       initial, fee, leverage, symbol_filters, progress, cancelled):
+                       initial, fee, leverage, symbol_filters, progress, cancelled, series_factory=list, research_space=None):
     ledger = Ledger(initial, "futures", leverage, fee, position_mode="hedge")
+    ledger.orders, ledger.closed_pnls = series_factory(), series_factory()
     book = MakerOrderBook(ledger, symbol_filters, maker_fee_rate=fee)
+    book.events = series_factory()
+    if research_space is not None:
+        # Rules are the immutable experiment snapshot, identical for every bar.
+        normalized_rules={symbol:_filters_for(symbol,symbol_filters,market_order=False) for symbol in prepared}
+        book._rule=normalized_rules.__getitem__
+        book.orders=research_space.mapping(active=lambda order: order["status"] in book.OPEN)
+        book.lots=research_space.mapping(active=lambda lot: _decimal(lot["remaining_quantity"])>0)
+        book._orders_by_lot=research_space.mapping()
     strategy = load_strategy(source)
     frames = MinuteFrames(prepared, manifest["timeframes"], manifest["history_window"])
-    attribution = SymbolAttribution(ledger, prepared)
-    curve, decisions = [], []
+    attribution = SymbolAttribution(ledger, prepared, series_factory)
+    curve, decisions = series_factory(), series_factory()
     unreported_events = []
     peak, batch_start = initial, 0
     batch_size = max(1, min(100, len(timestamps) // 30))
@@ -1120,7 +1144,7 @@ def _run_maker_backtest(source, manifest, parameters, prepared, timestamps,
         progress({"processed": len(timestamps), "total": len(timestamps), "status": "completed", "equity": [], "metrics": metrics})
     return {"metrics": metrics, "equity": curve, "orders": ledger.orders, "decisions": decisions,
             "positions": ledger.position_snapshot(), "account": ledger.account(), "open_orders": book.open_orders(),
-            "lots": book.lot_snapshot(), "events": copy.deepcopy(book.events), "order_book": book.dump(),
+            "lots": book.lot_snapshot(), "events": copy.deepcopy(book.events) if series_factory is list else book.events, "order_book": book.dump() if series_factory is list else None,
             "symbol_results":attribution.result(book),
             "engine_version": ENGINE_VERSION, "status": "completed", "parameters": parameters,
             "assumptions": {"execution": "maker_grid_v1", "position_mode": "hedge", "fee_rate": _float(fee),

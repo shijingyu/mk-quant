@@ -395,7 +395,8 @@ def test_backtest_memory_failure_has_actionable_result(client, monkeypatch):
     assert result.status_code == 202
     def exhausted(*args, **kwargs):
         raise MemoryError()
-    monkeypatch.setattr(storage, 'read_candles', exhausted)
+    from backend.research import CandleWindow
+    monkeypatch.setattr(CandleWindow, 'prepare', exhausted)
     run_experiment(result.json()['id'])
     report = client.get('/api/experiments/' + result.json()['id']).json()
     assert report['status'] == 'failed'

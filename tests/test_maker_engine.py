@@ -308,7 +308,7 @@ def test_backtest_uses_same_book_contract_and_reports_assumptions_and_orders():
     assert result["order_book"]["orders"]["e:sl"]["status"] == "CANCELED"
     assert result["assumptions"]["execution"] == "maker_grid_v1"
     assert result["assumptions"]["real_bid_ask_queue_available"] is False
-    assert result["engine_version"] == "1.3.0"
+    assert result["engine_version"] == "1.4.0"
     assert [event for decision in result["decisions"] for event in decision["execution_events"]] == result["events"]
     assert any(event["type"] == "ORDER_ACCEPTED" for event in result["decisions"][0]["execution_events"])
     json.dumps(result, allow_nan=False)

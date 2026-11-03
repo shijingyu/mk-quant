@@ -480,28 +480,106 @@ def candle_metadata(value):
 
 
 def curve_preview(rows, budget=600):
-    """Retain both extrema per bucket plus endpoints; never smooth the line."""
-    if len(rows) <= budget:
+    """One sequential pass, retaining both extrema of each original bucket."""
+    count = len(rows)
+    if count <= budget:
         return list(rows)
-    chosen = {0, len(rows) - 1}
-    width = max(1, math.ceil((len(rows) - 2) / max(1, (budget - 2) // 2)))
-    for first in range(1, len(rows) - 1, width):
-        indices = range(first, min(first + width, len(rows) - 1))
-        chosen.add(min(indices, key=lambda i: rows[i].get("equity", 0)))
-        chosen.add(max(indices, key=lambda i: rows[i].get("equity", 0)))
-    return [rows[i] for i in sorted(chosen)]
+    width = max(1, math.ceil((count - 2) / max(1, (budget - 2) // 2)))
+    chosen, bucket, low, high = {}, None, None, None
+    for index, row in enumerate(rows):
+        if index in {0, count - 1}:
+            chosen[index] = row
+            continue
+        key = (index - 1) // width
+        if key != bucket:
+            if low is not None:
+                chosen[low[0]], chosen[high[0]] = low[1], high[1]
+            bucket, low, high = key, (index, row), (index, row)
+        else:
+            if row["equity"] < low[1]["equity"]:
+                low = (index, row)
+            if row["equity"] > high[1]["equity"]:
+                high = (index, row)
+    if low is not None:
+        chosen[low[0]], chosen[high[0]] = low[1], high[1]
+    return [chosen[index] for index in sorted(chosen)]
 
 
-def write_records(kind, rows):
+def write_records(kind, rows, heartbeat=None):
+    """Publish an iterable as Parquet without materializing the complete report."""
     if kind not in SERIES:
         raise ArtifactError("不支持的回测明细类型")
-    pa, _ = _arrow()
-    records = [{"row_index": i, "timestamp": int(row["timestamp"]) if row.get("timestamp") is not None else None,
-                "symbol": str(row.get("symbol", "")), "split": str(row.get("split", "")), "payload": db.dump(row)}
-               for i, row in enumerate(rows)]
+    pa, pq = _arrow()
+    root = artifact_root()
+    directory = root / kind
+    directory.mkdir(parents=True, exist_ok=True, mode=0o750)
+    if directory.is_symlink() or root not in directory.resolve().parents:
+        raise ArtifactError("文件目录必须位于独立存储根目录内")
     schema = pa.schema([("row_index", pa.int64()), ("timestamp", pa.int64()), ("symbol", pa.string()), ("split", pa.string()), ("payload", pa.string())])
-    digest = hashlib.sha256(db.dump(rows).encode()).hexdigest()
-    return _publish(kind, pa.Table.from_pylist(records, schema=schema), digest, len(rows))
+    fd, temporary = tempfile.mkstemp(prefix=".writing-records-", suffix=".parquet", dir=directory)
+    os.close(fd)
+    writer = None
+    try:
+        writer = pq.ParquetWriter(temporary, schema, compression="zstd", compression_level=3)
+        digest, count, buffered_bytes, records = hashlib.sha256(b"["), 0, 0, []
+        def flush():
+            if heartbeat:
+                heartbeat()
+            if shutil.disk_usage(directory).free < 128*1024*1024 + buffered_bytes*3:
+                raise ArtifactError("磁盘可用空间不足，不能保存完整回测结果")
+            if records:
+                writer.write_table(pa.Table.from_pylist(records, schema=schema), row_group_size=32768)
+                records.clear()
+        for row in rows:
+            payload = db.dump(row)
+            encoded = payload.encode()
+            if count:
+                digest.update(b",")
+            digest.update(encoded)
+            records.append({"row_index":count, "timestamp":int(row["timestamp"]) if row.get("timestamp") is not None else None,
+                            "symbol":str(row.get("symbol", "")), "split":str(row.get("split", "")), "payload":payload})
+            count += 1
+            buffered_bytes += len(encoded)
+            if buffered_bytes >= 4*1024*1024 or len(records) >= 32768:
+                flush()
+                buffered_bytes = 0
+        flush()
+        digest.update(b"]")
+        content_hash = digest.hexdigest()
+        metadata = {b"mk.content_sha256":content_hash.encode(), b"mk.version":b"1", b"mk.kind":kind.encode()}
+        writer.add_key_value_metadata(metadata)
+        writer.close()
+        writer = None
+        os.chmod(temporary, 0o640)
+        with open(temporary, "rb") as stream:
+            os.fsync(stream.fileno())
+        footer = pq.read_metadata(temporary)
+        if footer.num_rows != count or any((footer.metadata or {}).get(key) != value for key,value in metadata.items()):
+            raise ArtifactError("回测文件清单校验失败")
+        # Cancellation must happen before publishing a new file, so the caller
+        # always receives its manifest and can reclaim it on a failed DB commit.
+        file_hash = _digest_file(Path(temporary), heartbeat)
+        path = directory / (content_hash + ".parquet")
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            if path.is_symlink() or _logical_digest(path, kind, heartbeat) != content_hash:
+                raise ArtifactError("已存在的文件索引与内容哈希不一致")
+            footer = pq.read_metadata(path)
+            if footer.num_rows != count or any((footer.metadata or {}).get(key) != value for key,value in metadata.items()):
+                raise ArtifactError("回测文件清单校验失败")
+            file_hash = _digest_file(path, heartbeat)
+        descriptor = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        return {"storage":"parquet", "version":FORMAT_VERSION, "kind":kind, "path":str(path.relative_to(root)),
+                "sha256":file_hash, "content_sha256":content_hash, "count":count}
+    finally:
+        if writer is not None:
+            writer.close()
+        Path(temporary).unlink(missing_ok=True)
 
 
 def _iter_payloads(path, *, offset=0, limit=None, symbol=None, split=None):
@@ -674,7 +752,8 @@ def result_preview(result):
     return preview
 
 
-def store_result(result):
+@lifecycle_lock()
+def store_result(result, heartbeat=None, published=None):
     """All detailed series are independent files; DB keeps summaries/previews."""
     stored = {key: value for key, value in result.items() if key not in SERIES and key not in {"artifacts", "symbol_results"}}
     symbols = result.get("symbol_results", {})
@@ -690,13 +769,16 @@ def store_result(result):
         # The empty symbol denotes the portfolio. Each other group is an
         # attribution from the same execution, not an independent strategy run.
         if kind in {"curve", "validation_curve"} and symbols:
-            scoped_rows = [dict(row, symbol="") for row in rows]
+            from .research import RecordView
+            scoped_rows = RecordView([("", rows), *((symbol, value.get(kind, [])) for symbol,value in symbols.items())],
+                                     transform=lambda row,symbol: dict(row,symbol=symbol))
             for symbol, value in symbols.items():
-                scoped_rows.extend(dict(row, symbol=symbol) for row in value.get(kind, []))
                 stored["symbol_results"][symbol][kind] = curve_preview(value.get(kind, []))
-            artifacts[kind] = write_records(kind, scoped_rows)
+            artifacts[kind] = write_records(kind, scoped_rows, heartbeat)
         else:
-            artifacts[kind] = write_records(kind, rows)
+            artifacts[kind] = write_records(kind, rows, heartbeat)
+        if published is not None:
+            published[kind] = artifacts[kind]
         if kind in {"curve", "validation_curve"}:
             stored[kind] = curve_preview(rows)
     stored["artifacts"] = artifacts

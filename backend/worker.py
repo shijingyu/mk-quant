@@ -38,6 +38,7 @@ def ui_metrics(m):
 
 def run_experiment(id):
     from .engine import run_backtest,BacktestCancelled
+    from .research import ResearchSpace, CandleWindow, RecordView, ExtremaPreview
     with db.connect() as con:
         row=con.execute("SELECT * FROM experiments WHERE id=? FOR UPDATE",(id,)).fetchone()
         if not row or row["status"] not in {"queued","running"}:
@@ -57,6 +58,8 @@ def run_experiment(id):
             strategy={**dict(version),"trusted":strategy["trusted"]}
         dataset=con.execute("SELECT * FROM datasets WHERE id=?",(row["dataset_id"],)).fetchone()
         con.execute("UPDATE experiments SET status='running',worker_pid=?,started_at=? WHERE id=?",(os.getpid(),db.now(),id))
+    space = data = published = None
+    committed=False
     partial={"curve":[],"validation_curve":[],"metrics":{},"validation_metrics":{},"incomplete":True,"symbol_results":{}}
     try:
         if not strategy or not strategy["trusted"]:
@@ -75,30 +78,50 @@ def run_experiment(id):
         # Network independence keeps historical experiments reproducible. Rules are
         # supplied with the job when captured; fallback is exposed in assumptions.
         filters=config.get("symbol_filters")
+        space=ResearchSpace(storage.artifact_root())
         output={}
+        cancellation_checked=0.0
+        cancellation_value=False
+        last_publish=0.0
+        accumulators={}
         def cancelled():
+            nonlocal cancellation_checked,cancellation_value
+            now=time.monotonic()
+            if now-cancellation_checked<1:
+                return cancellation_value
+            cancellation_checked=now
             with db.connect() as con:
                 current=con.execute("SELECT cancel_requested FROM experiments WHERE id=?",(id,)).fetchone()
-            return bool(current and current[0])
+            cancellation_value=not current or bool(current[0])
+            return cancellation_value
         for i,(split,start,end) in enumerate((("train",ranges[0],ranges[1]),("validation",ranges[2],ranges[3]))):
-            data=storage.read_candles(dataset["candles"],symbols=config["symbols"],start=start,end=end)
+            data=CandleWindow(dataset["candles"],config["symbols"],start,end)
             curve_key="curve" if split=="train" else "validation_curve"
             def progress(event):
-                partial[curve_key].extend(event.get("equity",[]))
-                for symbol,points in event.get("symbol_equity",{}).items():
-                    partial["symbol_results"][symbol][curve_key].extend(points)
+                nonlocal last_publish
+                groups={"":event.get("equity",[]), **event.get("symbol_equity",{})}
+                for symbol,points in groups.items():
+                    accumulator=accumulators.setdefault((curve_key,symbol),ExtremaPreview(event["total"]))
+                    accumulator.extend(points)
+                if time.monotonic()-last_publish<2 and event.get("status")!="completed":
+                    return
+                last_publish=time.monotonic()
+                partial[curve_key]=accumulators[(curve_key,"")].points()
+                for symbol in config["symbols"]:
+                    partial["symbol_results"][symbol][curve_key]=accumulators[(curve_key,symbol)].points()
                 value=min(99.9,(i+event["processed"]/max(event["total"],1))*50)
                 preview=storage.result_preview(partial)
                 with db.connect() as con:
                     con.execute("UPDATE experiments SET progress=?,result=? WHERE id=? AND status='running'",(value,db.dump(preview),id))
-            output[split]=run_backtest(strategy["source"],config["parameters"],data,config["initial_capital"],config["fee_rate"],config["slippage_bps"],market=config["market"],leverage=config.get("leverage",manifest["account"]["leverage_min"]),symbol_filters=filters,progress=progress,cancelled=cancelled,base_interval="1m")
-            del data  # Release this split before allocating the next input window.
+            output[split]=run_backtest(strategy["source"],config["parameters"],data,config["initial_capital"],config["fee_rate"],config["slippage_bps"],market=config["market"],leverage=config.get("leverage",manifest["account"]["leverage_min"]),symbol_filters=filters,progress=progress,cancelled=cancelled,base_interval="1m",research_space=space)
+            data.close()
+            data=None
             partial["metrics" if split=="train" else "validation_metrics"]=ui_metrics(output[split]["metrics"])
             for symbol,value in output[split]["symbol_results"].items():
                 partial["symbol_results"][symbol]["metrics" if split=="train" else "validation_metrics"]=ui_metrics(value["metrics"])
         if cancelled():
             raise BacktestCancelled("任务取消")
-        result={"metrics":ui_metrics(output["train"]["metrics"]),"validation_metrics":ui_metrics(output["validation"]["metrics"]),"curve":output["train"]["equity"],"validation_curve":output["validation"]["equity"],"orders":[dict(o,split=split) for split,r in output.items() for o in r["orders"]],"decisions":[dict(o,split=split) for split,r in output.items() for o in r["decisions"]],"assumptions":output["train"]["assumptions"],"incomplete":False}
+        result={"metrics":ui_metrics(output["train"]["metrics"]),"validation_metrics":ui_metrics(output["validation"]["metrics"]),"curve":output["train"]["equity"],"validation_curve":output["validation"]["equity"],"orders":RecordView([(split,r["orders"]) for split,r in output.items()],transform=lambda row,split:dict(row,split=split)),"decisions":RecordView([(split,r["decisions"]) for split,r in output.items()],transform=lambda row,split:dict(row,split=split)),"assumptions":output["train"]["assumptions"],"incomplete":False}
         result["symbol_results"]={}
         for symbol in config["symbols"]:
             train,validation=output["train"]["symbol_results"][symbol],output["validation"]["symbol_results"][symbol]
@@ -114,14 +137,25 @@ def run_experiment(id):
                           lots=[dict(lot,split=split) for split,value in output.items() for lot in value["lots"]],
                           account_summaries={split:value["account"] for split,value in output.items()})
         result["differences"]={k:result["validation_metrics"][k]-v for k,v in result["metrics"].items() if isinstance(v,(int,float)) and isinstance(result["validation_metrics"].get(k),(int,float))}
+        def publish_heartbeat():
+            nonlocal last_publish
+            if cancelled():
+                raise BacktestCancelled("发布时取消")
+            if time.monotonic()-last_publish>=2:
+                with db.connect() as con:
+                    con.execute("UPDATE experiments SET result=JSON_SET(result,'$.publication_heartbeat',?,'$.phase','publishing') WHERE id=? AND status='running'",(db.now(),id))
+                last_publish=time.monotonic()
         with storage.lifecycle_lock():
+            published={"artifacts":{}}
+            stored_result=storage.store_result(result,heartbeat=publish_heartbeat,published=published["artifacts"])
+            published=stored_result
             with db.connect() as con:
                 current=con.execute("SELECT cancel_requested,status FROM experiments WHERE id=? FOR UPDATE",(id,)).fetchone()
                 if not current or current["cancel_requested"] or current["status"] != "running":
                     raise BacktestCancelled("任务取消")
-                stored_result=storage.store_result(result)
                 con.execute("UPDATE experiments SET status='completed',progress=100,result=?,completed_at=?,error=NULL WHERE id=?",(db.dump(stored_result),db.now(),id))
                 db.audit(con,None,"experiment.complete","experiment",id,{"strategy_version_id":version["id"],"artifact_counts":{key:manifest["count"] for key,manifest in stored_result["artifacts"].items()}})
+        committed=True
         db.log("debug","回测及验证集完成",strategy_id=row["strategy_id"],details={"experiment_id":id})
     except BacktestCancelled:
         with db.connect() as con:
@@ -131,7 +165,9 @@ def run_experiment(id):
         if memory_failure:
             # Free the failing engine/read stack before allocating a DB error report.
             exc.__traceback__=None
-            data=None
+            if data is not None:
+                data.close()
+                data=None
             if "output" in locals():
                 output.clear()
             partial.clear()
@@ -139,12 +175,23 @@ def run_experiment(id):
         with db.connect() as con:
             con.execute("UPDATE experiments SET status='failed',completed_at=?,error=? WHERE id=?",(db.now(),message[:2000],id))
         db.log("error","回测失败",strategy_id=row["strategy_id"],details={"experiment_id":id,"error":message[:2000]})
+    finally:
+        if data is not None:
+            data.close()
+        if space is not None:
+            space.close()
+        if published and not committed:
+            from . import artifact_cleanup
+            with db.connect() as con:
+                cleanup_id=artifact_cleanup.enqueue(con,None,list(published["artifacts"].values()))
+            artifact_cleanup.drain(cleanup_id)
 
 
 def _child_limits():
     """Resource ceilings supplement process isolation; they are not a code sandbox."""
     import resource
-    resource.setrlimit(resource.RLIMIT_CPU,(300,305))
+    cpu=max(300,int(os.getenv("MK_BACKTEST_CPU_SECONDS","43200")))
+    resource.setrlimit(resource.RLIMIT_CPU,(cpu,cpu+5))
     if sys.platform.startswith("linux"):
         memory=max(256,int(os.getenv("MK_BACKTEST_ADDRESS_SPACE_MB","768")))*1024*1024
         inherited=resource.getrlimit(resource.RLIMIT_AS)[1]
@@ -228,10 +275,12 @@ def backtest_loop(once=False):
 
 
 def _monitor_job(child,job_id,owner,started):
+    last_progress=None
+    last_advance=time.monotonic()
     while child.poll() is None:
         service("backtest",owner)
         with db.connect() as con:
-            cancellation=con.execute("SELECT cancel_requested FROM experiments WHERE id=?",(job_id,)).fetchone()
+            cancellation=con.execute("SELECT cancel_requested,progress,status,JSON_EXTRACT(result,'$.publication_heartbeat') AS publication_heartbeat FROM experiments WHERE id=?",(job_id,)).fetchone()
         if cancellation and cancellation[0]:
             child.terminate()
             try:
@@ -241,8 +290,15 @@ def _monitor_job(child,job_id,owner,started):
             with db.connect() as con:
                 con.execute("UPDATE experiments SET status='cancelled',completed_at=?,error='用户取消；部分结果不是最终统计' WHERE id=? AND status='running'",(db.now(),job_id))
             break
-        if time.monotonic()-started>360:
+        value=(cancellation["progress"],cancellation["status"],cancellation["publication_heartbeat"]) if cancellation else None
+        if value!=last_progress:
+            last_progress,last_advance=value,time.monotonic()
+        stalled=time.monotonic()-last_advance>max(60,int(os.getenv("MK_BACKTEST_STALL_SECONDS","900")))
+        deadline=time.monotonic()-started>max(360,int(os.getenv("MK_BACKTEST_WALL_SECONDS","86400")))
+        if stalled or deadline:
             child.kill();child.wait()
+            with db.connect() as con:
+                con.execute("UPDATE experiments SET status='failed',completed_at=?,error=? WHERE id=? AND status='running'",(db.now(),"回测长时间无进展" if stalled else "回测超过总运行时长预算",job_id))
             break
         time.sleep(.5)
 
