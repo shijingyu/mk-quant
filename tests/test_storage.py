@@ -240,3 +240,33 @@ def test_cleanup_rejects_symlinks_and_changed_files(artifact_root, tmp_path):
     assert outside.read_bytes() == original
     path.unlink()
     assert artifact_cleanup._remove(manifest) == 0
+
+
+def test_minute_validation_streams_indices_without_loading_candles(artifact_root, monkeypatch):
+    data = candles()
+    data['ETHUSDT'] = copy.deepcopy(data['BTCUSDT'])
+    manifest = storage.write_candles(data)
+    start = data['BTCUSDT'][0]['timestamp']
+    _, pq = storage._arrow()
+    monkeypatch.setattr(pq, 'read_table', lambda *a, **kw: pytest.fail('Full table materialization is forbidden'))
+    result = storage.validate_minute_windows(manifest, ['BTCUSDT', 'ETHUSDT'], [(start, start + 120000), (start + 120000, start + 240000)])
+    assert result[0]['BTCUSDT'] == result[0]['ETHUSDT'] == [start, start+60000, 2]
+    assert storage.read_candles(manifest, symbols=['BTCUSDT'], start=start+60000, end=start+180000)['BTCUSDT'] == data['BTCUSDT'][1:3]
+
+
+@pytest.mark.parametrize('problem', ['gap', 'unaligned', 'different_window', 'insufficient'])
+def test_minute_validation_preserves_rejections(artifact_root, problem):
+    data = candles()
+    data['ETHUSDT'] = copy.deepcopy(data['BTCUSDT'])
+    start = data['BTCUSDT'][0]['timestamp']
+    if problem == 'gap':
+        data['ETHUSDT'].pop(1)
+    elif problem == 'unaligned':
+        data['ETHUSDT'][1]['timestamp'] += 1
+    elif problem == 'different_window':
+        data['ETHUSDT'].pop(0)
+    else:
+        data['ETHUSDT'] = data['ETHUSDT'][:1]
+    manifest = storage.write_candles(data)
+    with pytest.raises(ValueError):
+        storage.validate_minute_windows(manifest, ['BTCUSDT', 'ETHUSDT'], [(start, start + 240000)])

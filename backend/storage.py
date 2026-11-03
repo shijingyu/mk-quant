@@ -384,6 +384,25 @@ class CandleStreamWriter:
         self.close()
 
 
+def _candle_row_groups(parquet, symbols=None, start=None, end=None):
+    """Skip disjoint Parquet row groups before decoding payloads or indices."""
+    names = parquet.schema_arrow.names
+    symbol_index, timestamp_index = names.index("symbol"), names.index("timestamp")
+    selected = []
+    for index in range(parquet.metadata.num_row_groups):
+        group = parquet.metadata.row_group(index)
+        times = group.column(timestamp_index).statistics
+        if times and times.has_min_max:
+            if (start is not None and times.max < start) or (end is not None and times.min >= end):
+                continue
+        markets = group.column(symbol_index).statistics
+        if symbols is not None and markets and markets.has_min_max:
+            if not any(markets.min <= symbol <= markets.max for symbol in symbols):
+                continue
+        selected.append(index)
+    return selected
+
+
 def read_candles(value, *, symbols=None, start=None, end=None):
     stored = db.parse(value, {}) if isinstance(value, str) else value
     if not is_manifest(stored):
@@ -394,18 +413,61 @@ def read_candles(value, *, symbols=None, start=None, end=None):
                 for s, rows in result.items() if symbols is None or s in symbols}
     path = _resolve(stored)
     _, pq = _arrow()
-    filters = []
-    if symbols is not None:
-        filters.append(("symbol", "in", list(symbols)))
-    if start is not None:
-        filters.append(("timestamp", ">=", int(start)))
-    if end is not None:
-        filters.append(("timestamp", "<", int(end)))
-    rows = pq.read_table(path, columns=["symbol", "payload"], filters=filters or None, use_threads=False).to_pylist()
     result = {s: [] for s in stored["symbols"] if symbols is None or s in symbols}
-    for row in rows:
-        result[row["symbol"]].append(json.loads(row["payload"]))
+    # Decode one batch at a time; never retain both the full Arrow table and
+    # a second full Python payload list alongside the engine's candle rows.
+    with pq.ParquetFile(path) as parquet:
+        groups = _candle_row_groups(parquet, symbols, start, end)
+        for batch in parquet.iter_batches(batch_size=1024, row_groups=groups, columns=["symbol", "timestamp", "payload"], use_threads=False):
+            for row in batch.to_pylist():
+                if row["symbol"] in result and (start is None or row["timestamp"] >= start) and (end is None or row["timestamp"] < end):
+                    result[row["symbol"]].append(json.loads(row["payload"]))
     return result
+
+
+def validate_minute_windows(value, symbols, windows):
+    """Validate contiguous, aligned split timestamps with O(symbols) state.
+
+    Contiguity plus equal first/last/count proves identical timestamps across
+    symbols without retaining millions of candles, lists or timestamp sets.
+    Only indexed timestamp columns are read; OHLC payloads stay in Parquet.
+    """
+    stored = db.parse(value, {}) if isinstance(value, str) else value
+    states = [{s: [None, None, 0] for s in symbols} for _ in windows]
+
+    def accept(symbol, timestamp):
+        for index, (start, end) in enumerate(windows):
+            if start <= timestamp < end:
+                state = states[index][symbol]
+                if timestamp % 60000 or (state[1] is not None and timestamp - state[1] != 60000):
+                    raise ValueError(f"{symbol} 在选中区间不是连续 1 分钟行情，禁止用高周期或缺口数据撮合")
+                if state[0] is None:
+                    state[0] = timestamp
+                state[1] = timestamp
+                state[2] += 1
+
+    if is_manifest(stored):
+        path = _resolve(stored)
+        _, pq = _arrow()
+        with pq.ParquetFile(path) as parquet:
+            groups = _candle_row_groups(parquet, symbols, min(w[0] for w in windows), max(w[1] for w in windows))
+            for batch in parquet.iter_batches(batch_size=8192, row_groups=groups, columns=["symbol", "timestamp"], use_threads=False):
+                for row in batch.to_pylist():
+                    if row["symbol"] in states[0]:
+                        accept(row["symbol"], row["timestamp"])
+    else:
+        for symbol in symbols:
+            for row in (stored or {}).get(symbol, []):
+                accept(symbol, row["timestamp"])
+    for state in states:
+        expected = None
+        for symbol, values in state.items():
+            if values[2] < 2:
+                raise ValueError(f"{symbol} 在选中区间不足 2 根 K 线")
+            if expected is not None and values != expected:
+                raise ValueError("多币种回测必须覆盖相同的完整 1 分钟时间戳，不会取交集丢弃行情")
+            expected = values
+    return states
 
 
 def candle_metadata(value):

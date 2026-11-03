@@ -364,3 +364,41 @@ def test_download_resources_have_no_new_cumulative_cpu_deadline(monkeypatch):
     assert ("nice",10) in calls
     assert (resource.RLIMIT_AS,(512*1024*1024,512*1024*1024)) in calls
     assert all(kind!=resource.RLIMIT_CPU for kind,value in calls)
+
+
+def test_download_task_delete_retains_dataset_and_audit(client, monkeypatch):
+    job = enqueue(client)
+    claimed, busy = downloads.claim("delete-test")
+    monkeypatch.setattr(BinanceClient, "iter_klines", fake_klines)
+    downloads.run(job['id'], claimed['owner'])
+    dataset_id = downloads.get_job(job['id'])['dataset_id']
+    with db.connect() as con:
+        manifest = db.parse(con.execute('SELECT candles FROM datasets WHERE id=?', (dataset_id,)).fetchone()[0])
+    result = client.delete('/api/datasets/download-jobs/' + job['id'])
+    assert result.status_code == 200 and result.json()['deleted']
+    assert client.get('/api/datasets/download-jobs/' + job['id']).status_code == 404
+    assert storage.read_candles(manifest)
+    assert client.get('/api/datasets').json()[0]['id'] == dataset_id
+    with db.connect() as con:
+        assert con.execute("SELECT COUNT(*) FROM audit_records WHERE action='dataset.download.delete' AND resource_id=?", (job['id'],)).fetchone()[0] == 1
+
+
+@pytest.mark.parametrize('status', ['queued', 'running'])
+def test_download_task_delete_rejects_active(client, status):
+    job = enqueue(client)
+    if status == 'running':
+        downloads.claim('active')
+    assert client.delete('/api/datasets/download-jobs/' + job['id']).status_code == 409
+    assert downloads.get_job(job['id'])['status'] == status
+
+
+def test_failed_download_task_delete_requires_auth_and_csrf(client):
+    job = enqueue(client)
+    claimed, _ = downloads.claim('failed')
+    downloads.fail(job['id'], claimed['owner'], 'fixture failure')
+    assert TestClient(app).delete('/api/datasets/download-jobs/' + job['id']).status_code == 401
+    csrf = client.headers.pop('X-MK-CSRF')
+    assert client.delete('/api/datasets/download-jobs/' + job['id']).status_code == 403
+    client.headers['X-MK-CSRF'] = csrf
+    assert client.delete('/api/datasets/download-jobs/' + job['id']).status_code == 200
+    assert client.delete('/api/datasets/download-jobs/' + job['id']).status_code == 404

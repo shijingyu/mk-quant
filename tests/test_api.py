@@ -382,3 +382,22 @@ def test_strategy_deadline_does_not_hang_other_accounts():
     # The timer and prior handler are restored even on failure.
     with strategy_deadline(.02):
         assert 2+2==4
+
+
+def test_experiment_enqueue_does_not_load_candle_payloads(client, monkeypatch):
+    monkeypatch.setattr(storage, 'read_candles', lambda *a, **k: pytest.fail('API must use streaming timestamp validation'))
+    result = client.post('/api/experiments', json=experiment_body())
+    assert result.status_code == 202, result.text
+
+
+def test_backtest_memory_failure_has_actionable_result(client, monkeypatch):
+    result = client.post('/api/experiments', json=experiment_body())
+    assert result.status_code == 202
+    def exhausted(*args, **kwargs):
+        raise MemoryError()
+    monkeypatch.setattr(storage, 'read_candles', exhausted)
+    run_experiment(result.json()['id'])
+    report = client.get('/api/experiments/' + result.json()['id']).json()
+    assert report['status'] == 'failed'
+    assert '单任务内存预算' in report['error']
+    assert client.get('/healthz').status_code == 200

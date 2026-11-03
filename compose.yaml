@@ -68,7 +68,7 @@ services:
     command: ["python", "-m", "backend.worker", "backtest"]
     environment:
       <<: *db-environment
-      MK_BACKTEST_ADDRESS_SPACE_MB: "2048"
+      MK_BACKTEST_ADDRESS_SPACE_MB: "768"
     # Historical download jobs need public market access; no credential master key.
     # Download/backtest jobs run serially here, independently of runtime.
     networks: [database, market]

@@ -2901,7 +2901,11 @@ function downloadForm(config = {}) {
     end: toBeijingInput(config.end ?? end),
   };
 }
-function DownloadTasks({ jobs, onReuse, disabled }) {
+function DownloadTasks({ jobs, onReuse, disabled, mutate, notify }) {
+  const [deleteTarget, setDeleteTarget] = useState(null);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const [deleteError, setDeleteError] = useState("");
+  const deleteRequest = useRef(false);
   if (!jobs.length) return null;
   const labels = {
     queued: "排队中",
@@ -2994,16 +2998,93 @@ function DownloadTasks({ jobs, onReuse, disabled }) {
                   任务 {job.id.slice(0, 12)} ·{" "}
                   {formatBeijing(job.updated_at || job.created_at)}
                 </span>
-                {job.status === "failed" && (
-                  <Btn disabled={disabled} onClick={() => onReuse(config)}>
-                    载入配置重试
+                <div className="row-buttons">
+                  {job.status === "failed" && (
+                    <Btn disabled={disabled} onClick={() => onReuse(config)}>
+                      载入配置重试
+                    </Btn>
+                  )}
+                  <Btn
+                    kind="danger"
+                    disabled={pending || deleteBusy}
+                    title={pending ? "请等待下载任务结束" : "删除下载任务记录"}
+                    aria-label={`删除下载任务 ${job.id.slice(0, 12)}`}
+                    onClick={() => {
+                      setDeleteTarget(job);
+                      setDeleteError("");
+                    }}
+                  >
+                    删除
                   </Btn>
-                )}
+                </div>
               </div>
             </article>
           );
         })}
       </div>
+      {deleteTarget && (
+        <Modal
+          title="删除下载任务"
+          subtitle="仅删除任务记录，已保存的数据集不受影响。"
+          onClose={() => {
+            if (!deleteRequest.current) setDeleteTarget(null);
+          }}
+        >
+          <dl className="dataset-delete-details">
+            <div>
+              <dt>任务</dt>
+              <dd>{deleteTarget.id.slice(0, 12)}</dd>
+            </div>
+            <div>
+              <dt>交易对</dt>
+              <dd>{deleteTarget.config?.symbols?.join(" / ") || "—"}</dd>
+            </div>
+            <div>
+              <dt>区间 · 北京时间</dt>
+              <dd>
+                {formatBeijing(deleteTarget.config?.start)} —{" "}
+                {formatBeijing(deleteTarget.config?.end)}
+              </dd>
+            </div>
+          </dl>
+          {deleteError && (
+            <div className="inline-error" role="alert">
+              {deleteError}
+            </div>
+          )}
+          <div className="modal-footer">
+            <Btn disabled={deleteBusy} onClick={() => setDeleteTarget(null)}>
+              取消
+            </Btn>
+            <Btn
+              kind="danger"
+              disabled={deleteBusy}
+              onClick={async () => {
+                if (deleteRequest.current) return;
+                deleteRequest.current = true;
+                setDeleteBusy(true);
+                setDeleteError("");
+                try {
+                  const result = await mutate(
+                    `/datasets/download-jobs/${deleteTarget.id}`,
+                    undefined,
+                    "DELETE",
+                  );
+                  setDeleteTarget(null);
+                  notify(result.message);
+                } catch (error) {
+                  setDeleteError(error.message);
+                } finally {
+                  deleteRequest.current = false;
+                  setDeleteBusy(false);
+                }
+              }}
+            >
+              {deleteBusy ? "正在删除" : "确认删除"}
+            </Btn>
+          </div>
+        </Modal>
+      )}
     </section>
   );
 }
@@ -3277,6 +3358,8 @@ function Datasets({ data, mutate, notify, startDownload, downloadSubmitting }) {
       </div>
       <DownloadTasks
         jobs={jobs}
+        mutate={mutate}
+        notify={notify}
         disabled={downloadLocked || busy}
         onReuse={(config) => {
           setForm({ ...downloadForm(config), interval: "1m" });
@@ -3409,10 +3492,6 @@ function Datasets({ data, mutate, notify, startDownload, downloadSubmitting }) {
               </dd>
             </div>
           </dl>
-          <p className="dataset-delete-description">
-            删除后会同时清理对应的 K
-            线文件，释放磁盘空间。共享文件仅在最后一份引用删除后清理；下载与审计记录仍会保留。
-          </p>
           {deleteError && (
             <div className="inline-error" role="alert">
               {deleteError}

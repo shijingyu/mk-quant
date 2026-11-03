@@ -676,6 +676,20 @@ def download_jobs(current=Depends(admin)):
     return downloads.list_jobs()
 
 
+@app.delete("/api/datasets/download-jobs/{job_id}")
+def delete_download_job(job_id:str,current=Depends(admin)):
+    with db.connect() as con:
+        row=con.execute("SELECT * FROM data_download_jobs WHERE id=? FOR UPDATE",(job_id,)).fetchone()
+        if not row:
+            raise HTTPException(404,"下载任务不存在或已删除")
+        if row["status"] not in {"completed","failed"}:
+            raise HTTPException(409,"排队或下载中的任务不能删除，请等待任务结束")
+        con.execute("DELETE FROM data_download_jobs WHERE id=?",(job_id,))
+        db.audit(con,current["id"],"dataset.download.delete","data_download",job_id,
+                 {"status":row["status"],"dataset_id":row["dataset_id"],"config":db.parse(row["config"],{})})
+    return {"id":job_id,"deleted":True,"message":"下载任务记录已删除"}
+
+
 @app.get("/api/datasets/download-jobs/{job_id}")
 def download_job(job_id:str,current=Depends(admin)):
     result=downloads.get_job(job_id)
@@ -718,19 +732,12 @@ def enqueue_experiment(body, *, persist=True, rules_snapshot=None, actor_id=None
     ranges=[timestamp(body.get(k)) for k in ("train_start","train_end","validation_start","validation_end")]
     if not ranges[0]<ranges[1]<=ranges[2]<ranges[3]:
         raise HTTPException(422,"训练集和验证集必须按时间顺序分离，区间采用 [开始,结束) 且不可重叠")
-    dataset_candles=storage.read_candles(dataset["candles"], symbols=symbols, start=ranges[0], end=ranges[3])
-    split_times={}
-    for symbol in symbols:
-        times=[timestamp(c["timestamp"]) for c in dataset_candles[symbol]]
-        for index,(start,end) in enumerate((ranges[:2],ranges[2:])):
-            window=[t for t in times if start<=t<end]
-            if len(window)<2:
-                raise HTTPException(422,f"{symbol} 在选中区间不足 2 根 K 线")
-            if any(t%60000 for t in window) or any(b-a!=60000 for a,b in zip(window,window[1:])):
-                raise HTTPException(422,f"{symbol} 在选中区间不是连续 1 分钟行情，禁止用高周期或缺口数据撮合")
-            if index in split_times and split_times[index]!=window:
-                raise HTTPException(422,"多币种回测必须覆盖相同的完整 1 分钟时间戳，不会取交集丢弃行情")
-            split_times[index]=window
+    try:
+        storage.validate_minute_windows(dataset["candles"], symbols, (ranges[:2],ranges[2:]))
+    except ValueError as exc:
+        if isinstance(exc,storage.ArtifactError):
+            raise
+        raise HTTPException(422,str(exc)) from exc
     maker=manifest.get("execution",{}).get("model")=="maker_grid_v1"
     try:
         capital=float(body.get("initial_capital",10000)); fee=float(body.get("fee_rate",.0002 if maker else .0004)); slip=float(body.get("slippage_bps",0 if maker else 2)); seed=int(body.get("seed",42))
@@ -763,9 +770,6 @@ def enqueue_experiment(body, *, persist=True, rules_snapshot=None, actor_id=None
             filters_source="binance_exchange_info_snapshot"
         except Exception as exc:
             raise HTTPException(502,"无法取得币安交易精度规则，实验未启动；请检查行情网络") from exc
-    common=set.intersection(*(set(timestamp(c["timestamp"]) for c in dataset_candles[s]) for s in symbols))
-    if any(sum(start<=t<end for t in common)<2 for start,end in (ranges[:2],ranges[2:])):
-        raise HTTPException(422,"多币种在训练集或验证集缺少至少 2 根共同时间戳 K 线")
     # Do not copy display fields (id/status/result/provenance) from a cloned
     # experiment into its immutable configuration: they would shadow DB state.
     config={key:body[key] for key in ("name","strategy_id","dataset_id","train_start","train_end","validation_start","validation_end") if key in body}

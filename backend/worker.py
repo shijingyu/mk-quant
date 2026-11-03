@@ -69,7 +69,6 @@ def run_experiment(id):
         partial["symbol_results"]={symbol:{"curve":[],"validation_curve":[],"metrics":{},"validation_metrics":{},
             "allocation":{"method":"equal_initial_capital","initial_capital":config["initial_capital"]/len(config["symbols"])}}
             for symbol in config["symbols"]}
-        candles=storage.read_candles(dataset["candles"], symbols=config["symbols"], start=config["ranges_ms"][0], end=config["ranges_ms"][3])
         ranges=config["ranges_ms"]
         random.seed(config["seed"])
         filters=None
@@ -82,7 +81,7 @@ def run_experiment(id):
                 current=con.execute("SELECT cancel_requested FROM experiments WHERE id=?",(id,)).fetchone()
             return bool(current and current[0])
         for i,(split,start,end) in enumerate((("train",ranges[0],ranges[1]),("validation",ranges[2],ranges[3]))):
-            data={s:[c for c in candles[s] if start<=c["timestamp"]<end] for s in config["symbols"]}
+            data=storage.read_candles(dataset["candles"],symbols=config["symbols"],start=start,end=end)
             curve_key="curve" if split=="train" else "validation_curve"
             def progress(event):
                 partial[curve_key].extend(event.get("equity",[]))
@@ -93,6 +92,7 @@ def run_experiment(id):
                 with db.connect() as con:
                     con.execute("UPDATE experiments SET progress=?,result=? WHERE id=? AND status='running'",(value,db.dump(preview),id))
             output[split]=run_backtest(strategy["source"],config["parameters"],data,config["initial_capital"],config["fee_rate"],config["slippage_bps"],market=config["market"],leverage=config.get("leverage",manifest["account"]["leverage_min"]),symbol_filters=filters,progress=progress,cancelled=cancelled,base_interval="1m")
+            del data  # Release this split before allocating the next input window.
             partial["metrics" if split=="train" else "validation_metrics"]=ui_metrics(output[split]["metrics"])
             for symbol,value in output[split]["symbol_results"].items():
                 partial["symbol_results"][symbol]["metrics" if split=="train" else "validation_metrics"]=ui_metrics(value["metrics"])
@@ -127,9 +127,18 @@ def run_experiment(id):
         with db.connect() as con:
             con.execute("UPDATE experiments SET status='cancelled',completed_at=?,error='用户取消；部分曲线不是最终结果' WHERE id=?",(db.now(),id))
     except Exception as exc:
+        memory_failure=isinstance(exc,MemoryError) or "memory" in str(exc).lower() or "malloc" in str(exc).lower()
+        if memory_failure:
+            # Free the failing engine/read stack before allocating a DB error report.
+            exc.__traceback__=None
+            data=None
+            if "output" in locals():
+                output.clear()
+            partial.clear()
+        message=("回测超过单任务内存预算，请缩短回测区间、减少交易对或由管理员提高独立回测资源预算" if memory_failure else str(exc) or type(exc).__name__)
         with db.connect() as con:
-            con.execute("UPDATE experiments SET status='failed',completed_at=?,error=? WHERE id=?",(db.now(),str(exc)[:2000],id))
-        db.log("error","回测失败",strategy_id=row["strategy_id"],details={"experiment_id":id,"error":str(exc)[:2000]})
+            con.execute("UPDATE experiments SET status='failed',completed_at=?,error=? WHERE id=?",(db.now(),message[:2000],id))
+        db.log("error","回测失败",strategy_id=row["strategy_id"],details={"experiment_id":id,"error":message[:2000]})
 
 
 def _child_limits():
@@ -137,7 +146,7 @@ def _child_limits():
     import resource
     resource.setrlimit(resource.RLIMIT_CPU,(300,305))
     if sys.platform.startswith("linux"):
-        memory=int(os.getenv("MK_BACKTEST_ADDRESS_SPACE_MB","2048"))*1024*1024
+        memory=max(256,int(os.getenv("MK_BACKTEST_ADDRESS_SPACE_MB","768")))*1024*1024
         inherited=resource.getrlimit(resource.RLIMIT_AS)[1]
         if inherited!=resource.RLIM_INFINITY:
             memory=min(memory,inherited)

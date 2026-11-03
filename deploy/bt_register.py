@@ -54,7 +54,7 @@ if hasattr(os,"sched_getaffinity"):
         os.sched_setaffinity(0,{available[-1] if role=="backtest" else available[0]})
 if role=="backtest":
     os.nice(10)
-    ceiling=int(os.getenv("MK_BACKTEST_ADDRESS_SPACE_MB","2048"))*1024*1024
+    ceiling=int(os.getenv("MK_BACKTEST_ADDRESS_SPACE_MB","768"))*1024*1024
     resource.setrlimit(resource.RLIMIT_AS,(ceiling,ceiling))
 if role!="api":
     os.environ.pop("MK_MASTER_KEY",None)

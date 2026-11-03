@@ -59,7 +59,7 @@ export MK_COOKIE_SECURE=1
 export MK_MASTER_KEY=
 ```
 
-回测角色可设置 `MK_BACKTEST_ADDRESS_SPACE_MB=2048`；这是地址空间上限，包含 PyArrow 映射空间，不是物理内存预留。
+回测角色默认 `MK_BACKTEST_ADDRESS_SPACE_MB=768`；这是地址空间上限，包含 PyArrow 映射空间，不是物理内存预留。资源不足会将任务标记失败并提示调整区间或独立资源预算。只有确认宿主机剩余容量足够时才提高此配置；已有显式设置需要同步更新。
 
 `backtest` 角色还负责历史 K 线下载，需要解析并通过 HTTPS 访问 Binance 公开行情接口；防火墙或代理不能只允许该角色连接 MySQL。下载使用公开接口，不需要交易 API Key。下载与回测在此角色串行调度，各任务运行于独立的低优先级子进程，不占用 `runtime` 角色的任务进程。
 
