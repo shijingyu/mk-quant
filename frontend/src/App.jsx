@@ -58,7 +58,6 @@ import {
   TrendingDown,
   TrendingUp,
   Upload,
-  Users,
   Wallet,
   X,
   XCircle,
@@ -188,7 +187,6 @@ const navs = [
     items: [
       ["paper", "模拟交易", Wallet],
       ["live", "实盘交易", Radio],
-      ["users", "用户管理", Users],
     ],
   },
   {
@@ -245,11 +243,14 @@ async function api(path, body, method) {
     } catch {
       data = { detail: `服务响应 ${res.status}` };
     }
-    throw new Error(
+    const error = new Error(
       typeof data.detail === "string"
         ? data.detail
-        : JSON.stringify(data.detail || data),
+        : data.detail?.message || JSON.stringify(data.detail || data),
     );
+    error.status = res.status;
+    error.details = data.detail;
+    throw error;
   }
   if (res.status === 204) return {};
   const data = await res.json();
@@ -573,25 +574,35 @@ export default function App() {
   const [data, setData] = useState(null),
     [loading, setLoading] = useState(true),
     [error, setError] = useState(""),
-    [page, setPage] = useState(location.hash.slice(1) || "overview"),
+    [page, setPage] = useState(() =>
+      location.hash.slice(1) === "users"
+        ? "paper"
+        : location.hash.slice(1) || "overview",
+    ),
     [toast, setToast] = useState(""),
     [modal, setModal] = useState(null),
     [side, setSide] = useState(false),
     [search, setSearch] = useState(""),
     [updated, setUpdated] = useState(null),
-    [client, setClient] = useState(null);
+    [client, setClient] = useState(null),
+    [downloadSubmitting, setDownloadSubmitting] = useState(false);
+  const downloadRequest = useRef(null);
+  const refreshSequence = useRef(0);
   const notify = (m) => {
     setToast(m);
     setTimeout(() => setToast(""), 4500);
   };
   const refresh = async () => {
+    const sequence = ++refreshSequence.current;
     try {
       const d = await api("/bootstrap");
+      if (sequence !== refreshSequence.current) return d;
       setData(d);
       setError("");
       setUpdated(new Date());
       return d;
     } catch (e) {
+      if (sequence !== refreshSequence.current) return;
       if (e.message === "请先登录") {
         setData(null);
         setError("");
@@ -618,7 +629,7 @@ export default function App() {
         );
       }
     } finally {
-      setLoading(false);
+      if (sequence === refreshSequence.current) setLoading(false);
     }
   };
   useEffect(() => {
@@ -627,8 +638,16 @@ export default function App() {
     return () => clearInterval(id);
   }, []);
   useEffect(() => {
-    const fn = () => setPage(location.hash.slice(1) || "overview");
+    const fn = () => {
+      const next = location.hash.slice(1) || "overview";
+      if (next === "users") {
+        location.replace("#paper");
+        return;
+      }
+      setPage(next);
+    };
     addEventListener("hashchange", fn);
+    fn();
     return () => removeEventListener("hashchange", fn);
   }, []);
   useEffect(() => {
@@ -648,6 +667,67 @@ export default function App() {
     } catch (e) {
       notify(e.message);
       throw e;
+    }
+  };
+  const startDownload = async (config) => {
+    if (downloadRequest.current?.pending) return;
+    const fingerprint = JSON.stringify(config);
+    let attempt;
+    try {
+      attempt = JSON.parse(
+        sessionStorage.getItem("mk-download-attempt") || "null",
+      );
+    } catch {}
+    if (!attempt || attempt.fingerprint !== fingerprint)
+      attempt = { fingerprint, key: crypto.randomUUID() };
+    try {
+      sessionStorage.setItem("mk-download-attempt", JSON.stringify(attempt));
+    } catch {}
+    downloadRequest.current = { ...attempt, pending: true };
+    setDownloadSubmitting(true);
+    const remember = (job) =>
+      setData((previous) =>
+        previous
+          ? {
+              ...previous,
+              download_jobs: [
+                job,
+                ...(previous.download_jobs || []).filter(
+                  (item) => item.id !== job.id,
+                ),
+              ],
+            }
+          : previous,
+      );
+    try {
+      const job = await api("/datasets/download", {
+        ...config,
+        request_key: attempt.key,
+      });
+      remember(job);
+      try {
+        sessionStorage.removeItem("mk-download-attempt");
+      } catch {}
+      notify(
+        job.status === "completed"
+          ? "该下载任务已完成，数据集已保存"
+          : "下载任务已提交，切换页面或关闭网页后仍会继续",
+      );
+      await refresh();
+      return job;
+    } catch (error) {
+      if (error.details?.job) remember(error.details.job);
+      if (error.status && error.status < 500) {
+        try {
+          sessionStorage.removeItem("mk-download-attempt");
+        } catch {}
+      }
+      notify(error.message);
+      await refresh();
+      throw error;
+    } finally {
+      downloadRequest.current = null;
+      setDownloadSubmitting(false);
     }
   };
   const accounts = data?.accounts || [],
@@ -797,7 +877,13 @@ export default function App() {
                 />
               )}
               {page === "datasets" && (
-                <Datasets data={data} mutate={mutate} notify={notify} />
+                <Datasets
+                  data={data}
+                  mutate={mutate}
+                  notify={notify}
+                  startDownload={startDownload}
+                  downloadSubmitting={downloadSubmitting}
+                />
               )}
               {page === "strategies" && (
                 <Strategies
@@ -818,7 +904,7 @@ export default function App() {
                   go={go}
                 />
               )}
-              {["users", "paper", "live"].includes(page) && (
+              {["paper", "live"].includes(page) && (
                 <Accounts
                   page={page}
                   commands={data.commands || []}
@@ -874,6 +960,7 @@ export default function App() {
       {modal?.type === "account" && (
         <AccountForm
           account={modal.account}
+          defaultMode={modal.defaultMode}
           strategies={strategies}
           mutate={mutate}
           notify={notify}
@@ -926,7 +1013,9 @@ export default function App() {
           </div>
           <ClientView
             account={
-              data.accounts.find((account) => account.id === modal.account.id) || {
+              data.accounts.find(
+                (account) => account.id === modal.account.id,
+              ) || {
                 ...modal.account,
                 stale: true,
                 status: "unknown",
@@ -1314,9 +1403,6 @@ function Overview({ data, go, setModal, updated, refresh }) {
             </h2>
             <p>查看资金分布、运行状态和策略表现</p>
           </div>
-          <Btn icon={ArrowUpRight} onClick={() => go("users")}>
-            管理账户
-          </Btn>
         </div>
         <AccountTable
           accounts={accounts.slice(0, 5)}
@@ -1816,14 +1902,12 @@ function Accounts({
     [q, setQ] = useState("");
   const filtered = accounts.filter(
     (a) =>
-      (page === "users" || a.mode === page) &&
+      a.mode === page &&
       `${a.name} ${a.phone} ${a.strategy_name}`
         .toLowerCase()
         .includes(q.toLowerCase()),
   );
-  const allForPage = accounts.filter(
-    (a) => page === "users" || a.mode === page,
-  );
+  const allForPage = accounts.filter((a) => a.mode === page);
   const action = (action) =>
     setModal({ type: "command", action, accounts: filtered });
   useEffect(() => {
@@ -1835,17 +1919,17 @@ function Accounts({
       <Heading
         title={titles[page]}
         desc={
-          page === "users"
-            ? "管理客户、账户与策略分配。"
-            : page === "live"
-              ? "跟踪真实账户的资金、持仓与运行状态。"
-              : "观察策略表现，验证执行行为。"
+          page === "live"
+            ? "跟踪真实账户的资金、持仓与运行状态。"
+            : "观察策略表现，验证执行行为。"
         }
       >
         <Btn
           kind="primary"
           icon={Plus}
-          onClick={() => setModal({ type: "account", account: undefined })}
+          onClick={() =>
+            setModal({ type: "account", account: undefined, defaultMode: page })
+          }
         >
           新建账户
         </Btn>
@@ -1859,7 +1943,7 @@ function Accounts({
           </div>
         </div>
       )}
-      {page !== "users" && <AssetOverview accounts={allForPage} />}
+      <AssetOverview accounts={allForPage} />
       <section className="panel accounts-workspace">
         <div className="panel-toolbar">
           <div className="tabs">
@@ -1869,14 +1953,12 @@ function Accounts({
             >
               账户列表 <span>{filtered.length}</span>
             </button>
-            {page !== "users" && (
-              <button
-                className={tab === "strategies" ? "active" : ""}
-                onClick={() => setTab("strategies")}
-              >
-                策略汇总
-              </button>
-            )}
+            <button
+              className={tab === "strategies" ? "active" : ""}
+              onClick={() => setTab("strategies")}
+            >
+              策略汇总
+            </button>
           </div>
           <label className="search-input">
             <Search size={17} />
@@ -1945,51 +2027,52 @@ function Accounts({
             )}
           </div>
         )}
-        <div className="table-footnote">
-          <span>{filtered.length} 个账户 · 金额单位 U</span>
-          <span>完整指标、订单与资金明细可在「查看」中读取</span>
-        </div>
       </section>
       <RecentOperations commands={commands} accounts={filtered} />
-      {page !== "users" && (
-        <details className="danger-zone">
-          <summary>
-            <ShieldAlert size={19} />
-            <span>
-              <strong>全局运行控制</strong>
-              <small>
-                影响当前筛选的 {filtered.length} 个
-                {page === "live" ? "实盘" : "模拟"}账户，操作需两次确认。
-              </small>
-            </span>
-            <ChevronDown size={17} />
-          </summary>
-          <div className="danger-zone-actions">
-            <Btn disabled={!filtered.length} onClick={() => action("pause")}>
-              全部停止开仓
-            </Btn>
-            <Btn disabled={!filtered.length} onClick={() => action("resume")}>
-              全部恢复
-            </Btn>
-            <Btn
-              disabled={!filtered.length}
-              kind="danger"
-              onClick={() => action("flatten")}
-            >
-              全部平仓并停止
-            </Btn>
-          </div>
-        </details>
-      )}
+      <details className="danger-zone">
+        <summary>
+          <ShieldAlert size={19} />
+          <span>
+            <strong>全局运行控制</strong>
+            <small>
+              影响当前筛选的 {filtered.length} 个
+              {page === "live" ? "实盘" : "模拟"}账户，操作需两次确认。
+            </small>
+          </span>
+          <ChevronDown size={17} />
+        </summary>
+        <div className="danger-zone-actions">
+          <Btn disabled={!filtered.length} onClick={() => action("pause")}>
+            全部停止开仓
+          </Btn>
+          <Btn disabled={!filtered.length} onClick={() => action("resume")}>
+            全部恢复
+          </Btn>
+          <Btn
+            disabled={!filtered.length}
+            kind="danger"
+            onClick={() => action("flatten")}
+          >
+            全部平仓并停止
+          </Btn>
+        </div>
+      </details>
     </>
   );
 }
-function AccountForm({ account, strategies, mutate, notify, onClose }) {
+function AccountForm({
+  account,
+  defaultMode = "paper",
+  strategies,
+  mutate,
+  notify,
+  onClose,
+}) {
   const [form, setForm] = useState({
       name: account?.name || "",
       phone: account?.phone || "",
       password: "",
-      mode: account?.mode || "paper",
+      mode: account?.mode || (defaultMode === "live" ? "live" : "paper"),
       initial_equity: account?.initial_equity || 10000,
       strategy_id: account?.strategy_id || strategies[0]?.id || "",
       symbols: (account?.symbols || strategySymbols(strategies[0])).join(","),
@@ -2758,20 +2841,118 @@ function ClientView({ account: a, user }) {
   );
 }
 
-function Datasets({ data, mutate, notify }) {
+function downloadForm(config = {}) {
+  return {
+    market: config.market || "futures",
+    symbols: config.symbols?.join(",") || "BTCUSDT,ETHUSDT",
+    interval: config.interval || "1h",
+    start: config.start ? toBeijingInput(config.start) : "2025-01-01T00:00",
+    end: config.end ? toBeijingInput(config.end) : "2025-04-01T00:00",
+  };
+}
+function DownloadTasks({ jobs, onReuse, disabled }) {
+  if (!jobs.length) return null;
+  const labels = {
+    queued: "排队中",
+    running: "下载中",
+    completed: "已完成",
+    failed: "失败",
+  };
+  return (
+    <section className="panel download-jobs" aria-label="后台下载任务">
+      <div className="panel-heading">
+        <div>
+          <h2>后台下载任务</h2>
+          <p>离开页面后继续执行，完成后自动加入本地数据集。</p>
+        </div>
+      </div>
+      <div className="download-job-list">
+        {jobs.slice(0, 5).map((job) => {
+          const config = job.config || {};
+          const pending = ["queued", "running"].includes(job.status);
+          const progress =
+            job.status === "completed"
+              ? 100
+              : Math.min(
+                  99,
+                  Math.max(0, Math.floor(Number(job.progress) || 0)),
+                );
+          return (
+            <article className="download-job" key={job.id}>
+              <div className="download-job-heading">
+                <strong>
+                  {config.symbols?.join(" / ") || config.name || "K 线下载"} ·{" "}
+                  {config.interval}
+                </strong>
+                <Badge status={job.status}>
+                  {labels[job.status] || "状态未知"}
+                </Badge>
+              </div>
+              <p className="download-job-range">
+                {config.market === "spot" ? "现货" : "永续合约"} ·{" "}
+                {formatBeijing(config.start)} — {formatBeijing(config.end)}{" "}
+                北京时间
+              </p>
+              {pending && (
+                <progress
+                  aria-label={`下载进度 ${job.id}`}
+                  value={progress}
+                  max="100"
+                />
+              )}
+              <div className="download-job-status">
+                <span>
+                  {job.status === "queued"
+                    ? "等待研究任务进程调度"
+                    : job.status === "completed"
+                      ? "数据集已保存"
+                      : job.status === "failed"
+                        ? "任务已停止，可修正配置后重试"
+                        : `${progress}% · ${job.current_symbol || "准备下载"}`}
+                </span>
+                <span>
+                  已读取{" "}
+                  {Number(job.downloaded_bars || 0).toLocaleString("en-US")} 根
+                  · 已下载 {job.completed_symbols || 0}/
+                  {job.total_symbols || config.symbols?.length || 0} 个币种
+                </span>
+              </div>
+              {job.error && <div className="inline-error">{job.error}</div>}
+              <div className="download-job-footer">
+                <span title={job.id}>
+                  任务 {job.id.slice(0, 12)} ·{" "}
+                  {formatBeijing(job.updated_at || job.created_at)}
+                </span>
+                {job.status === "failed" && (
+                  <Btn disabled={disabled} onClick={() => onReuse(config)}>
+                    载入配置重试
+                  </Btn>
+                )}
+              </div>
+            </article>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+function Datasets({ data, mutate, notify, startDownload, downloadSubmitting }) {
+  const jobs = data.download_jobs || [];
+  const activeDownload = jobs.find((job) =>
+    ["queued", "running"].includes(job.status),
+  );
   const [tab, setTab] = useState("download"),
-    [form, setForm] = useState({
-      market: "futures",
-      symbols: "BTCUSDT,ETHUSDT",
-      interval: "1h",
-      start: "2025-01-01T00:00",
-      end: "2025-04-01T00:00",
-    }),
+    [form, setForm] = useState(() => downloadForm(activeDownload?.config)),
     [busy, setBusy] = useState(false),
     [filename, setFilename] = useState(""),
     [raw, setRaw] = useState(""),
     [err, setErr] = useState("");
   const change = (k, v) => setForm((f) => ({ ...f, [k]: v }));
+  const downloadLocked = Boolean(activeDownload || downloadSubmitting);
+  const submitting = busy || (tab === "download" && downloadLocked);
+  useEffect(() => {
+    if (activeDownload?.config) setForm(downloadForm(activeDownload.config));
+  }, [activeDownload?.id]);
   return (
     <>
       <Heading
@@ -2801,17 +2982,17 @@ function Datasets({ data, mutate, notify }) {
             className="panel-body"
             onSubmit={async (e) => {
               e.preventDefault();
+              if (submitting) return;
               setBusy(true);
               setErr("");
               try {
                 if (tab === "download") {
-                  await mutate("/datasets/download", {
+                  await startDownload({
                     ...form,
                     symbols: form.symbols.split(/[,，\s]+/).filter(Boolean),
                     start: beijingInputToISO(form.start),
                     end: beijingInputToISO(form.end),
                   });
-                  notify("K 线已下载、校验并保存");
                 } else {
                   const parsed = JSON.parse(raw);
                   await mutate("/datasets", {
@@ -2830,132 +3011,142 @@ function Datasets({ data, mutate, notify }) {
               }
             }}
           >
-            <div className="form-grid">
-              <Field label="交易市场">
-                <select
-                  value={form.market}
-                  onChange={(e) => change("market", e.target.value)}
-                >
-                  <option value="futures">U 本位永续合约</option>
-                  <option value="spot">现货</option>
-                </select>
-              </Field>
-              <Field label="K 线周期">
-                <select
-                  value={form.interval}
-                  onChange={(e) => change("interval", e.target.value)}
-                >
-                  {[
-                    "1m",
-                    "3m",
-                    "5m",
-                    "15m",
-                    "30m",
-                    "1h",
-                    "2h",
-                    "4h",
-                    "6h",
-                    "12h",
-                    "1d",
-                  ].map((x) => (
-                    <option key={x}>{x}</option>
-                  ))}
-                </select>
-              </Field>
-            </div>
-            <Field
-              label="交易对"
-              hint="支持 USDT / USDC；多个交易对用逗号分隔，服务端校验交易所可用性"
-            >
-              <input
-                value={form.symbols}
-                onChange={(e) =>
-                  change("symbols", e.target.value.toUpperCase())
-                }
-                required
-              />
-            </Field>
-            {tab === "download" ? (
+            <fieldset disabled={submitting} className="download-fields">
               <div className="form-grid">
-                <Field label="开始时间（北京时间）">
-                  <input
-                    type="datetime-local"
-                    value={form.start}
-                    onChange={(e) => change("start", e.target.value)}
-                    required
-                  />
+                <Field label="交易市场">
+                  <select
+                    value={form.market}
+                    onChange={(e) => change("market", e.target.value)}
+                  >
+                    <option value="futures">U 本位永续合约</option>
+                    <option value="spot">现货</option>
+                  </select>
                 </Field>
-                <Field label="结束时间（北京时间，不含）">
-                  <input
-                    type="datetime-local"
-                    value={form.end}
-                    min={form.start}
-                    onChange={(e) => change("end", e.target.value)}
-                    required
-                  />
+                <Field label="K 线周期">
+                  <select
+                    value={form.interval}
+                    onChange={(e) => change("interval", e.target.value)}
+                  >
+                    {[
+                      "1m",
+                      "3m",
+                      "5m",
+                      "15m",
+                      "30m",
+                      "1h",
+                      "2h",
+                      "4h",
+                      "6h",
+                      "12h",
+                      "1d",
+                    ].map((x) => (
+                      <option key={x}>{x}</option>
+                    ))}
+                  </select>
                 </Field>
               </div>
-            ) : (
-              <>
-                <label className="file-drop">
-                  <Upload size={25} />
-                  <strong>{filename || "选择本地 JSON / CSV 文件"}</strong>
-                  <span>
-                    CSV 包含 timestamp, open, high, low, close, volume 列
-                  </span>
-                  <input
-                    type="file"
-                    accept=".json,.csv"
-                    onChange={async (e) => {
-                      const file = e.target.files?.[0];
-                      if (!file) return;
-                      setFilename(file.name);
-                      const txt = await file.text();
-                      if (file.name.endsWith(".csv")) {
-                        try {
-                          const lines = txt.trim().split(/\r?\n/),
-                            keys = lines
-                              .shift()
-                              .split(",")
-                              .map((x) => x.trim()),
-                            candles = lines.map((line) =>
-                              Object.fromEntries(
-                                line
-                                  .split(",")
-                                  .map((v, i) => [keys[i], Number(v)]),
-                              ),
+              <Field
+                label="交易对"
+                hint="支持 USDT / USDC；多个交易对用逗号分隔，服务端校验交易所可用性"
+              >
+                <input
+                  value={form.symbols}
+                  onChange={(e) =>
+                    change("symbols", e.target.value.toUpperCase())
+                  }
+                  required
+                />
+              </Field>
+              {tab === "download" ? (
+                <div className="form-grid">
+                  <Field label="开始时间（北京时间）">
+                    <input
+                      type="datetime-local"
+                      value={form.start}
+                      onChange={(e) => change("start", e.target.value)}
+                      required
+                    />
+                  </Field>
+                  <Field label="结束时间（北京时间，不含）">
+                    <input
+                      type="datetime-local"
+                      value={form.end}
+                      min={form.start}
+                      onChange={(e) => change("end", e.target.value)}
+                      required
+                    />
+                  </Field>
+                </div>
+              ) : (
+                <>
+                  <label className="file-drop">
+                    <Upload size={25} />
+                    <strong>{filename || "选择本地 JSON / CSV 文件"}</strong>
+                    <span>
+                      CSV 包含 timestamp, open, high, low, close, volume 列
+                    </span>
+                    <input
+                      type="file"
+                      accept=".json,.csv"
+                      onChange={async (e) => {
+                        const file = e.target.files?.[0];
+                        if (!file) return;
+                        setFilename(file.name);
+                        const txt = await file.text();
+                        if (file.name.endsWith(".csv")) {
+                          try {
+                            const lines = txt.trim().split(/\r?\n/),
+                              keys = lines
+                                .shift()
+                                .split(",")
+                                .map((x) => x.trim()),
+                              candles = lines.map((line) =>
+                                Object.fromEntries(
+                                  line
+                                    .split(",")
+                                    .map((v, i) => [keys[i], Number(v)]),
+                                ),
+                              );
+                            setRaw(
+                              JSON.stringify({
+                                [form.symbols.split(",")[0]]: candles,
+                              }),
                             );
-                          setRaw(
-                            JSON.stringify({
-                              [form.symbols.split(",")[0]]: candles,
-                            }),
-                          );
-                          notify("CSV 已解析，请确认交易对后导入");
-                        } catch {
-                          setErr("CSV 格式无法解析");
-                        }
-                      } else setRaw(txt);
-                    }}
-                  />
-                </label>
-                <small className="dim">
-                  JSON 格式：
-                  {`{"BTCUSDT":[{"timestamp":1735689600000,"open":...}]}`}
-                </small>
-              </>
-            )}
+                            notify("CSV 已解析，请确认交易对后导入");
+                          } catch {
+                            setErr("CSV 格式无法解析");
+                          }
+                        } else setRaw(txt);
+                      }}
+                    />
+                  </label>
+                  <small className="dim">
+                    JSON 格式：
+                    {`{"BTCUSDT":[{"timestamp":1735689600000,"open":...}]}`}
+                  </small>
+                </>
+              )}
+            </fieldset>
             {err && <div className="inline-error">{err}</div>}
             <div className="form-bottom">
               <Btn
                 kind="primary"
-                icon={busy ? Loader2 : tab === "download" ? Download : Upload}
-                disabled={busy}
+                icon={
+                  submitting ? Loader2 : tab === "download" ? Download : Upload
+                }
+                disabled={submitting}
               >
-                {busy
-                  ? "处理中"
-                  : tab === "download"
-                    ? "下载 K 线"
-                    : "验证并导入"}
+                {tab === "download" && downloadSubmitting
+                  ? "正在提交"
+                  : tab === "download" && activeDownload
+                    ? activeDownload.status === "queued"
+                      ? "排队中"
+                      : "正在下载"
+                    : busy
+                      ? "处理中"
+                      : tab === "download"
+                        ? "下载 K 线"
+                        : "验证并导入"}
               </Btn>
             </div>
           </form>
@@ -2993,6 +3184,16 @@ function Datasets({ data, mutate, notify }) {
           ))}
         </section>
       </div>
+      <DownloadTasks
+        jobs={jobs}
+        disabled={downloadLocked || busy}
+        onReuse={(config) => {
+          setForm(downloadForm(config));
+          setTab("download");
+          setErr("");
+          notify("已载入失败任务配置，确认后点击下载 K 线");
+        }}
+      />
       <section className="panel">
         <div className="panel-heading">
           <div>
@@ -3000,9 +3201,6 @@ function Datasets({ data, mutate, notify }) {
               本地数据集{" "}
               <span className="count-pill">{data.datasets?.length || 0}</span>
             </h2>
-            <p>
-              时间均为北京时间（UTC+8），开始与结束对应首根及末根 K 线的开盘时间
-            </p>
           </div>
         </div>
         {data.datasets?.length ? (
@@ -3481,6 +3679,7 @@ function Backtest({ data, mutate, notify, go }) {
   const [sid, setSid] = useState(initialStrategy?.id || ""),
     [params, setParams] = useState({}),
     [preset, setPreset] = useState(""),
+    [selectedPreset, setSelectedPreset] = useState(""),
     [presets, setPresets] = useState([]),
     [feeAccount, setFeeAccount] = useState(""),
     [feeBusy, setFeeBusy] = useState(false),
@@ -3506,7 +3705,13 @@ function Backtest({ data, mutate, notify, go }) {
   const s = strategies.find((x) => x.id === sid) || strategies[0],
     manifest = s?.manifest || s || {},
     props = manifest.parameters?.properties || {},
-    maker = isMakerStrategy(s);
+    maker = isMakerStrategy(s),
+    strategyPresets = presets.filter((item) => item.strategy_id === sid);
+  useEffect(() => {
+    setSelectedPreset("");
+    setPreset("");
+    setActive(null);
+  }, [sid]);
   const selectStrategy = (id) => {
     const selected = strategies.find((strategy) => strategy.id === id);
     setSid(id);
@@ -3573,7 +3778,8 @@ function Backtest({ data, mutate, notify, go }) {
   }, []);
   const savePreset = async () => {
     try {
-      const title = preset.trim() || `${s.name} 参数 ${presets.length + 1}`;
+      const title =
+        preset.trim() || `${s.name} 参数 ${strategyPresets.length + 1}`;
       await mutate("/presets", {
         name: title,
         strategy_id: sid,
@@ -3794,17 +4000,20 @@ function Backtest({ data, mutate, notify, go }) {
                     <div className="preset-row">
                       <select
                         aria-label="加载参数预设"
-                        value=""
+                        value={selectedPreset}
                         onChange={(e) => {
-                          const p = presets[Number(e.target.value)];
-                          selectStrategy(p.strategy_id);
+                          const p = strategyPresets.find(
+                            (item) => item.id === e.target.value,
+                          );
+                          setSelectedPreset(e.target.value);
+                          if (!p) return;
                           setParams(p.parameters);
                           notify("预设已加载");
                         }}
                       >
                         <option value="">加载服务器参数预设</option>
-                        {presets.map((p, i) => (
-                          <option key={i} value={i}>
+                        {strategyPresets.map((p) => (
+                          <option key={p.id} value={p.id}>
                             {p.name}
                           </option>
                         ))}
@@ -4086,11 +4295,7 @@ function Backtest({ data, mutate, notify, go }) {
             <div className="panel-heading">
               <div>
                 <h2>实验结果</h2>
-                <p>
-                  {job
-                    ? `${active ? "当前实验" : "最近实验"} · ${job.name || job.strategy_name}`
-                    : "选择策略与数据，开始第一次实验。"}
-                </p>
+                {!job && <p>选择策略与数据，开始第一次实验。</p>}
               </div>
               {job && <Badge status={job.status} />}
             </div>
@@ -4148,7 +4353,7 @@ function Backtest({ data, mutate, notify, go }) {
             <div className="panel-heading">
               <div>
                 <h2>权益变化</h2>
-                <p>{job?.name || job?.strategy_name || "运行回测后显示结果"}</p>
+                {!job && <p>运行回测后显示结果</p>}
               </div>
               {job && <Badge status={job.status} />}
             </div>

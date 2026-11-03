@@ -168,6 +168,7 @@ def init_schema():
         for statement in SCHEMA:
             con.execute(statement)
         con.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?) ON DUPLICATE KEY UPDATE version=VALUES(version)", ("mysql-001", now()))
+        con.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?) ON DUPLICATE KEY UPDATE version=VALUES(version)", ("mysql-002-download-jobs", now()))
 
 
 def init_db():

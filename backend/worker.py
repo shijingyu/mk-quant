@@ -18,7 +18,7 @@ import sys
 import time
 import traceback
 
-from . import db, storage
+from . import db, storage, downloads
 
 
 def service(name,owner):
@@ -150,6 +150,23 @@ def backtest_loop(once=False):
                     from datetime import datetime
                     if time.time()-datetime.fromisoformat(job["started_at"]).timestamp()>60:
                         con.execute("UPDATE experiments SET status='failed',error='原回测工作进程已退出，完整统计未完成；可重跑',completed_at=? WHERE id=? AND status='running'",(db.now(),job["id"]))
+            still_running=con.execute("SELECT id FROM experiments WHERE status='running' LIMIT 1").fetchone()
+        # A predecessor coordinator can die while its isolated research child
+        # survives. Wait for that child (including the short pid-registration
+        # window) before allocating resources to either kind of queued job.
+        if still_running:
+            if once:
+                return
+            time.sleep(.8)
+            continue
+        download,busy=downloads.claim(owner)
+        if download:
+            _run_download_child(download,owner)
+        if busy:
+            if once:
+                return
+            time.sleep(.8)
+            continue
         with db.connect() as con:
             row=con.execute("SELECT id FROM experiments WHERE status='queued' AND cancel_requested=0 ORDER BY created_at,id LIMIT 1 FOR UPDATE").fetchone()
             if row:
@@ -199,6 +216,53 @@ def _monitor_job(child,job_id,owner,started):
             child.kill();child.wait()
             break
         time.sleep(.5)
+
+
+def _download_limits():
+    _child_limits()
+    if sys.platform.startswith("linux"):
+        import resource
+        memory=max(256,min(int(os.getenv("MK_DOWNLOAD_MEMORY_MB","768")),2048))*1024*1024
+        inherited=resource.getrlimit(resource.RLIMIT_AS)[1]
+        if inherited!=resource.RLIM_INFINITY:
+            memory=min(memory,inherited)
+        resource.setrlimit(resource.RLIMIT_AS,(memory,memory))
+
+
+def _run_download_child(job,coordinator):
+    """Research CPU/memory budgets are never shared with the runtime workers."""
+    env={k:v for k,v in os.environ.items() if k not in {"MK_MASTER_KEY","MK_ENABLE_LIVE"}}
+    env.update(OMP_NUM_THREADS="1",OPENBLAS_NUM_THREADS="1",MKL_NUM_THREADS="1",NUMEXPR_NUM_THREADS="1")
+    try:
+        child=subprocess.Popen([sys.executable,"-m","backend.worker","download-job",job["id"],"--download-owner",job["owner"]],env=env,preexec_fn=_download_limits if os.name=="posix" else None)
+    except (OSError,subprocess.SubprocessError) as exc:
+        downloads.fail(job["id"],job["owner"],f"无法启动独立下载工作进程：{type(exc).__name__}")
+        return
+    started=time.monotonic()
+    error="下载工作进程退出，可能触发资源上限；请缩短区间后重试"
+    try:
+        while child.poll() is None:
+            service("backtest",coordinator)
+            if time.monotonic()-started>downloads.timeout_seconds():
+                error="下载超过任务时限；请分段下载或稍后重试"
+                break
+            with db.connect() as con:
+                current=con.execute("SELECT status,owner,lease_until FROM data_download_jobs WHERE id=?",(job["id"],)).fetchone()
+                if not current or current["status"]!="running" or current["owner"]!=job["owner"] or current["lease_until"]<=time.time():
+                    break
+                # A page request may temporarily have no progress. Only this
+                # coordinator's live subprocess can receive a lease extension.
+                if current["lease_until"]<time.time()+downloads.LEASE_SECONDS/2:
+                    con.execute("UPDATE data_download_jobs SET lease_until=? WHERE id=? AND status='running' AND owner=? AND lease_until>?",(time.time()+downloads.LEASE_SECONDS,job["id"],job["owner"],time.time()))
+            time.sleep(.5)
+    finally:
+        if child.poll() is None:
+            child.terminate()
+            try:
+                child.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                child.kill();child.wait()
+    downloads.fail(job["id"],job["owner"],error)
 
 
 def ensure_market_cache():
@@ -720,17 +784,18 @@ def runtime_loop(once=False):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode",choices=("backtest","runtime","market","job","account","init-demo","create-admin","trust-strategy"))
+    parser.add_argument("mode",choices=("backtest","runtime","market","job","download-job","account","init-demo","create-admin","trust-strategy"))
     parser.add_argument("id",nargs="?")
     parser.add_argument("--once",action="store_true")
     parser.add_argument("--username", help="管理员用户名；不提供则交互输入")
     parser.add_argument("--generate-password", action="store_true", help="生成高强度密码并仅在创建成功时输出一次 JSON")
     parser.add_argument("--source-hash")
+    parser.add_argument("--download-owner")
     parser.add_argument("--accept-trusted-code",action="store_true")
     args=parser.parse_args();db.init_db()
     if args.mode in {"runtime","backtest"}:
         signal.signal(signal.SIGTERM,lambda signum,frame:sys.exit(0))
-    if args.mode in {"job","account","market"}:
+    if args.mode in {"job","download-job","account","market"}:
         os.environ.pop("MK_MASTER_KEY",None)
         os.environ.pop("MK_ENABLE_LIVE",None)
     if args.mode=="init-demo":
@@ -777,6 +842,10 @@ def main():
     elif args.mode=="runtime":runtime_loop(args.once)
     elif args.mode=="market":market_loop(args.once)
     elif args.mode=="job":run_experiment(args.id)
+    elif args.mode=="download-job":
+        if not args.id or not args.download_owner:
+            parser.error("download-job 必须提供任务编号与 --download-owner")
+        downloads.run(args.id,args.download_owner)
     elif args.mode=="account":account_loop(args.id,args.once)
 
 

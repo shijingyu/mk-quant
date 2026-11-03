@@ -4,7 +4,7 @@ TABLES = (
     "users", "strategies", "strategy_versions", "sessions", "accounts", "instances",
     "commands", "datasets", "experiments", "presets", "logs", "ledger", "runtime_events",
     "services", "market_cache", "orders", "fills", "audit_records", "binance_order_intents",
-    "schema_migrations",
+    "schema_migrations", "data_download_jobs",
 )
 
 _TABLES = {
@@ -134,6 +134,20 @@ _TABLES = {
     """,
     "schema_migrations": """
         version VARCHAR(64) PRIMARY KEY, applied_at VARCHAR(40) NOT NULL
+    """,
+    "data_download_jobs": """
+        id VARCHAR(64) PRIMARY KEY, request_key VARCHAR(128) UNIQUE,
+        request_hash CHAR(64) NOT NULL, requested_by VARCHAR(64) NOT NULL,
+        config LONGTEXT NOT NULL, status VARCHAR(32) NOT NULL DEFAULT 'queued',
+        active_slot VARCHAR(32) UNIQUE, progress DOUBLE NOT NULL DEFAULT 0,
+        current_symbol VARCHAR(32), downloaded_bars BIGINT NOT NULL DEFAULT 0,
+        completed_symbols INT NOT NULL DEFAULT 0, total_symbols INT NOT NULL,
+        attempts INT NOT NULL DEFAULT 0, owner VARCHAR(128), lease_until DOUBLE NOT NULL DEFAULT 0,
+        worker_pid BIGINT, dataset_id VARCHAR(64), error TEXT,
+        created_at VARCHAR(40) NOT NULL, started_at VARCHAR(40), updated_at VARCHAR(40) NOT NULL,
+        completed_at VARCHAR(40), KEY download_status_created(status,created_at),
+        CONSTRAINT fk_download_user FOREIGN KEY(requested_by) REFERENCES users(id),
+        CONSTRAINT fk_download_dataset FOREIGN KEY(dataset_id) REFERENCES datasets(id)
     """,
 }
 

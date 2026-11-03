@@ -69,8 +69,9 @@ services:
     environment:
       <<: *db-environment
       MK_BACKTEST_ADDRESS_SPACE_MB: "2048"
-    # Can reach MySQL only; no public internet or credential master key.
-    networks: [database]
+    # Historical download jobs need public market access; no credential master key.
+    # Download/backtest jobs run serially here, independently of runtime.
+    networks: [database, market]
     cpus: "1.0"
     mem_limit: 768m
     pids_limit: 64

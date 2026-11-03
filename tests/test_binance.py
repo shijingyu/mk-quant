@@ -97,10 +97,16 @@ class BinanceTests(unittest.TestCase):
             [[120000, "3", "4", "3", "4", "30", 179999], [180000, "4", "5", "4", "5", "40", 239999]],
         ]
         exchange.routes["/fapi/v1/klines"] = lambda method, params: pages.pop(0)
-        result = exchange.client().klines("BTCUSDT", "1m", 0, 200000)
+        progress=[]
+        result = exchange.client().klines("BTCUSDT", "1m", 0, 200000,progress=progress.append,max_rows=3)
         self.assertEqual([c["timestamp"] for c in result], [0, 60000, 120000])
         self.assertEqual(exchange.calls[1][2]["startTime"], ["120000"])
         self.assertNotIn("X-MBX-APIKEY", exchange.calls[0][3])
+        self.assertEqual([event["rows"] for event in progress],[2,3])
+        self.assertEqual(progress[-1]["cursor"],200000)
+        exchange.routes["/fapi/v1/klines"]=[[0,"1","2","1","2","10",59999],[60000,"2","3","2","3","20",119999]]
+        with self.assertRaisesRegex(BinanceError,"分段下载"):
+            exchange.client().klines("BTCUSDT","1m",0,200000,max_rows=1)
 
     def test_read_retry_honors_retry_after(self):
         exchange = FakeExchange()

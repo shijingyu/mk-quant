@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
-from . import db, storage
+from . import db, storage, downloads
 from .security import decrypt_secret, encrypt_secret, hash_password, token_hash, verify_password
 
 
@@ -274,7 +274,7 @@ def bootstrap(current=Depends(user)):
     accounts=all_accounts(current)
     result={"current_user":public_user(current),"csrf_token":current["csrf"],"accounts":accounts,"overview":overview_data(accounts),"demo":os.getenv("MK_DEMO","0")=="1","live_enabled":False,"server_time":db.now()}
     if current["role"]=="admin":
-        result.update(strategies=list_strategy_data(),experiments=list_experiments(),datasets=list_datasets(),logs=logs_data(),commands=commands_data(),services=services_data())
+        result.update(strategies=list_strategy_data(),experiments=list_experiments(),datasets=list_datasets(),download_jobs=downloads.list_jobs(),logs=logs_data(),commands=commands_data(),services=services_data())
     return result
 
 
@@ -574,7 +574,7 @@ def datasets(current=Depends(admin)):
     return list_datasets()
 
 
-def store_dataset(body,source,actor_id=None):
+def store_dataset(body,source,actor_id=None,*,download_id=None,download_owner=None):
     market=body.get("market","futures")
     if market=="perpetual":
         market="futures"
@@ -604,11 +604,19 @@ def store_dataset(body,source,actor_id=None):
             except (KeyError,TypeError,ValueError) as exc:
                 raise HTTPException(422,f"{symbol} 的 K 线格式、OHLC 范围或时间唯一性校验失败") from exc
         normalized[symbol].sort(key=lambda r:r["timestamp"])
-    id=db.uid(); serialized=db.dump(normalized)
+    id=download_id or db.uid()
     artifact=storage.write_candles(normalized)
+    content_hash=artifact["content_sha256"] if download_id else hashlib.sha256(db.dump(normalized).encode()).hexdigest()
     with db.connect() as con:
-        con.execute("INSERT INTO datasets VALUES(?,?,?,?,?,?,?,?,?)",(id,str(body.get("name","导入 K 线")),market,str(body.get("interval","1h")),db.dump(symbols),db.dump(artifact),hashlib.sha256(serialized.encode()).hexdigest(),source,db.now()))
+        if download_id:
+            job=con.execute("SELECT * FROM data_download_jobs WHERE id=? FOR UPDATE",(download_id,)).fetchone()
+            if not job or job["status"]!="running" or job["owner"]!=download_owner or job["lease_until"]<=time.time():
+                raise downloads.DownloadLeaseLost("下载任务租约失效，结果未发布")
+        con.execute("INSERT INTO datasets VALUES(?,?,?,?,?,?,?,?,?)",(id,str(body.get("name","导入 K 线")),market,str(body.get("interval","1h")),db.dump(symbols),db.dump(artifact),content_hash,source,db.now()))
         db.audit(con,actor_id,"dataset.create","dataset",id,{"source":source,"count":count,"hash":artifact["content_sha256"]})
+        if download_id:
+            con.execute("UPDATE data_download_jobs SET status='completed',progress=100,downloaded_bars=?,completed_symbols=total_symbols,current_symbol=NULL,dataset_id=?,active_slot=NULL,lease_until=0,error=NULL,completed_at=?,updated_at=? WHERE id=?",(count,id,db.now(),db.now(),download_id))
+            db.audit(con,actor_id,"dataset.download.complete","data_download",download_id,{"dataset_id":id,"count":count})
     return next(x for x in list_datasets() if x["id"]==id)
 
 
@@ -617,21 +625,27 @@ def import_dataset(body:dict,current=Depends(admin)):
     return store_dataset(body,"import",current["id"])
 
 
-@app.post("/api/datasets/download",status_code=201)
+@app.post("/api/datasets/download",status_code=202)
 def download_dataset(body:dict,current=Depends(admin)):
-    from .binance import BinanceClient
-    symbols=body.get("symbols",[])
-    if not symbols or len(symbols)>10:
-        raise HTTPException(422,"单次选择 1–10 个币种")
-    start,end=timestamp(body.get("start",body.get("start_date"))),timestamp(body.get("end",body.get("end_date")))
-    if start>=end:
-        raise HTTPException(422,"下载起始日期必须早于结束日期")
     try:
-        client=BinanceClient(market=body.get("market","futures"))
-        candles={s:client.klines(s,body.get("interval","1h"),start,end) for s in symbols}
-    except Exception as exc:
-        raise HTTPException(502,f"币安行情下载失败：{exchange_error(exc)}") from exc
-    return store_dataset({**body,"candles":candles},"binance_public",current["id"])
+        return downloads.enqueue(body,current["id"])
+    except downloads.DownloadConflict as exc:
+        raise HTTPException(409,{"message":str(exc),"job":exc.job}) from exc
+    except ValueError as exc:
+        raise HTTPException(422,str(exc)) from exc
+
+
+@app.get("/api/datasets/download-jobs")
+def download_jobs(current=Depends(admin)):
+    return downloads.list_jobs()
+
+
+@app.get("/api/datasets/download-jobs/{job_id}")
+def download_job(job_id:str,current=Depends(admin)):
+    result=downloads.get_job(job_id)
+    if result is None:
+        raise HTTPException(404,"下载任务不存在")
+    return result
 
 
 @app.get("/api/market/symbols")

@@ -236,7 +236,7 @@ class BinanceClient:
                                 "fetched_at": int(self._clock() * 1000), "source": "binance"}
         return self._exchange_cache
 
-    def klines(self, symbol: str, interval: str, start_ms: int, end_ms: int) -> list[dict]:
+    def klines(self, symbol: str, interval: str, start_ms: int, end_ms: int, *, progress=None, max_rows=None) -> list[dict]:
         if interval not in self.INTERVALS or not isinstance(symbol, str) or not (4 <= len(symbol) <= 50 and symbol.isalnum() and symbol.endswith(("USDT", "USDC"))):
             raise BinanceError("不支持的交易对或 K 线周期")
         if not isinstance(start_ms, int) or not isinstance(end_ms, int) or start_ms < 0 or end_ms <= start_ms:
@@ -261,10 +261,14 @@ class BinanceClient:
                     result.append({"timestamp": stamp, "open": float(decimal(row[1])), "high": float(decimal(row[2])),
                                    "low": float(decimal(row[3])), "close": float(decimal(row[4])),
                                    "volume": float(decimal(row[5])), "close_time": close_time})
+                    if max_rows is not None and len(result)>max_rows:
+                        raise BinanceError("下载超过允许的 K 线数量，请分段下载、缩短区间或减少币种")
             next_cursor = int(page[-1][6]) + 1
             if next_cursor <= cursor:
                 raise BinanceError("币安 K 线分页没有前进，已停止下载")
             cursor = next_cursor
+            if progress:
+                progress({"rows":len(result),"cursor":min(cursor,cutoff),"end":cutoff})
         return sorted(result, key=lambda candle: candle["timestamp"])
 
     download_klines = klines
