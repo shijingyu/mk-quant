@@ -7,6 +7,9 @@ Exchange timestamps are always integer Unix milliseconds, independent of UI TZ.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+import fcntl
+import threading
 import hashlib
 import json
 import math
@@ -30,6 +33,35 @@ def artifact_root():
     root = Path(os.environ.get("MK_ARTIFACT_ROOT", "data/artifacts")).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True, mode=0o750)
     return root
+
+
+_lifecycle_state = threading.local()
+
+
+@contextmanager
+def lifecycle_lock():
+    """Serialize artifact publication, reference removal, cleanup and backups.
+
+    All roles must share MK_ARTIFACT_ROOT on a filesystem supporting flock.
+    Reentrant per thread; the OS releases the lock if a process crashes.
+    """
+    root = artifact_root()
+    if getattr(_lifecycle_state, "root", None) == root:
+        yield
+        return
+    # Lock the stable root directory itself: root-run backups must not create
+    # a lock file that the service user cannot open on the next publication.
+    descriptor = os.open(root, os.O_RDONLY)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        _lifecycle_state.root = root
+        try:
+            yield
+        finally:
+            _lifecycle_state.root = None
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
 
 
 def _arrow():

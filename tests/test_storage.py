@@ -198,3 +198,45 @@ def test_stream_rejects_invalid_pages_without_publishing(artifact_root,mutation)
             writer.append("BTCUSDT",rows[2:])
             writer.finish()
     assert not list(artifact_root.rglob("*.parquet"))
+
+
+def test_lifecycle_lock_serializes_processes_and_is_reentrant(tmp_path, monkeypatch):
+    import os
+    import subprocess
+    import sys
+    import time
+    monkeypatch.setenv("MK_ARTIFACT_ROOT", str(tmp_path / "locked-artifacts"))
+    marker = tmp_path / "acquired"
+    script = "from backend.storage import lifecycle_lock; from pathlib import Path; import sys;\nwith lifecycle_lock(): Path(sys.argv[1]).write_text('acquired')"
+    with storage.lifecycle_lock():
+        with storage.lifecycle_lock():
+            child = subprocess.Popen([sys.executable, '-c', script, str(marker)], env=os.environ.copy())
+            try:
+                time.sleep(0.3)
+                assert child.poll() is None
+                assert not marker.exists()
+            except BaseException:
+                child.kill(); child.wait()
+                raise
+    assert child.wait(timeout=10) == 0
+    assert marker.read_text() == 'acquired'
+
+
+def test_cleanup_rejects_symlinks_and_changed_files(artifact_root, tmp_path):
+    from backend import artifact_cleanup
+    manifest = storage.write_candles(candles())
+    path = artifact_root / manifest['path']
+    original = path.read_bytes()
+    path.write_bytes(b'changed')
+    with pytest.raises(storage.ArtifactError):
+        artifact_cleanup._remove(manifest)
+    assert path.exists()
+    path.unlink()
+    outside = tmp_path / 'outside.parquet'
+    outside.write_bytes(original)
+    path.symlink_to(outside)
+    with pytest.raises(storage.ArtifactError):
+        artifact_cleanup._remove(manifest)
+    assert outside.read_bytes() == original
+    path.unlink()
+    assert artifact_cleanup._remove(manifest) == 0

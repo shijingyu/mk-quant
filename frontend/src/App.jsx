@@ -57,6 +57,7 @@ import {
   Terminal,
   TrendingDown,
   TrendingUp,
+  Trash2,
   Upload,
   Wallet,
   X,
@@ -3409,7 +3410,8 @@ function Datasets({ data, mutate, notify, startDownload, downloadSubmitting }) {
             </div>
           </dl>
           <p className="dataset-delete-description">
-            删除后，该数据集不再可用于新回测；原下载任务记录仍会保留。
+            删除后会同时清理对应的 K
+            线文件，释放磁盘空间。共享文件仅在最后一份引用删除后清理；下载与审计记录仍会保留。
           </p>
           {deleteError && (
             <div className="inline-error" role="alert">
@@ -3430,13 +3432,13 @@ function Datasets({ data, mutate, notify, startDownload, downloadSubmitting }) {
                 setDeleteBusy(true);
                 setDeleteError("");
                 try {
-                  await mutate(
+                  const result = await mutate(
                     `/datasets/${deleteTarget.id}`,
                     undefined,
                     "DELETE",
                   );
                   setDeleteTarget(null);
-                  notify("数据集已删除，下载任务记录仍保留");
+                  notify(result.message);
                 } catch (error) {
                   setDeleteError(error.message);
                 } finally {
@@ -4784,6 +4786,9 @@ function Backtest({ data, mutate, notify, go }) {
 
 function Experiments({ data, mutate, notify, go }) {
   const [chosen, setChosen] = useState([]),
+    [deleteTarget, setDeleteTarget] = useState(null),
+    [deleteBusy, setDeleteBusy] = useState(false),
+    [deleteError, setDeleteError] = useState(""),
     [detail, setDetail] = useState(null),
     [detailScope, setDetailScope] = useState("all"),
     [detailCurveSplit, setDetailCurveSplit] = useState("train"),
@@ -4803,6 +4808,7 @@ function Experiments({ data, mutate, notify, go }) {
     (e) => filter === "all" || e.status === filter,
   );
   const detailRequest = useRef(null);
+  const deleteRequest = useRef(false);
   const recordPageSize = 20;
   const load = async (e) => {
     if (detailRequest.current) return;
@@ -5093,6 +5099,24 @@ function Experiments({ data, mutate, notify, go }) {
                           <RefreshCw size={15} />
                         </button>
                       )}
+                      <button
+                        className="icon-btn negative"
+                        aria-label={`删除实验 ${e.name}`}
+                        title={
+                          ["queued", "running"].includes(e.status)
+                            ? "请先取消并等待任务结束"
+                            : "删除实验记录及明细文件"
+                        }
+                        disabled={
+                          deleteBusy || ["queued", "running"].includes(e.status)
+                        }
+                        onClick={() => {
+                          setDeleteError("");
+                          setDeleteTarget(e);
+                        }}
+                      >
+                        <Trash2 size={16} />
+                      </button>
                     </div>
                   </td>
                 </tr>
@@ -5102,6 +5126,71 @@ function Experiments({ data, mutate, notify, go }) {
         </div>
         {!list.length && <Empty title="没有符合条件的实验" />}
       </section>
+      {deleteTarget && (
+        <Modal
+          title="删除实验记录"
+          subtitle="删除无法撤销，请先导出需要保留的报告。"
+          onClose={() => {
+            if (!deleteRequest.current) setDeleteTarget(null);
+          }}
+        >
+          <dl className="dataset-delete-details">
+            <div>
+              <dt>实验</dt>
+              <dd>{deleteTarget.name}</dd>
+            </div>
+            <div>
+              <dt>创建时间 · 北京时间</dt>
+              <dd>{formatBeijing(deleteTarget.created_at)}</dd>
+            </div>
+          </dl>
+          <p className="dataset-delete-description">
+            将删除本次实验结果、权益曲线、订单及决策明细文件。共享文件仅在最后一份引用删除后清理；原始
+            K 线数据集与审计记录保留。
+          </p>
+          {deleteError && (
+            <div className="inline-error" role="alert">
+              {deleteError}
+            </div>
+          )}
+          <div className="modal-footer">
+            <Btn disabled={deleteBusy} onClick={() => setDeleteTarget(null)}>
+              取消
+            </Btn>
+            <Btn
+              kind="danger"
+              disabled={deleteBusy}
+              icon={deleteBusy ? Loader2 : Trash2}
+              onClick={async () => {
+                if (deleteRequest.current) return;
+                deleteRequest.current = true;
+                setDeleteBusy(true);
+                setDeleteError("");
+                try {
+                  const result = await mutate(
+                    `/experiments/${deleteTarget.id}`,
+                    undefined,
+                    "DELETE",
+                  );
+                  setChosen((items) =>
+                    items.filter((id) => id !== deleteTarget.id),
+                  );
+                  if (detail?.id === deleteTarget.id) setDetail(null);
+                  setDeleteTarget(null);
+                  notify(result.message);
+                } catch (error) {
+                  setDeleteError(error.message);
+                } finally {
+                  deleteRequest.current = false;
+                  setDeleteBusy(false);
+                }
+              }}
+            >
+              {deleteBusy ? "正在删除" : "确认删除"}
+            </Btn>
+          </div>
+        </Modal>
+      )}
       {compared.length > 1 && (
         <section className="panel">
           <div className="panel-heading">

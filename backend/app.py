@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
-from . import db, storage, downloads
+from . import db, storage, downloads, artifact_cleanup
 from .security import decrypt_secret, encrypt_secret, hash_password, token_hash, verify_password
 
 
@@ -22,6 +22,7 @@ async def lifespan(app):
     db.init_db()
     if os.getenv("MK_DEMO", "0") == "1":
         db.seed_demo()
+    artifact_cleanup.drain()
     yield
 
 
@@ -574,6 +575,7 @@ def datasets(current=Depends(admin)):
 
 
 @app.delete("/api/datasets/{dataset_id}")
+@storage.lifecycle_lock()
 def delete_dataset(dataset_id:str,current=Depends(admin)):
     with db.connect() as con:
         dataset=con.execute("SELECT * FROM datasets WHERE id=? FOR UPDATE",(dataset_id,)).fetchone()
@@ -581,18 +583,17 @@ def delete_dataset(dataset_id:str,current=Depends(admin)):
             raise HTTPException(404,"数据集不存在或已删除")
         references=con.execute("SELECT COUNT(*) FROM experiments WHERE dataset_id=?",(dataset_id,)).fetchone()[0]
         if references:
-            raise HTTPException(409,f"该数据集已被 {references} 个实验引用，不能删除；需保留原始行情以便复现")
-        # Retain the durable download receipt without a dangling foreign key.
-        # Content-addressed Parquet is append-only: another dataset or an older
-        # SQL backup may still reference the same file. Deletion is catalogue
-        # deletion, never an unsafe inline file garbage collection.
+            raise HTTPException(409,f"该数据集已被 {references} 个实验引用，请先删除相关实验记录")
+        artifact=db.parse(dataset["candles"],{})
         con.execute("UPDATE data_download_jobs SET dataset_id=NULL WHERE dataset_id=?",(dataset_id,))
         con.execute("DELETE FROM datasets WHERE id=?",(dataset_id,))
         db.audit(con,current["id"],"dataset.delete","dataset",dataset_id,
-                 {"name":dataset["name"],"hash":dataset["sha256"],"artifact":db.parse(dataset["candles"],{}),"artifact_retained":True})
-    return {"id":dataset_id,"deleted":True,"artifact_retained":True,"message":"数据集已删除，下载与审计记录已保留"}
+                 {"name":dataset["name"],"hash":dataset["sha256"],"artifact":artifact})
+        cleanup_id=artifact_cleanup.enqueue(con,current["id"],[artifact])
+    return artifact_cleanup.response(dataset_id,cleanup_id,"数据集")
 
 
+@storage.lifecycle_lock()
 def store_dataset(body,source,actor_id=None,*,download_id=None,download_owner=None):
     interval=body.get("interval","1m")
     if interval!="1m":
@@ -634,6 +635,7 @@ def store_dataset(body,source,actor_id=None,*,download_id=None,download_owner=No
     return publish_dataset_artifact({**body,"market":market,"interval":interval,"symbols":symbols},source,artifact,actor_id,download_id=download_id,download_owner=download_owner,content_hash=content_hash)
 
 
+@storage.lifecycle_lock()
 def publish_dataset_artifact(body,source,artifact,actor_id=None,*,download_id=None,download_owner=None,content_hash=None):
     """Commit an already validated immutable file without materializing candles."""
     id=download_id or db.uid()
@@ -823,6 +825,23 @@ def experiment_row(experiment_id):
     if not row:
         raise HTTPException(404,"实验不存在")
     return row
+
+
+@app.delete("/api/experiments/{experiment_id}")
+@storage.lifecycle_lock()
+def delete_experiment(experiment_id:str,current=Depends(admin)):
+    with db.connect() as con:
+        row=con.execute("SELECT * FROM experiments WHERE id=? FOR UPDATE",(experiment_id,)).fetchone()
+        if not row:
+            raise HTTPException(404,"实验不存在或已删除")
+        if row["status"] not in {"completed","failed","cancelled"}:
+            raise HTTPException(409,"排队或运行中的实验不能删除，请先取消并等待任务结束")
+        manifests=list(db.parse(row["result"],{}).get("artifacts",{}).values())
+        con.execute("DELETE FROM experiments WHERE id=?",(experiment_id,))
+        db.audit(con,current["id"],"experiment.delete","experiment",experiment_id,
+                 {"name":row["name"],"dataset_id":row["dataset_id"],"provenance":db.parse(row["provenance"],{}),"artifacts":manifests})
+        cleanup_id=artifact_cleanup.enqueue(con,current["id"],manifests)
+    return artifact_cleanup.response(experiment_id,cleanup_id,"实验记录")
 
 
 @app.get("/api/experiments/{experiment_id}")

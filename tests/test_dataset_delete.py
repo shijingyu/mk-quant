@@ -1,4 +1,4 @@
-"""Catalogue deletion preserves experiment inputs, download receipts and backups."""
+"""Reference-aware deletion frees files and preserves inputs, receipts and audit."""
 import secrets
 
 from fastapi.testclient import TestClient
@@ -51,7 +51,7 @@ def test_delete_unreferenced_catalogue_retains_shared_artifact_and_audit(client)
         artifact = db.parse(con.execute('SELECT candles FROM datasets WHERE id=?', (first['id'],)).fetchone()[0])
     expected = storage.read_candles(artifact)
     response = client.delete('/api/datasets/' + first['id'])
-    assert response.status_code == 200 and response.json()['artifact_retained']
+    assert response.status_code == 200 and response.json()['shared_files'] == 1
     assert client.delete('/api/datasets/' + first['id']).status_code == 404
     datasets = client.get('/api/datasets').json()
     assert [d['id'] for d in datasets] == [second['id']]
@@ -61,8 +61,7 @@ def test_delete_unreferenced_catalogue_retains_shared_artifact_and_audit(client)
         audit = con.execute("SELECT payload FROM audit_records WHERE action='dataset.delete' AND resource_id=?", (first['id'],)).fetchone()
         assert db.parse(audit['payload'])['hash'] == first['sha256']
     assert client.delete('/api/datasets/' + second['id']).status_code == 200
-    # An older SQL backup can still restore its content-addressed reference.
-    assert storage.read_candles(artifact) == expected
+    assert not (storage.artifact_root() / artifact["path"]).exists()
 
 
 def test_delete_keeps_download_receipt_without_dangling_dataset(client):
@@ -107,3 +106,97 @@ def test_download_wait_columns_upgrade_is_additive_and_repeatable(mysql_database
         columns = {row['COLUMN_NAME'] for row in con.execute("SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='data_download_jobs'").fetchall()}
         assert {'waiting_reason', 'retry_at'} <= columns
         assert con.execute("SELECT COUNT(*) FROM schema_migrations WHERE version='mysql-003-download-waits'").fetchone()[0] == 1
+
+
+def create_experiment(client, identity, status="completed", result=None, dataset=None):
+    dataset = dataset or create_dataset(client)
+    with db.connect() as con:
+        con.execute('INSERT INTO experiments(id,name,strategy_id,dataset_id,status,config,provenance,result,created_at) VALUES(?,?,?,?,?,?,?,?,?)',
+                    (identity, identity, 'momentum', dataset['id'], status, '{}', '{}', db.dump(result or {}), db.now()))
+    return dataset
+
+
+@pytest.mark.parametrize('status', ['queued', 'running'])
+def test_active_experiment_delete_rejected(client, status):
+    create_experiment(client, 'active', status)
+    assert client.delete('/api/experiments/active').status_code == 409
+    with db.connect() as con:
+        assert con.execute('SELECT id FROM experiments WHERE id=?', ('active',)).fetchone()
+
+
+def test_experiment_delete_frees_shared_results_after_last_reference(client):
+    result = storage.store_result({'curve': [{'timestamp': 1767225600000, 'equity': 100}],
+                                  'validation_curve': [], 'orders': [], 'decisions': []})
+    dataset = create_experiment(client, 'first', result=result)
+    create_experiment(client, 'second', result=result, dataset=dataset)
+    paths = [storage.artifact_root() / m['path'] for m in result['artifacts'].values()]
+    assert len(paths) == 4
+    assert client.delete('/api/datasets/' + dataset['id']).status_code == 409
+    response = client.delete('/api/experiments/first')
+    assert response.status_code == 200 and response.json()['shared_files'] == 4
+    assert all(path.exists() for path in paths)
+    expected_bytes = sum(path.stat().st_size for path in paths)
+    response = client.delete('/api/experiments/second')
+    assert response.status_code == 200 and response.json()['freed_bytes'] == expected_bytes
+    assert response.json()['deleted_files'] == 4
+    assert not any(path.exists() for path in paths)
+    assert client.delete('/api/experiments/second').status_code == 404
+    assert client.get('/api/experiments/second').status_code == 404
+    assert client.get('/api/datasets').json()[0]['experiment_count'] == 0
+    assert client.delete('/api/datasets/' + dataset['id']).json()['deleted_files'] == 1
+    with db.connect() as con:
+        assert con.execute("SELECT COUNT(*) FROM audit_records WHERE action='experiment.delete'").fetchone()[0] == 2
+
+
+def test_experiment_delete_requires_admin_and_csrf(client):
+    create_experiment(client, 'private', status='failed')
+    assert TestClient(app).delete('/api/experiments/private').status_code == 401
+    csrf = client.headers.pop('X-MK-CSRF')
+    assert client.delete('/api/experiments/private').status_code == 403
+    client.headers['X-MK-CSRF'] = csrf
+    login = client.post('/api/login', json={'username': 'client', 'password': client.test_password})
+    client.headers['X-MK-CSRF'] = login.json()['csrf_token']
+    assert client.delete('/api/experiments/private').status_code == 403
+
+
+def test_failed_file_cleanup_retried_after_commit(client, monkeypatch):
+    from backend import artifact_cleanup
+    dataset = create_dataset(client)
+    remove = artifact_cleanup._remove
+    def denied(manifest):
+        raise PermissionError('fixture')
+    monkeypatch.setattr(artifact_cleanup, '_remove', denied)
+    response = client.delete('/api/datasets/' + dataset['id'])
+    assert response.status_code == 200 and response.json()['cleanup_pending']
+    assert not client.get('/api/datasets').json()
+    monkeypatch.setattr(artifact_cleanup, '_remove', remove)
+    reports = artifact_cleanup.drain()
+    assert len(reports) == 1
+    assert next(iter(reports.values()))['deleted_files'] == 1
+    assert artifact_cleanup.drain() == {}
+
+
+def test_delete_transaction_rollback_never_unlinks(client, monkeypatch):
+    from backend import artifact_cleanup
+    from fastapi import HTTPException
+    dataset = create_dataset(client)
+    def failure(*args):
+        raise HTTPException(503, 'fixture')
+    monkeypatch.setattr(artifact_cleanup, 'enqueue', failure)
+    assert client.delete('/api/datasets/' + dataset['id']).status_code == 503
+    with db.connect() as con:
+        manifest = db.parse(con.execute('SELECT candles FROM datasets WHERE id=?', (dataset['id'],)).fetchone()[0])
+    assert storage.read_candles(manifest)
+
+
+def test_cleanup_rechecks_new_reference_before_retry(client, monkeypatch):
+    from backend import artifact_cleanup
+    first = create_dataset(client)
+    remove = artifact_cleanup._remove
+    monkeypatch.setattr(artifact_cleanup, '_remove', lambda m: (_ for _ in ()).throw(PermissionError()))
+    assert client.delete('/api/datasets/' + first['id']).json()['cleanup_pending']
+    second = create_dataset(client)
+    monkeypatch.setattr(artifact_cleanup, '_remove', remove)
+    reports = artifact_cleanup.drain()
+    assert next(iter(reports.values()))['shared_files'] == 1
+    assert client.delete('/api/datasets/' + second['id']).json()['deleted_files'] == 1

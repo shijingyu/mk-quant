@@ -42,8 +42,8 @@ def safe_artifact(root, relative):
 def validate_references(root):
     """Catch wrong roots and damaged referenced files without loading Arrow.
 
-    SQL is snapshotted first. Published files are never garbage-collected, so
-    taking all final filenames later also retains earlier snapshot references.
+    The lifecycle lock prevents publication and cleanup throughout the SQL
+    snapshot and archive, preserving every snapshot reference.
     This current-reference check adds a fail-closed check for operator mistakes.
     """
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -106,9 +106,7 @@ def main():
                 shutil.copyfileobj(output, compressed)
             if process.wait() != 0:
                 raise RuntimeError('mysqldump failed; inspect database availability and user privileges locally')
-        # Files are immutable and written before their MySQL references commit. Reading
-        # the file set AFTER the SQL snapshot contains every referenced object, plus
-        # possibly newer harmless objects. No automatic artifact garbage collection.
+        # The lifecycle lock keeps snapshot references and files stable.
         verified = validate_references(artifact_root)
         # Only final content-addressed names are visible objects. In particular,
         # .writing-*.parquet files can be changing or disappearing concurrently.
@@ -148,4 +146,7 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from backend.storage import lifecycle_lock
+    with lifecycle_lock():
+        main()

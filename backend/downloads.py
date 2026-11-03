@@ -261,9 +261,10 @@ def run(identity, owner):
                     heartbeat(force=True)
                 state.update(completed_symbols=index+1,fraction=0)
                 heartbeat(force=True)
-            artifact = writer.finish()
-            heartbeat(force=True)
-            publish_dataset_artifact(config,"binance_public",artifact,row["requested_by"],download_id=identity,download_owner=owner)
+            with storage.lifecycle_lock():
+                artifact = writer.finish()
+                heartbeat(force=True)
+                publish_dataset_artifact(config,"binance_public",artifact,row["requested_by"],download_id=identity,download_owner=owner)
     except DownloadLeaseLost:
         return
     except Exception as exc:

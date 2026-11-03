@@ -114,13 +114,14 @@ def run_experiment(id):
                           lots=[dict(lot,split=split) for split,value in output.items() for lot in value["lots"]],
                           account_summaries={split:value["account"] for split,value in output.items()})
         result["differences"]={k:result["validation_metrics"][k]-v for k,v in result["metrics"].items() if isinstance(v,(int,float)) and isinstance(result["validation_metrics"].get(k),(int,float))}
-        stored_result=storage.store_result(result)
-        with db.connect() as con:
-            current=con.execute("SELECT cancel_requested FROM experiments WHERE id=? FOR UPDATE",(id,)).fetchone()
-            if current and current["cancel_requested"]:
-                raise BacktestCancelled("任务取消")
-            con.execute("UPDATE experiments SET status='completed',progress=100,result=?,completed_at=?,error=NULL WHERE id=?",(db.dump(stored_result),db.now(),id))
-            db.audit(con,None,"experiment.complete","experiment",id,{"strategy_version_id":version["id"],"artifact_counts":{key:manifest["count"] for key,manifest in stored_result["artifacts"].items()}})
+        with storage.lifecycle_lock():
+            with db.connect() as con:
+                current=con.execute("SELECT cancel_requested,status FROM experiments WHERE id=? FOR UPDATE",(id,)).fetchone()
+                if not current or current["cancel_requested"] or current["status"] != "running":
+                    raise BacktestCancelled("任务取消")
+                stored_result=storage.store_result(result)
+                con.execute("UPDATE experiments SET status='completed',progress=100,result=?,completed_at=?,error=NULL WHERE id=?",(db.dump(stored_result),db.now(),id))
+                db.audit(con,None,"experiment.complete","experiment",id,{"strategy_version_id":version["id"],"artifact_counts":{key:manifest["count"] for key,manifest in stored_result["artifacts"].items()}})
         db.log("debug","回测及验证集完成",strategy_id=row["strategy_id"],details={"experiment_id":id})
     except BacktestCancelled:
         with db.connect() as con:
