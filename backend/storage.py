@@ -13,6 +13,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import tempfile
 
 from . import db
@@ -39,15 +40,17 @@ def _arrow():
     return pa, pq
 
 
-def _digest_file(path):
+def _digest_file(path, heartbeat=None):
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
+            if heartbeat:
+                heartbeat()
     return digest.hexdigest()
 
 
-def _logical_digest(path, kind):
+def _logical_digest(path, kind, heartbeat=None):
     """Hash canonical original rows without retaining a second full dataset."""
     _, pq = _arrow()
     digest = hashlib.sha256()
@@ -56,6 +59,8 @@ def _logical_digest(path, kind):
     symbol = None
     ordinal = 0
     for batch in pq.ParquetFile(path).iter_batches(batch_size=4096, use_threads=False):
+        if heartbeat:
+            heartbeat()
         for row in batch.to_pylist():
             payload = json.loads(row["payload"])
             # Analytical columns determine filtering and pagination. They must
@@ -177,6 +182,174 @@ def write_candles(candles):
     digest = hashlib.sha256(canonical.encode()).hexdigest()
     return _publish("candles", pa.Table.from_pylist(records, schema=schema), digest, len(records),
                     symbols=sorted(candles), start=min(r["timestamp"] for r in records), end=max(r["timestamp"] for r in records))
+
+
+class CandleStreamWriter:
+    """Validate ordered pages and publish one immutable candle artifact.
+
+    Only one exchange page and Arrow row group are retained. The logical hash,
+    lossless payload schema and manifest match write_candles, including its
+    sorted-symbol canonical JSON. The final hash is added to the Parquet footer
+    at close, so the entire file never needs to be buffered or rewritten.
+    """
+    def __init__(self, symbols, *, heartbeat=None, temporary_prefix=""):
+        self.symbols = sorted(symbols)
+        if not self.symbols or len(set(self.symbols)) != len(self.symbols):
+            raise ArtifactError("流式行情需要不重复的交易对")
+        self.heartbeat = heartbeat
+        self.directory = artifact_root() / "candles"
+        self.directory.mkdir(parents=True, exist_ok=True, mode=0o750)
+        if artifact_root() not in self.directory.resolve().parents:
+            raise ArtifactError("文件目录必须位于独立存储根目录内")
+        self.reserve = max(16, int(os.getenv("MK_DOWNLOAD_DISK_RESERVE_MB", "128"))) * 1024 * 1024
+        self._space()
+        pa, pq = _arrow()
+        self.schema = pa.schema([("symbol", pa.string()), ("timestamp", pa.int64()),
+                                 *[(key, pa.float64()) for key in ("open", "high", "low", "close", "volume")],
+                                 ("payload", pa.string())])
+        if temporary_prefix and not re.fullmatch(r"[a-zA-Z0-9-]+", temporary_prefix):
+            raise ArtifactError("行情临时文件标识无效")
+        fd, temporary = tempfile.mkstemp(prefix=".writing-"+temporary_prefix, suffix=".parquet", dir=self.directory)
+        os.close(fd)
+        self.temporary = Path(temporary)
+        self.writer = None
+        try:
+            self.writer = pq.ParquetWriter(self.temporary, self.schema, compression="zstd", compression_level=3)
+        except BaseException:
+            self.temporary.unlink(missing_ok=True)
+            raise
+        self.digest = hashlib.sha256(b"{")
+        self.symbol = None
+        self.symbol_index = -1
+        self.previous_timestamp = None
+        self.pending_tables = []
+        self.pending_rows = 0
+        self.count = 0
+        self.start = self.end = None
+        self.finished = False
+
+    def _space(self, required=1024*1024):
+        if shutil.disk_usage(self.directory).free < self.reserve + required:
+            raise ArtifactError("磁盘可用空间不足，下载已停止且未发布数据集；请清理磁盘后重试")
+
+    def _flush(self):
+        if not self.pending_tables:
+            return
+        pa, _ = _arrow()
+        table = pa.concat_tables(self.pending_tables)
+        self._space(required=max(1024*1024,table.nbytes+1024*1024))
+        self.writer.write_table(table,row_group_size=32768)
+        self.pending_tables.clear()
+        self.pending_rows = 0
+
+    def append(self, symbol, rows):
+        if self.finished or self.writer is None:
+            raise ArtifactError("行情文件已经关闭")
+        if not rows:
+            return
+        if symbol != self.symbol:
+            next_index = self.symbol_index + 1
+            if next_index >= len(self.symbols) or symbol != self.symbols[next_index]:
+                raise ArtifactError("流式行情必须按交易对排序，且每个交易对至少一根 K 线")
+            if self.symbol is not None:
+                self.digest.update(b"],")
+            self.symbol_index, self.symbol, self.previous_timestamp = next_index, symbol, None
+            self.digest.update(db.dump(symbol).encode() + b":[")
+        pa, _ = _arrow()
+        for first in range(0, len(rows), 1000):
+            self._space()
+            records = []
+            for item in rows[first:first+1000]:
+                try:
+                    row = {key: float(item[key]) for key in ("open", "high", "low", "close", "volume")}
+                    stamp = item["timestamp"]
+                    if isinstance(stamp, bool) or float(stamp) != int(stamp):
+                        raise ValueError()
+                    row["timestamp"] = stamp = int(stamp)
+                    if not all(math.isfinite(value) for value in row.values()) or min(row[key] for key in ("open", "high", "low", "close")) <= 0 or row["volume"] < 0 or row["low"] > min(row["open"], row["close"]) or row["high"] < max(row["open"], row["close"]):
+                        raise ValueError()
+                    if stamp < 0 or stamp % 60000 or (self.previous_timestamp is not None and stamp - self.previous_timestamp != 60000):
+                        raise ArtifactError(f"{symbol} 必须是对齐且连续的 1 分钟 K 线；不能发布重复、缺口或高周期数据")
+                except (KeyError, TypeError, ValueError, OverflowError) as exc:
+                    if isinstance(exc, ArtifactError):
+                        raise
+                    raise ArtifactError(f"{symbol} 的 K 线格式、OHLC 范围或时间校验失败") from exc
+                payload = db.dump(row)
+                if self.previous_timestamp is not None:
+                    self.digest.update(b",")
+                self.digest.update(payload.encode())
+                self.previous_timestamp = stamp
+                self.count += 1
+                self.start = stamp if self.start is None else min(self.start, stamp)
+                self.end = stamp if self.end is None else max(self.end, stamp)
+                records.append({"symbol": symbol, **row, "payload": payload})
+            self.pending_tables.append(pa.Table.from_pylist(records, schema=self.schema))
+            self.pending_rows += len(records)
+            # A bounded Arrow row group prevents a years-long download from
+            # accumulating one large footer entry per 1000-row exchange page.
+            if self.pending_rows >= 32000:
+                self._flush()
+            if self.heartbeat:
+                self.heartbeat()
+
+    def finish(self):
+        if self.finished or self.writer is None:
+            raise ArtifactError("行情文件已经关闭")
+        if not self.count or self.symbol_index != len(self.symbols)-1:
+            raise ArtifactError("每个币种至少需要一根 K 线，空结果不能发布")
+        self.digest.update(b"]}")
+        digest = self.digest.hexdigest()
+        expected_meta = {b"mk.content_sha256": digest.encode(), b"mk.version": b"1", b"mk.kind": b"candles"}
+        self._space()
+        self._flush()
+        self.writer.add_key_value_metadata(expected_meta)
+        self.writer.close()
+        self.writer = None
+        os.chmod(self.temporary, 0o640)
+        with self.temporary.open("rb") as stream:
+            os.fsync(stream.fileno())
+        if self.heartbeat:
+            self.heartbeat()
+        _, pq = _arrow()
+        path = self.directory / f"{digest}.parquet"
+        if artifact_root() not in path.resolve().parents:
+            raise ArtifactError("文件路径必须位于独立存储根目录内")
+        # Validate the new file before publication; no-clobber also preserves
+        # identical artifacts previously published by an import or another job.
+        if _logical_digest(self.temporary, "candles", self.heartbeat) != digest:
+            raise ArtifactError("流式行情文件回读校验失败")
+        try:
+            os.link(self.temporary, path)
+        except FileExistsError:
+            metadata = pq.read_metadata(path)
+            if metadata.num_rows != self.count or any((metadata.metadata or {}).get(key) != value for key, value in expected_meta.items()) or _logical_digest(path, "candles", self.heartbeat) != digest:
+                raise ArtifactError("已存在的行情版本与内容哈希不一致")
+        descriptor = os.open(self.directory, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        manifest = {"storage": "parquet", "version": FORMAT_VERSION, "kind": "candles",
+                    "path": str(path.relative_to(artifact_root())), "sha256": _digest_file(path, self.heartbeat),
+                    "content_sha256": digest, "count": self.count, "symbols": self.symbols, "start": self.start, "end": self.end}
+        self.finished = True
+        self.temporary.unlink(missing_ok=True)
+        return manifest
+
+    def close(self):
+        try:
+            self.pending_tables.clear()
+            if self.writer is not None:
+                self.writer.close()
+                self.writer = None
+        finally:
+            self.temporary.unlink(missing_ok=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
 
 
 def read_candles(value, *, symbols=None, start=None, end=None):

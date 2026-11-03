@@ -13,11 +13,10 @@ import threading
 import time
 from pymysql.err import OperationalError
 
-from . import db
+from . import db, storage
 
 LEASE_SECONDS = 180
 MAX_ATTEMPTS = 3
-MAX_CANDLES = 100000
 ACTIVE_SLOT = "dataset-download"
 
 
@@ -32,12 +31,14 @@ class DownloadLeaseLost(RuntimeError):
 
 
 class DownloadTimeout(RuntimeError):
-    """Wall-clock deadline must bypass the exchange transport's retry types."""
+    """Stall deadline must bypass the exchange transport's retry types."""
     pass
 
 
-def timeout_seconds():
-    return max(30,min(int(os.getenv("MK_DOWNLOAD_TIMEOUT_SECONDS","900")),3600))
+def stall_seconds():
+    # Existing deployments may retain the old setting; it now bounds silence,
+    # never the duration of an actively downloading or rate-limited task.
+    return max(30,min(int(os.getenv("MK_DOWNLOAD_STALL_SECONDS",os.getenv("MK_DOWNLOAD_TIMEOUT_SECONDS","900"))),3600))
 
 
 def _timestamp(value):
@@ -53,7 +54,6 @@ def _timestamp(value):
 
 
 def normalize_config(body):
-    from .binance import BinanceClient
     market = body.get("market", "futures")
     market = "futures" if market == "perpetual" else market
     if not isinstance(market,str) or market not in {"spot", "futures"}:
@@ -68,10 +68,6 @@ def normalize_config(body):
     end = min(_timestamp(body.get("end", body.get("end_date"))), int(time.time() * 1000))
     if start < 0 or start >= end:
         raise ValueError("下载起始日期必须早于结束日期，且区间须包含已发生的行情")
-    number, unit = int(interval[:-1]), interval[-1]
-    milliseconds = number * {"m":60000,"h":3600000,"d":86400000,"w":604800000,"M":2419200000}[unit]
-    if math.ceil((end - start) / milliseconds) * len(symbols) > MAX_CANDLES:
-        raise ValueError("单次下载最多 100000 根 K 线，请分段下载、缩短区间或减少币种")
     name = str(body.get("name") or "币安公开 K 线").strip()
     if not name or len(name) > 255:
         raise ValueError("数据集名称需要 1–255 个字符")
@@ -79,7 +75,7 @@ def normalize_config(body):
 
 
 def public_job(row):
-    keys = ("id","status","progress","current_symbol","downloaded_bars","completed_symbols","total_symbols","attempts","dataset_id","error","created_at","started_at","updated_at","completed_at")
+    keys = ("id","status","progress","current_symbol","downloaded_bars","completed_symbols","total_symbols","attempts","dataset_id","error","waiting_reason","retry_at","created_at","started_at","updated_at","completed_at")
     return {**{key:row[key] for key in keys},"config":db.parse(row["config"],{})}
 
 
@@ -93,6 +89,34 @@ def get_job(identity):
     with db.connect() as con:
         row = con.execute("SELECT * FROM data_download_jobs WHERE id=?", (identity,)).fetchone()
     return public_job(row) if row else None
+
+
+def temporary_prefix(identity, owner):
+    return f"download-{identity}-{hashlib.sha256(owner.encode()).hexdigest()[:16]}-"
+
+
+def cleanup_temporary(identity, owner=None):
+    """Remove only task-owned incomplete files after a child is confirmed dead."""
+    if not re.fullmatch(r"[a-f0-9]{32}",identity):
+        return
+    root=storage.artifact_root()
+    directory=root/"candles"
+    if not directory.is_dir() or root not in directory.resolve().parents:
+        return
+    prefix=temporary_prefix(identity,owner) if owner else f"download-{identity}-"
+    for path in directory.glob(".writing-"+prefix+"*.parquet"):
+        if owner is None:
+            match=re.fullmatch(r"\.writing-download-[a-f0-9]{32}-[a-f0-9]{16}-(\d+)-.+\.parquet",path.name)
+            if not match:
+                continue
+            try:
+                os.kill(int(match[1]),0)
+                continue
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                continue
+        path.unlink(missing_ok=True)
 
 
 def enqueue(body, actor_id):
@@ -143,8 +167,9 @@ def claim(owner):
             return None, False
         if row["status"] == "running" and row["lease_until"] > time.time():
             return None, True
+        cleanup_temporary(row["id"])
         if row["attempts"] >= MAX_ATTEMPTS:
-            con.execute("UPDATE data_download_jobs SET status='failed',active_slot=NULL,lease_until=0,error=?,completed_at=?,updated_at=? WHERE id=?",
+            con.execute("UPDATE data_download_jobs SET status='failed',active_slot=NULL,lease_until=0,waiting_reason=NULL,retry_at=NULL,error=?,completed_at=?,updated_at=? WHERE id=?",
                         ("下载工作进程多次中断，已保留失败记录；可重新提交",db.now(),db.now(),row["id"]))
             return None, False
         token = owner + ":" + db.uid()
@@ -155,10 +180,10 @@ def claim(owner):
         return dict(row), True
 
 
-def progress(identity, owner, *, completed_symbols, total_symbols, downloaded_bars, current_symbol, fraction):
+def progress(identity, owner, *, completed_symbols, total_symbols, downloaded_bars, current_symbol, fraction, waiting_reason=None, retry_at=None):
     with db.connect() as con:
-        result = con.execute("UPDATE data_download_jobs SET progress=?,downloaded_bars=?,completed_symbols=?,current_symbol=?,lease_until=?,updated_at=? WHERE id=? AND owner=? AND status='running' AND lease_until>?",
-                             (min(99.5,100*(completed_symbols+max(0,min(fraction,1)))/total_symbols),downloaded_bars,completed_symbols,current_symbol,time.time()+LEASE_SECONDS,db.now(),identity,owner,time.time()))
+        result = con.execute("UPDATE data_download_jobs SET progress=?,downloaded_bars=?,completed_symbols=?,current_symbol=?,waiting_reason=?,retry_at=?,lease_until=?,updated_at=? WHERE id=? AND owner=? AND status='running' AND lease_until>?",
+                             (min(99.5,100*(completed_symbols+max(0,min(fraction,1)))/total_symbols),downloaded_bars,completed_symbols,current_symbol,waiting_reason,retry_at,time.time()+LEASE_SECONDS,db.now(),identity,owner,time.time()))
         if not result.rowcount:
             raise DownloadLeaseLost("下载任务租约已失效，旧执行者禁止继续发布结果")
 
@@ -168,13 +193,13 @@ def fail(identity, owner, message):
         row = con.execute("SELECT * FROM data_download_jobs WHERE id=? FOR UPDATE", (identity,)).fetchone()
         if not row or row["owner"] != owner or row["status"] != "running" or row["lease_until"] <= time.time():
             return
-        con.execute("UPDATE data_download_jobs SET status='failed',active_slot=NULL,lease_until=0,error=?,updated_at=?,completed_at=? WHERE id=?", (message[:2000],db.now(),db.now(),identity))
+        con.execute("UPDATE data_download_jobs SET status='failed',active_slot=NULL,lease_until=0,waiting_reason=NULL,retry_at=NULL,error=?,updated_at=?,completed_at=? WHERE id=?", (message[:2000],db.now(),db.now(),identity))
         db.audit(con,row["requested_by"],"dataset.download.failed","data_download",identity,{"error":message[:2000]})
 
 
 def run(identity, owner):
     from fastapi import HTTPException
-    from .app import store_dataset
+    from .app import publish_dataset_artifact
     from .binance import BinanceClient, BinanceError
     with db.connect() as con:
         row = con.execute("SELECT * FROM data_download_jobs WHERE id=? FOR UPDATE", (identity,)).fetchone()
@@ -182,35 +207,73 @@ def run(identity, owner):
             return
         con.execute("UPDATE data_download_jobs SET worker_pid=?,updated_at=? WHERE id=?", (os.getpid(),db.now(),identity))
     config = db.parse(row["config"])
-    candles, count = {}, 0
-    previous_alarm = None
-    # Keep the wall limit even if the coordinator crashes while this child is
-    # blocked on the network. The production subprocess always has a main thread.
-    if hasattr(signal,"SIGALRM") and threading.current_thread() is threading.main_thread():
+    state = {"completed_symbols":0,"total_symbols":len(config["symbols"]),"downloaded_bars":0,
+             "current_symbol":None,"fraction":0,"waiting_reason":row.get("waiting_reason"),"retry_at":row.get("retry_at")}
+    previous_signals = {}
+    alarm_active = hasattr(signal,"SIGALRM") and threading.current_thread() is threading.main_thread()
+    last_update = [0.0]
+
+    def heartbeat(force=False):
+        # Reset even while validating/hashing a large file. Waiting callbacks
+        # prove that the exchange cooldown is advancing, not a stuck request.
+        if alarm_active:
+            signal.alarm(stall_seconds())
+        if force or time.monotonic()-last_update[0] >= 10:
+            progress(identity,owner,**state)
+            last_update[0] = time.monotonic()
+
+    def waiting(event):
+        remaining = max(0,float(event.get("seconds",0)))
+        reason=event.get("reason") or "等待行情接口恢复"
+        reason={"rate_limit":"币安限流冷却，等待恢复","request_weight":"行情接口请求权重接近上限，等待窗口恢复","request_spacing":"按行情接口频率要求等待","ip_ban":"币安 IP 限制冷却，等待恢复","network_retry":"网络连接暂时失败，等待重试","server_retry":"币安服务暂时异常，等待重试"}.get(reason,reason)
+        state["waiting_reason"] = str(reason)[:2000] if remaining>=1 else None
+        state["retry_at"] = float(event["retry_at"])/1000 if remaining and event.get("retry_at") else None
+        heartbeat(force=True)
+
+    if alarm_active:
         def timed_out(signum,frame):
-            raise DownloadTimeout("下载超过任务时限；请分段下载或稍后重试")
-        previous_alarm = signal.signal(signal.SIGALRM,timed_out)
-        signal.alarm(timeout_seconds())
+            raise DownloadTimeout("下载任务长时间没有进展，已停止；请检查网络或工作进程后重试")
+        previous_signals[signal.SIGALRM] = signal.signal(signal.SIGALRM,timed_out)
+        previous_signals[signal.SIGTERM] = signal.signal(signal.SIGTERM,timed_out)
+        signal.alarm(stall_seconds())
     try:
         if config.get("interval") != "1m":
             raise ValueError("旧下载任务不是 1 分钟周期，请重新提交 1 分钟行情下载")
+        # A replacement process must respect an already persisted IP cooldown
+        # before sending even exchangeInfo. Claim does not erase these fields.
+        resume_at = float(state["retry_at"] or 0)
+        while resume_at > time.time():
+            remaining = resume_at-time.time()
+            waiting({"seconds":remaining,"reason":state["waiting_reason"] or "恢复上次行情接口冷却等待","retry_at":resume_at*1000})
+            time.sleep(min(15,remaining))
+        state.update(waiting_reason=None,retry_at=None)
+        heartbeat(force=True)
         client = BinanceClient(market=config["market"])
-        total = len(config["symbols"])
-        for index, symbol in enumerate(config["symbols"]):
-            progress(identity,owner,completed_symbols=index,total_symbols=total,downloaded_bars=count,current_symbol=symbol,fraction=0)
-            def update(event):
-                progress(identity,owner,completed_symbols=index,total_symbols=total,downloaded_bars=count+event["rows"],current_symbol=symbol,
-                         fraction=(event["cursor"]-config["start"])/max(1,config["end"]-config["start"]))
-            candles[symbol] = client.klines(symbol,config["interval"],config["start"],config["end"],progress=update,max_rows=MAX_CANDLES-count)
-            count += len(candles[symbol])
-            progress(identity,owner,completed_symbols=index+1,total_symbols=total,downloaded_bars=count,current_symbol=symbol,fraction=0)
-        store_dataset({**config,"candles":candles},"binance_public",row["requested_by"],download_id=identity,download_owner=owner)
+        with storage.CandleStreamWriter(config["symbols"],heartbeat=heartbeat,temporary_prefix=temporary_prefix(identity,owner)+str(os.getpid())+"-") as writer:
+            for index, symbol in enumerate(config["symbols"]):
+                state.update(completed_symbols=index,current_symbol=symbol,fraction=0)
+                heartbeat(force=True)
+                for page in client.iter_klines(symbol,config["interval"],config["start"],config["end"],progress=lambda event:heartbeat(),on_wait=waiting):
+                    writer.append(symbol,page)
+                    state.update(downloaded_bars=writer.count,waiting_reason=None,retry_at=None)
+                    if page:
+                        state["fraction"] = (page[-1]["timestamp"]+60000-config["start"])/max(1,config["end"]-config["start"])
+                    heartbeat(force=True)
+                state.update(completed_symbols=index+1,fraction=0)
+                heartbeat(force=True)
+            artifact = writer.finish()
+            heartbeat(force=True)
+            publish_dataset_artifact(config,"binance_public",artifact,row["requested_by"],download_id=identity,download_owner=owner)
     except DownloadLeaseLost:
         return
     except Exception as exc:
-        message = str(exc.detail) if isinstance(exc,HTTPException) else str(exc) if isinstance(exc,(BinanceError,ValueError,DownloadTimeout)) else "下载处理失败（"+type(exc).__name__+"），请检查工作进程日志"
+        if isinstance(exc,OSError) and exc.errno in {28,122}:
+            message = "磁盘空间不足，下载已停止且未发布数据集；请清理磁盘后重试"
+        else:
+            message = str(exc.detail) if isinstance(exc,HTTPException) else str(exc) if isinstance(exc,(BinanceError,ValueError,DownloadTimeout)) else "下载处理失败（"+type(exc).__name__+"），请检查工作进程日志"
         fail(identity,owner,message)
     finally:
-        if previous_alarm is not None:
+        if alarm_active:
             signal.alarm(0)
-            signal.signal(signal.SIGALRM,previous_alarm)
+            for signum, previous in previous_signals.items():
+                signal.signal(signum,previous)

@@ -129,6 +129,7 @@ class BinanceClient:
         self.timeout, self.max_retries = timeout, max_retries
         self._offset_ms, self._cooldown_until, self._last_request = 0, 0.0, 0.0
         self.rate_limit_headers: dict[str, str] = {}
+        self._history_usage = {}
         self._exchange_cache = None
         self._preflight = None
         self._live_enabled = False
@@ -136,20 +137,99 @@ class BinanceClient:
         self._execution_guard = None
         self._lock = threading.RLock()
 
-    def _request(self, method, path, params=None, *, signed=False, wallet=False):
+    def _history_wait(self, seconds, on_wait, reason):
+        """Keep job leases alive during an exchange-mandated long cooldown."""
+        remaining = max(0.0, float(seconds))
+        retry_at = int((self._clock() + remaining) * 1000)
+        while remaining > 0:
+            if on_wait:
+                on_wait({"seconds": remaining, "reason": reason, "retry_at": retry_at})
+            pause = min(15.0, remaining)
+            self._sleep(pause)
+            remaining -= pause
+        if on_wait:
+            on_wait({"seconds": 0.0, "reason": reason, "retry_at": retry_at})
+
+    def _history_limits(self):
+        units = {"SECOND": 1, "MINUTE": 60, "HOUR": 3600, "DAY": 86400}
+        limits = []
+        for item in (self._exchange_cache or {}).get("rate_limits", []):
+            kind = item.get("rateLimitType")
+            if kind == "RAW_REQUEST":
+                kind = "RAW_REQUESTS"
+            try:
+                interval = int(item["intervalNum"]) * units[item["interval"]]
+                capacity = int(item["limit"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if kind in {"REQUEST_WEIGHT", "RAW_REQUESTS"} and interval > 0 and capacity > 0:
+                limits.append((kind, interval, capacity))
+        # This conservative local budget is only a fallback until exchangeInfo
+        # supplies the live limits; it is not a claim about Binance's quota.
+        if not any(kind == "REQUEST_WEIGHT" for kind, _, _ in limits):
+            limits.append(("REQUEST_WEIGHT", 60, 1200))
+        return limits
+
+    def _history_throttle(self, weight, on_wait):
+        limits = self._history_limits()
+        spacing = max([0.5] + [interval * (weight if kind == "REQUEST_WEIGHT" else 1) / max(1, capacity * .5)
+                               for kind, interval, capacity in limits])
+        pause = spacing - (self._clock() - self._last_request)
+        if pause > 0:
+            self._history_wait(pause, on_wait, "request_spacing")
+        for kind, interval, capacity in limits:
+            now = self._clock()
+            window = math.floor(now / interval)
+            previous_window, used = self._history_usage.get((kind, interval), (window, 0))
+            if previous_window != window:
+                used = 0
+            cost = weight if kind == "REQUEST_WEIGHT" else 1
+            if used + cost > max(cost, capacity * .8):
+                self._history_wait((window + 1) * interval - now + 1.0, on_wait, "request_weight")
+        now = self._clock()
+        for kind, interval, _ in limits:
+            window = math.floor(now / interval)
+            previous_window, used = self._history_usage.get((kind, interval), (window, 0))
+            self._history_usage[(kind, interval)] = (window, (used if window == previous_window else 0) + (weight if kind == "REQUEST_WEIGHT" else 1))
+
+    def _observe_weight(self, headers):
+        for key, value in headers.items():
+            match = re.fullmatch(r"x-mbx-used-weight-(\d+)([smhd])", key.lower())
+            if not match:
+                continue
+            try:
+                interval = int(match[1]) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[match[2]]
+                used = max(0, int(value))
+            except (ValueError, TypeError):
+                continue
+            if interval > 0:
+                window = math.floor(self._clock() / interval)
+                previous_window, previous = self._history_usage.get(("REQUEST_WEIGHT", interval), (window, 0))
+                self._history_usage[("REQUEST_WEIGHT", interval)] = (window, max(used, previous if previous_window == window else 0))
+
+    def _request(self, method, path, params=None, *, signed=False, wallet=False,
+                 historical=False, on_wait=None, request_weight=1):
         params = dict(params or {})
         if signed and (not self.api_key or not self._secret):
             raise BinanceError("需要有效 API Key 和 Secret；公开行情不需要凭证")
         if wallet and self.testnet:
             raise BinanceError("测试环境不提供钱包 SAPI 权限查询，检查结果不能作为实盘授权")
         base = "https://api.binance.com" if wallet else self.base_url
-        for attempt in range(self.max_retries + 1):
+        if historical and (method != "GET" or signed or wallet):
+            raise ValueError("历史下载等待模式只允许公开 GET 请求")
+        attempt, limited = 0, 0
+        while attempt <= self.max_retries:
             now = self._clock()
             if now < self._cooldown_until:
-                raise BinanceError("币安限流冷却中，请稍后重试", status=429)
-            wait = 0.12 - (now - self._last_request)
-            if wait > 0:
-                self._sleep(wait)
+                if not historical:
+                    raise BinanceError("币安限流冷却中，请稍后重试", status=429)
+                self._history_wait(self._cooldown_until - now, on_wait, "rate_limit")
+            if historical:
+                self._history_throttle(request_weight, on_wait)
+            else:
+                wait = 0.12 - (now - self._last_request)
+                if wait > 0:
+                    self._sleep(wait)
             query_params = dict(params)
             headers = {"Accept": "application/json", "User-Agent": "MKQuant/1"}
             if signed:
@@ -172,26 +252,40 @@ class BinanceClient:
                 if isinstance(exc, BinanceError) and exc.code == -90001:
                     raise
                 if method == "GET" and attempt < self.max_retries:
-                    self._sleep(min(2 ** attempt, 8))
+                    delay = min(2 ** attempt, 8)
+                    self._history_wait(delay, on_wait, "network_retry") if historical else self._sleep(delay)
+                    attempt += 1
                     continue
                 if isinstance(exc, BinanceError):
                     raise
                 raise BinanceError("币安请求连接失败；写入请求结果可能未知") from None
             self.rate_limit_headers = {k.lower(): str(v) for k, v in response_headers.items() if "weight" in k.lower() or "order-count" in k.lower()}
+            self._observe_weight(response_headers)
             if status in {418, 429}:
                 headers_lower = {k.lower(): v for k, v in response_headers.items()}
                 try:
-                    retry = max(1.0, float(headers_lower.get("retry-after", 2 ** attempt)))
+                    fallback = min(300, 60 * 2 ** min(limited, 3)) if historical else 2 ** attempt
+                    retry = float(headers_lower.get("retry-after", fallback))
+                    if not math.isfinite(retry):
+                        raise ValueError("invalid retry delay")
+                    retry = max(1.0, retry)
                 except (ValueError, TypeError):
                     retry = 60.0
                 self._cooldown_until = self._clock() + retry
+                if historical:
+                    limited += 1
+                    self._history_wait(retry, on_wait, "ip_ban" if status == 418 else "rate_limit")
+                    continue
                 # Do not shorten Retry-After. Long bans return immediately with a cooldown.
                 if method == "GET" and status != 418 and retry <= 10 and attempt < self.max_retries:
                     self._sleep(retry)
+                    attempt += 1
                     continue
                 raise BinanceError("币安请求频率受限，已进入冷却", status=status)
             if status >= 500 and method == "GET" and attempt < self.max_retries:
-                self._sleep(min(2 ** attempt, 8))
+                delay = min(2 ** attempt, 8)
+                self._history_wait(delay, on_wait, "server_retry") if historical else self._sleep(delay)
+                attempt += 1
                 continue
             code = payload.get("code") if isinstance(payload, dict) else None
             if status >= 400 or isinstance(code, int) and code < 0:
@@ -207,10 +301,11 @@ class BinanceClient:
         self._offset_ms = int(data["serverTime"] - (before + after) / 2)
         return self._offset_ms
 
-    def exchange_info(self, refresh=False) -> dict:
+    def exchange_info(self, refresh=False, *, historical=False, on_wait=None) -> dict:
         if self._exchange_cache is not None and not refresh:
             return self._exchange_cache
-        raw = self._request("GET", "/fapi/v1/exchangeInfo" if self.market == "futures" else "/api/v3/exchangeInfo")
+        raw = self._request("GET", "/fapi/v1/exchangeInfo" if self.market == "futures" else "/api/v3/exchangeInfo",
+                            historical=historical, on_wait=on_wait, request_weight=1 if self.market == "futures" else 20)
         symbols = []
         for item in raw.get("symbols", []):
             if item.get("quoteAsset") not in {"USDT", "USDC"}:
@@ -236,40 +331,80 @@ class BinanceClient:
                                 "fetched_at": int(self._clock() * 1000), "source": "binance"}
         return self._exchange_cache
 
-    def klines(self, symbol: str, interval: str, start_ms: int, end_ms: int, *, progress=None, max_rows=None) -> list[dict]:
+    def _kline_pages(self, symbol, interval, start_ms, end_ms, *, progress=None,
+                     historical=False, on_wait=None):
         if interval not in self.INTERVALS or not isinstance(symbol, str) or not (4 <= len(symbol) <= 50 and symbol.isalnum() and symbol.endswith(("USDT", "USDC"))):
             raise BinanceError("不支持的交易对或 K 线周期")
-        if not isinstance(start_ms, int) or not isinstance(end_ms, int) or start_ms < 0 or end_ms <= start_ms:
+        if isinstance(start_ms, bool) or isinstance(end_ms, bool) or not isinstance(start_ms, int) or not isinstance(end_ms, int) or start_ms < 0 or end_ms <= start_ms:
             raise BinanceError("K 线区间必须是有效毫秒时间戳，结束时间大于开始时间")
-        # End is exclusive. Only candles fully closed before end and now are usable.
+        # Fix cutoff at job start, never let a long job ingest an open candle.
         cutoff = min(end_ms, int(self._clock() * 1000) + self._offset_ms)
-        cursor, result, seen = start_ms, [], set()
+        cursor, count, previous = start_ms, 0, None
+        if historical:
+            self.exchange_info(historical=True, on_wait=on_wait)
         path = "/fapi/v1/klines" if self.market == "futures" else "/api/v3/klines"
         while cursor < cutoff:
             page = self._request("GET", path, {"symbol": symbol, "interval": interval, "startTime": cursor,
-                                                   "endTime": cutoff - 1, "limit": 1000})
-            if not isinstance(page, list):
-                raise BinanceError("K 线响应格式无效")
+                                                   "endTime": cutoff - 1, "limit": 1000},
+                                 historical=historical, on_wait=on_wait,
+                                 request_weight=5 if self.market == "futures" else 2)
+            if not isinstance(page, list) or len(page) > 1000:
+                raise BinanceError("K 线响应格式或分页数量无效")
             if not page:
                 break
+            batch, page_stamp, next_cursor = [], None, cursor
             for row in page:
                 if not isinstance(row, list) or len(row) < 7:
                     raise BinanceError("K 线记录格式无效")
-                stamp, close_time = int(row[0]), int(row[6])
-                if start_ms <= stamp < cutoff and close_time < cutoff and stamp not in seen:
-                    seen.add(stamp)
-                    result.append({"timestamp": stamp, "open": float(decimal(row[1])), "high": float(decimal(row[2])),
-                                   "low": float(decimal(row[3])), "close": float(decimal(row[4])),
-                                   "volume": float(decimal(row[5])), "close_time": close_time})
-                    if max_rows is not None and len(result)>max_rows:
-                        raise BinanceError("下载超过允许的 K 线数量，请分段下载、缩短区间或减少币种")
-            next_cursor = int(page[-1][6]) + 1
+                try:
+                    stamp, close_time = int(row[0]), int(row[6])
+                except (ValueError, TypeError, OverflowError):
+                    raise BinanceError("K 线时间戳格式无效") from None
+                if close_time < stamp or (page_stamp is not None and stamp < page_stamp):
+                    raise BinanceError("K 线时间顺序无效")
+                page_stamp = stamp
+                next_cursor = max(next_cursor, close_time + 1)
+                if stamp < start_ms or stamp >= cutoff or close_time >= cutoff:
+                    continue
+                candle = {"timestamp": stamp, "open": float(decimal(row[1])), "high": float(decimal(row[2])),
+                          "low": float(decimal(row[3])), "close": float(decimal(row[4])),
+                          "volume": float(decimal(row[5])), "close_time": close_time}
+                if previous is not None and stamp <= previous["timestamp"]:
+                    # Some transports repeat the page boundary. Retain only a
+                    # single prior row, never an unbounded seen-timestamp set.
+                    if stamp == previous["timestamp"] and candle != previous:
+                        raise BinanceError("重复 K 线内容不一致")
+                    continue
+                if stamp < cursor:
+                    continue
+                batch.append(candle)
+                previous = candle
             if next_cursor <= cursor:
                 raise BinanceError("币安 K 线分页没有前进，已停止下载")
             cursor = next_cursor
+            count += len(batch)
             if progress:
-                progress({"rows":len(result),"cursor":min(cursor,cutoff),"end":cutoff})
-        return sorted(result, key=lambda candle: candle["timestamp"])
+                progress({"rows": count, "cursor": min(cursor, cutoff), "end": cutoff})
+            if batch:
+                yield batch
+
+    def iter_klines(self, symbol: str, interval: str, start_ms: int, end_ms: int, *, progress=None, on_wait=None):
+        """Yield bounded pages for durable historical downloads, without a total cap.
+
+        Only this historical public-read path waits through full 429/418 delays.
+        The on_wait callback runs at most 15 seconds apart to renew the job lease.
+        Ordinary market polling and all trading writes keep their short failures.
+        """
+        yield from self._kline_pages(symbol, interval, start_ms, end_ms,
+                                    progress=progress, historical=True, on_wait=on_wait)
+
+    def klines(self, symbol: str, interval: str, start_ms: int, end_ms: int, *, progress=None, max_rows=None) -> list[dict]:
+        result = []
+        for page in self._kline_pages(symbol, interval, start_ms, end_ms, progress=progress):
+            result.extend(page)
+            if max_rows is not None and len(result) > max_rows:
+                raise BinanceError("下载超过允许的 K 线数量，请分段下载、缩短区间或减少币种")
+        return result
 
     download_klines = klines
     fetch_klines = klines

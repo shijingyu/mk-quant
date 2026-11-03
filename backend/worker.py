@@ -238,7 +238,12 @@ def _monitor_job(child,job_id,owner,started):
 
 
 def _download_limits():
-    _child_limits()
+    # Large historical downloads have no total CPU/wall deadline. They remain
+    # isolated, low priority and memory bounded; their watchdog detects stalls.
+    try:
+        os.nice(10)
+    except PermissionError:
+        pass
     if sys.platform.startswith("linux"):
         import resource
         memory=max(256,min(int(os.getenv("MK_DOWNLOAD_MEMORY_MB","768")),2048))*1024*1024
@@ -257,17 +262,21 @@ def _run_download_child(job,coordinator):
     except (OSError,subprocess.SubprocessError) as exc:
         downloads.fail(job["id"],job["owner"],f"无法启动独立下载工作进程：{type(exc).__name__}")
         return
-    started=time.monotonic()
-    error="下载工作进程退出，可能触发资源上限；请缩短区间后重试"
+    last_activity=time.monotonic()
+    last_update=job.get("updated_at")
+    error="下载工作进程退出，可能触发资源上限；请检查工作进程日志后重试"
     try:
         while child.poll() is None:
             service("backtest",coordinator)
-            if time.monotonic()-started>downloads.timeout_seconds():
-                error="下载超过任务时限；请分段下载或稍后重试"
-                break
             with db.connect() as con:
-                current=con.execute("SELECT status,owner,lease_until FROM data_download_jobs WHERE id=?",(job["id"],)).fetchone()
+                current=con.execute("SELECT status,owner,lease_until,updated_at FROM data_download_jobs WHERE id=?",(job["id"],)).fetchone()
                 if not current or current["status"]!="running" or current["owner"]!=job["owner"] or current["lease_until"]<=time.time():
+                    break
+                if current["updated_at"]!=last_update:
+                    last_update=current["updated_at"]
+                    last_activity=time.monotonic()
+                if time.monotonic()-last_activity>downloads.stall_seconds():
+                    error="下载任务长时间没有进展，已停止；请检查网络或工作进程后重试"
                     break
                 # A page request may temporarily have no progress. Only this
                 # coordinator's live subprocess can receive a lease extension.
@@ -281,6 +290,7 @@ def _run_download_child(job,coordinator):
                 child.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 child.kill();child.wait()
+        downloads.cleanup_temporary(job["id"],job["owner"])
     downloads.fail(job["id"],job["owner"],error)
 
 

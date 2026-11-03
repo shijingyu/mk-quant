@@ -37,10 +37,10 @@ def candles(start):
     return [{"timestamp":start+i*60000,"open":100,"high":102,"low":99,"close":101,"volume":10} for i in range(2)]
 
 
-def fake_klines(self,symbol,interval,start,end,*,progress,max_rows):
+def fake_klines(self,symbol,interval,start,end,*,progress,on_wait):
     result=candles(start)
     progress({"rows":len(result),"cursor":start+120000,"end":end})
-    return result
+    yield result
 
 
 def enqueue(client,**changes):
@@ -50,7 +50,7 @@ def enqueue(client,**changes):
 
 
 def test_enqueue_is_fast_durable_authorized_and_deduplicated(client,monkeypatch):
-    monkeypatch.setattr(BinanceClient,"klines",lambda *a,**k:pytest.fail("API must never fetch candles"))
+    monkeypatch.setattr(BinanceClient,"iter_klines",lambda *a,**k:pytest.fail("API must never fetch candles"))
     first=enqueue(client,request_key="request-one")
     assert first["status"]=="queued" and first["progress"]==0 and not first["reused"]
     second=enqueue(client,request_key="request-one")
@@ -92,11 +92,10 @@ def test_progress_and_dataset_publication_are_persistent(client,monkeypatch):
     claimed,busy=downloads.claim("research-one")
     assert busy and claimed["attempts"]==1
     seen=[]
-    def fetch(self,symbol,interval,start,end,*,progress,max_rows):
-        rows=fake_klines(self,symbol,interval,start,end,progress=progress,max_rows=max_rows)
+    def fetch(self,symbol,interval,start,end,*,progress,on_wait):
+        yield from fake_klines(self,symbol,interval,start,end,progress=progress,on_wait=on_wait)
         seen.append(downloads.get_job(job["id"]))
-        return rows
-    monkeypatch.setattr(BinanceClient,"klines",fetch)
+    monkeypatch.setattr(BinanceClient,"iter_klines",fetch)
     downloads.run(job["id"],claimed["owner"])
     final=downloads.get_job(job["id"])
     assert final["status"]=="completed",final["error"]
@@ -112,32 +111,40 @@ def test_progress_and_dataset_publication_are_persistent(client,monkeypatch):
 
 
 def test_web_restart_and_real_isolated_child_complete_same_job(client):
-    job=enqueue(client,request_key="survives-web")
+    job=enqueue(client,request_key="survives-web",start="2026-01-01",end="2026-04-01")
     claimed,_=downloads.claim("research-process")
     # A new API lifespan sees the durable queue before an independent child runs.
     with TestClient(app) as fresh:
         fresh.cookies.update(client.cookies)
         assert fresh.get("/api/bootstrap").json()["download_jobs"][0]["id"]==job["id"]
     script='''
-import json,sys
+import json,sys,resource
 from backend import downloads
 from backend.binance import BinanceClient
 
-def fixture(self,symbol,interval,start,end,*,progress,max_rows):
-    rows=[{"timestamp":start+i*60000,"open":100,"high":102,"low":99,"close":101,"volume":10} for i in range(2)]
-    progress({"rows":2,"cursor":start+120000,"end":end})
-    return rows
-BinanceClient.klines=fixture
+def fixture(self,symbol,interval,start,end,*,progress,on_wait):
+    for first in range(0,100005,1000):
+        rows=[{"timestamp":start+i*60000,"open":100,"high":102,"low":99,"close":101,"volume":10} for i in range(first,min(first+1000,100005))]
+        progress({"rows":first+len(rows),"cursor":rows[-1]["timestamp"]+60000,"end":end})
+        yield rows
+BinanceClient.iter_klines=fixture
 downloads.run(sys.argv[1],sys.argv[2])
+print(json.dumps({"peak_rss_kb":resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,"downloaded_bars":downloads.get_job(sys.argv[1])["downloaded_bars"]}))
 '''
     env={**os.environ,"OMP_NUM_THREADS":"1","OPENBLAS_NUM_THREADS":"1","MKL_NUM_THREADS":"1","NUMEXPR_NUM_THREADS":"1"}
-    result=subprocess.run([sys.executable,"-c",script,job["id"],claimed["owner"]],env=env,preexec_fn=worker._download_limits if os.name=="posix" else None,capture_output=True,text=True,timeout=30)
+    result=subprocess.run([sys.executable,"-c",script,job["id"],claimed["owner"]],env=env,preexec_fn=worker._download_limits if os.name=="posix" else None,capture_output=True,text=True,timeout=90)
     assert result.returncode==0,result.stderr
+    profile=json.loads(result.stdout.strip().splitlines()[-1])
+    assert profile["downloaded_bars"]==100005
+    if sys.platform.startswith("linux"):
+        assert profile["peak_rss_kb"]<768*1024
+    print("download_child_profile="+json.dumps(profile))
     final=downloads.get_job(job["id"])
     assert final["status"]=="completed",final["error"]
     with db.connect() as con:
         assert con.execute("SELECT worker_pid FROM data_download_jobs WHERE id=?",(job["id"],)).fetchone()[0]!=os.getpid()
-    assert enqueue(client,request_key="survives-web")["id"]==job["id"]
+    assert final["downloaded_bars"]==100005
+    assert enqueue(client,request_key="survives-web",start="2026-01-01",end="2026-04-01")["id"]==job["id"]
     with db.connect() as con:
         assert con.execute("SELECT COUNT(*) FROM datasets").fetchone()[0]==1
 
@@ -166,7 +173,7 @@ def test_expired_lease_is_fenced_and_retry_bound_is_finite(client,monkeypatch):
 def test_completion_transaction_rolls_back_both_dataset_and_status(client,monkeypatch):
     job=enqueue(client)
     claimed,_=downloads.claim("research")
-    monkeypatch.setattr(BinanceClient,"klines",fake_klines)
+    monkeypatch.setattr(BinanceClient,"iter_klines",fake_klines)
     original=db.audit
     def broken(con,actor,action,*args):
         if action=="dataset.download.complete":
@@ -186,7 +193,7 @@ def test_network_failure_is_terminal_and_has_readable_error(client,monkeypatch):
     claimed,_=downloads.claim("research")
     def unavailable(*args,**kwargs):
         raise BinanceError("币安请求频率受限，已进入冷却")
-    monkeypatch.setattr(BinanceClient,"klines",unavailable)
+    monkeypatch.setattr(BinanceClient,"iter_klines",unavailable)
     downloads.run(job["id"],claimed["owner"])
     result=client.get("/api/datasets/download-jobs/"+job["id"]).json()
     assert result["status"]=="failed" and "频率受限" in result["error"]
@@ -203,15 +210,16 @@ def test_active_job_is_not_lost_behind_recent_history(client):
 
 
 def test_limits_validation_and_worker_dispatch(client,monkeypatch):
-    invalid=[body(interval="bad"),body(interval="1h"),body(interval="1d"),body(symbols=["BTCUSDC","BTCUSDC"]),body(market="invalid"),body(start="2025-01-01",end="2026-01-01",interval="1m")]
+    invalid=[body(interval="bad"),body(interval="1h"),body(interval="1d"),body(symbols=["BTCUSDC","BTCUSDC"]),body(market="invalid")]
     for config in invalid:
         assert client.post("/api/datasets/download",json=config).status_code==422
-    assert downloads.MAX_CANDLES==100000 and downloads.LEASE_SECONDS==180
-    assert downloads.timeout_seconds()==900
+    assert downloads.LEASE_SECONDS==180
+    assert downloads.normalize_config(body(start="2025-01-01",end="2026-01-01"))["interval"]=="1m"
+    assert downloads.stall_seconds()==900
     monkeypatch.setenv("MK_DOWNLOAD_TIMEOUT_SECONDS","99999")
-    assert downloads.timeout_seconds()==3600
+    assert downloads.stall_seconds()==3600
     monkeypatch.setenv("MK_DOWNLOAD_TIMEOUT_SECONDS","1")
-    assert downloads.timeout_seconds()==30
+    assert downloads.stall_seconds()==30
     job=enqueue(client)
     monkeypatch.setenv("MK_MASTER_KEY","must-not-leak")
     monkeypatch.setenv("MK_ENABLE_LIVE","1")
@@ -234,7 +242,7 @@ def test_omitted_download_interval_defaults_to_minute(client):
     assert response.status_code==202 and response.json()["config"]["interval"]=="1m"
 
 
-def test_child_wall_deadline_bypasses_exchange_retry_chain(client,monkeypatch):
+def test_child_stall_deadline_bypasses_exchange_retry_chain(client,monkeypatch):
     if not hasattr(downloads.signal,"SIGALRM"):
         pytest.skip("Production worker uses POSIX alarms")
     from backend import binance
@@ -244,17 +252,17 @@ def test_child_wall_deadline_bypasses_exchange_retry_chain(client,monkeypatch):
     def blocked_transport(*args,**kwargs):
         attempts.append(1)
         time.sleep(10)
-        pytest.fail("Wall deadline was swallowed")
+        pytest.fail("Stall deadline was swallowed")
     # Exercise the real urllib transport and Binance retry wrapper. No monitor
     # or exchange network is involved; an orphan child must still stop itself.
     monkeypatch.setattr(binance,"urlopen",blocked_transport)
     monkeypatch.setattr(binance,"_ssl_context",lambda:None)
-    monkeypatch.setattr(downloads,"timeout_seconds",lambda:1)
+    monkeypatch.setattr(downloads,"stall_seconds",lambda:1)
     started=time.monotonic()
     downloads.run(job["id"],claimed["owner"])
     result=downloads.get_job(job["id"])
     assert time.monotonic()-started<4 and len(attempts)==1
-    assert result["status"]=="failed" and "超过任务时限" in result["error"]
+    assert result["status"]=="failed" and "长时间没有进展" in result["error"]
 
 
 @pytest.mark.parametrize("worker_pid",[None,os.getpid()])
@@ -266,3 +274,93 @@ def test_restart_waits_for_surviving_backtest_or_pid_registration(client,monkeyp
     monkeypatch.setattr(worker.subprocess,"Popen",lambda *a,**k:pytest.fail("Must wait for existing research child"))
     worker.backtest_loop(once=True)
     assert downloads.get_job(job["id"])["status"]=="queued"
+
+
+def test_long_rate_limit_wait_renews_lease_without_total_deadline(client,monkeypatch):
+    clock=[time.time()]
+    monkeypatch.setattr(downloads.time,"time",lambda:clock[0])
+    job=enqueue(client)
+    claimed,_=downloads.claim("long-wait")
+    observed=[]
+    def pages(self,symbol,interval,start,end,*,progress,on_wait):
+        resume=clock[0]+1200
+        while clock[0]<resume:
+            on_wait({"seconds":resume-clock[0],"reason":"rate_limit","retry_at":resume*1000})
+            current=downloads.get_job(job["id"])
+            observed.append(current)
+            with db.connect() as con:
+                assert con.execute("SELECT lease_until FROM data_download_jobs WHERE id=?",(job["id"],)).fetchone()[0]>clock[0]
+            clock[0]+=15
+        on_wait({"seconds":0,"reason":"rate_limit","retry_at":resume*1000})
+        yield candles(start)
+    monkeypatch.setattr(BinanceClient,"iter_klines",pages)
+    downloads.run(job["id"],claimed["owner"])
+    result=downloads.get_job(job["id"])
+    assert result["status"]=="completed",result["error"]
+    assert len(observed)==80 and all(row["waiting_reason"]=="币安限流冷却，等待恢复" and row["retry_at"]>0 for row in observed)
+    assert result["waiting_reason"] is None and result["retry_at"] is None
+
+
+def test_retry_respects_persisted_cooldown_before_any_request(client,monkeypatch):
+    clock=[time.time()]
+    monkeypatch.setattr(downloads.time,"time",lambda:clock[0])
+    job=enqueue(client)
+    downloads.claim("old-worker")
+    resume=clock[0]+300
+    with db.connect() as con:
+        con.execute("UPDATE data_download_jobs SET lease_until=0,waiting_reason='币安限流冷却，等待恢复',retry_at=? WHERE id=?",(resume,job["id"]))
+    claimed,_=downloads.claim("replacement-worker")
+    monkeypatch.setattr(downloads.time,"sleep",lambda seconds:clock.__setitem__(0,clock[0]+seconds))
+    def pages(self,symbol,interval,start,end,*,progress,on_wait):
+        assert clock[0]>=resume
+        yield candles(start)
+    monkeypatch.setattr(BinanceClient,"iter_klines",pages)
+    downloads.run(job["id"],claimed["owner"])
+    assert downloads.get_job(job["id"])["status"]=="completed"
+
+
+def test_disk_shortage_fails_clearly_without_dataset_or_partial_files(client,monkeypatch):
+    from types import SimpleNamespace
+    job=enqueue(client)
+    claimed,_=downloads.claim("disk-full")
+    monkeypatch.setattr(storage.shutil,"disk_usage",lambda path:SimpleNamespace(free=0))
+    monkeypatch.setattr(BinanceClient,"iter_klines",fake_klines)
+    downloads.run(job["id"],claimed["owner"])
+    result=downloads.get_job(job["id"])
+    assert result["status"]=="failed" and "磁盘" in result["error"]
+    with db.connect() as con:
+        assert con.execute("SELECT COUNT(*) FROM datasets").fetchone()[0]==0
+    assert not list(storage.artifact_root().rglob(".writing-*"))
+
+
+def test_cleanup_only_removes_dead_task_temporaries(client):
+    job=enqueue(client)
+    old,_=downloads.claim("dead-worker")
+    directory=storage.artifact_root()/"candles"
+    directory.mkdir(parents=True,exist_ok=True)
+    prefix=downloads.temporary_prefix(job["id"],old["owner"])
+    dead=directory/(".writing-"+prefix+"999999999-leftover.parquet")
+    live=directory/(".writing-"+prefix+str(os.getpid())+"-active.parquet")
+    shared=directory/("a"*64+".parquet")
+    unrelated=directory/".writing-another-task.parquet"
+    for path in (dead,live,shared,unrelated):path.write_bytes(b"untouched")
+    with db.connect() as con:
+        con.execute("UPDATE data_download_jobs SET lease_until=0 WHERE id=?",(job["id"],))
+    downloads.claim("new-worker")
+    assert not dead.exists() and live.exists() and shared.exists() and unrelated.exists()
+    # The coordinator invokes owner cleanup only after its child has exited.
+    downloads.cleanup_temporary(job["id"],old["owner"])
+    assert not live.exists() and shared.exists() and unrelated.exists()
+
+
+def test_download_resources_have_no_new_cumulative_cpu_deadline(monkeypatch):
+    import resource
+    calls=[]
+    monkeypatch.setattr(worker.sys,"platform","linux")
+    monkeypatch.setattr(worker.os,"nice",lambda value:calls.append(("nice",value)))
+    monkeypatch.setattr(resource,"getrlimit",lambda kind:(resource.RLIM_INFINITY,512*1024*1024))
+    monkeypatch.setattr(resource,"setrlimit",lambda kind,limits:calls.append((kind,limits)))
+    worker._download_limits()
+    assert ("nice",10) in calls
+    assert (resource.RLIMIT_AS,(512*1024*1024,512*1024*1024)) in calls
+    assert all(kind!=resource.RLIMIT_CPU for kind,value in calls)

@@ -218,7 +218,7 @@ def list_experiments():
 
 def list_datasets():
     with db.connect() as con:
-        rows=con.execute("SELECT * FROM datasets ORDER BY created_at DESC").fetchall()
+        rows=con.execute("SELECT d.*,(SELECT COUNT(*) FROM experiments e WHERE e.dataset_id=d.id) AS experiment_count FROM datasets d ORDER BY d.created_at DESC").fetchall()
     result=[]
     for row in rows:
         d=dict(row)
@@ -572,6 +572,27 @@ def datasets(current=Depends(admin)):
     return list_datasets()
 
 
+
+@app.delete("/api/datasets/{dataset_id}")
+def delete_dataset(dataset_id:str,current=Depends(admin)):
+    with db.connect() as con:
+        dataset=con.execute("SELECT * FROM datasets WHERE id=? FOR UPDATE",(dataset_id,)).fetchone()
+        if not dataset:
+            raise HTTPException(404,"数据集不存在或已删除")
+        references=con.execute("SELECT COUNT(*) FROM experiments WHERE dataset_id=?",(dataset_id,)).fetchone()[0]
+        if references:
+            raise HTTPException(409,f"该数据集已被 {references} 个实验引用，不能删除；需保留原始行情以便复现")
+        # Retain the durable download receipt without a dangling foreign key.
+        # Content-addressed Parquet is append-only: another dataset or an older
+        # SQL backup may still reference the same file. Deletion is catalogue
+        # deletion, never an unsafe inline file garbage collection.
+        con.execute("UPDATE data_download_jobs SET dataset_id=NULL WHERE dataset_id=?",(dataset_id,))
+        con.execute("DELETE FROM datasets WHERE id=?",(dataset_id,))
+        db.audit(con,current["id"],"dataset.delete","dataset",dataset_id,
+                 {"name":dataset["name"],"hash":dataset["sha256"],"artifact":db.parse(dataset["candles"],{}),"artifact_retained":True})
+    return {"id":dataset_id,"deleted":True,"artifact_retained":True,"message":"数据集已删除，下载与审计记录已保留"}
+
+
 def store_dataset(body,source,actor_id=None,*,download_id=None,download_owner=None):
     interval=body.get("interval","1m")
     if interval!="1m":
@@ -608,9 +629,18 @@ def store_dataset(body,source,actor_id=None,*,download_id=None,download_owner=No
         times=[row["timestamp"] for row in normalized[symbol]]
         if any(t%60000 for t in times) or any(b-a!=60000 for a,b in zip(times,times[1:])):
             raise HTTPException(422,f"{symbol} 必须是对齐且连续的 1 分钟 K 线，不能将高周期数据标记成 1m；缺口需要补齐")
-    id=download_id or db.uid()
     artifact=storage.write_candles(normalized)
     content_hash=artifact["content_sha256"] if download_id else hashlib.sha256(db.dump(normalized).encode()).hexdigest()
+    return publish_dataset_artifact({**body,"market":market,"interval":interval,"symbols":symbols},source,artifact,actor_id,download_id=download_id,download_owner=download_owner,content_hash=content_hash)
+
+
+def publish_dataset_artifact(body,source,artifact,actor_id=None,*,download_id=None,download_owner=None,content_hash=None):
+    """Commit an already validated immutable file without materializing candles."""
+    id=download_id or db.uid()
+    count=artifact["count"]
+    market,interval=body["market"],body["interval"]
+    symbols=artifact["symbols"]
+    content_hash=content_hash or artifact["content_sha256"]
     with db.connect() as con:
         if download_id:
             job=con.execute("SELECT * FROM data_download_jobs WHERE id=? FOR UPDATE",(download_id,)).fetchone()
@@ -619,7 +649,7 @@ def store_dataset(body,source,actor_id=None,*,download_id=None,download_owner=No
         con.execute("INSERT INTO datasets VALUES(?,?,?,?,?,?,?,?,?)",(id,str(body.get("name","导入 K 线")),market,interval,db.dump(symbols),db.dump(artifact),content_hash,source,db.now()))
         db.audit(con,actor_id,"dataset.create","dataset",id,{"source":source,"count":count,"hash":artifact["content_sha256"]})
         if download_id:
-            con.execute("UPDATE data_download_jobs SET status='completed',progress=100,downloaded_bars=?,completed_symbols=total_symbols,current_symbol=NULL,dataset_id=?,active_slot=NULL,lease_until=0,error=NULL,completed_at=?,updated_at=? WHERE id=?",(count,id,db.now(),db.now(),download_id))
+            con.execute("UPDATE data_download_jobs SET status='completed',progress=100,downloaded_bars=?,completed_symbols=total_symbols,current_symbol=NULL,dataset_id=?,active_slot=NULL,lease_until=0,error=NULL,waiting_reason=NULL,retry_at=NULL,completed_at=?,updated_at=? WHERE id=?",(count,id,db.now(),db.now(),download_id))
             db.audit(con,actor_id,"dataset.download.complete","data_download",download_id,{"dataset_id":id,"count":count})
     return next(x for x in list_datasets() if x["id"]==id)
 
@@ -753,6 +783,11 @@ def enqueue_experiment(body, *, persist=True, rules_snapshot=None, actor_id=None
 
 def store_experiments(items,actor_id=None):
     with db.connect() as con:
+        # Lock every referenced catalogue row before creating experiments so a
+        # concurrent deletion either sees the committed reference or wins first.
+        for dataset_id in sorted({item["dataset_id"] for item in items}):
+            if not con.execute("SELECT id FROM datasets WHERE id=? FOR UPDATE",(dataset_id,)).fetchone():
+                raise HTTPException(409,"所选数据集已删除，请重新选择数据集")
         for item in items:
             snapshot=item["strategy_snapshot"]
             version_id=db.pin_strategy_version(con,item["strategy_id"],db.parse(snapshot["manifest"],{}),snapshot["source"],snapshot["source_hash"])

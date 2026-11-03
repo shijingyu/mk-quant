@@ -143,7 +143,7 @@ _TABLES = {
         current_symbol VARCHAR(32), downloaded_bars BIGINT NOT NULL DEFAULT 0,
         completed_symbols INT NOT NULL DEFAULT 0, total_symbols INT NOT NULL,
         attempts INT NOT NULL DEFAULT 0, owner VARCHAR(128), lease_until DOUBLE NOT NULL DEFAULT 0,
-        worker_pid BIGINT, dataset_id VARCHAR(64), error TEXT,
+        worker_pid BIGINT, dataset_id VARCHAR(64), error TEXT, waiting_reason TEXT, retry_at DOUBLE,
         created_at VARCHAR(40) NOT NULL, started_at VARCHAR(40), updated_at VARCHAR(40) NOT NULL,
         completed_at VARCHAR(40), KEY download_status_created(status,created_at),
         CONSTRAINT fk_download_user FOREIGN KEY(requested_by) REFERENCES users(id),

@@ -751,7 +751,9 @@ export default function App() {
       } catch {}
       notify(
         job.status === "completed"
-          ? "该下载任务已完成，数据集已保存"
+          ? job.dataset_id === null
+            ? "原下载任务已完成，但数据集已删除；可再次提交创建新下载"
+            : "该下载任务已完成，数据集已保存"
           : "下载任务已提交，切换页面或关闭网页后仍会继续",
       );
       await refresh({ force: true });
@@ -2918,6 +2920,9 @@ function DownloadTasks({ jobs, onReuse, disabled }) {
         {jobs.slice(0, 5).map((job) => {
           const config = job.config || {};
           const pending = ["queued", "running"].includes(job.status);
+          const waiting = pending && Boolean(job.waiting_reason);
+          const datasetRemoved =
+            job.status === "completed" && job.dataset_id === null;
           const progress =
             job.status === "completed"
               ? 100
@@ -2933,7 +2938,11 @@ function DownloadTasks({ jobs, onReuse, disabled }) {
                   {config.interval}
                 </strong>
                 <Badge status={job.status}>
-                  {labels[job.status] || "状态未知"}
+                  {datasetRemoved
+                    ? "已完成 · 数据集已删除"
+                    : waiting
+                      ? "等待重试"
+                      : labels[job.status] || "状态未知"}
                 </Badge>
               </div>
               <p className="download-job-range">
@@ -2953,7 +2962,9 @@ function DownloadTasks({ jobs, onReuse, disabled }) {
                   {job.status === "queued"
                     ? "等待研究任务进程调度"
                     : job.status === "completed"
-                      ? "数据集已保存"
+                      ? datasetRemoved
+                        ? "下载记录保留，数据集已删除"
+                        : "数据集已保存"
                       : job.status === "failed"
                         ? "任务已停止，可修正配置后重试"
                         : `${progress}% · ${job.current_symbol || "准备下载"}`}
@@ -2965,6 +2976,17 @@ function DownloadTasks({ jobs, onReuse, disabled }) {
                   {job.total_symbols || config.symbols?.length || 0} 个币种
                 </span>
               </div>
+              {waiting && (
+                <div className="download-waiting" role="status">
+                  <Clock3 size={15} aria-hidden="true" />
+                  <span>
+                    {job.waiting_reason}
+                    {job.retry_at
+                      ? ` · 下次尝试 ${formatBeijing(job.retry_at, { second: "2-digit" })} 北京时间`
+                      : ""}
+                  </span>
+                </div>
+              )}
               {job.error && <div className="inline-error">{job.error}</div>}
               <div className="download-job-footer">
                 <span title={job.id}>
@@ -2994,7 +3016,11 @@ function Datasets({ data, mutate, notify, startDownload, downloadSubmitting }) {
     [busy, setBusy] = useState(false),
     [filename, setFilename] = useState(""),
     [raw, setRaw] = useState(""),
-    [err, setErr] = useState("");
+    [err, setErr] = useState(""),
+    [deleteTarget, setDeleteTarget] = useState(null),
+    [deleteBusy, setDeleteBusy] = useState(false),
+    [deleteError, setDeleteError] = useState("");
+  const deleteRequest = useRef(false);
   const change = (k, v) => setForm((f) => ({ ...f, [k]: v }));
   const downloadLocked = Boolean(activeDownload || downloadSubmitting);
   const legacyActiveInterval =
@@ -3071,6 +3097,7 @@ function Datasets({ data, mutate, notify, startDownload, downloadSubmitting }) {
               <p>
                 仅下载 1 分钟 K
                 线；其他周期由框架合成。成交价格须位于对应分钟的最低价与最高价之间，并满足挂单生效、触发和风控规则。
+                后台自动分页下载，遇到限流会等待后继续执行。
               </p>
             </div>
             {legacyActiveInterval && (
@@ -3202,7 +3229,9 @@ function Datasets({ data, mutate, notify, startDownload, downloadSubmitting }) {
                   : tab === "download" && activeDownload
                     ? activeDownload.status === "queued"
                       ? "排队中"
-                      : "正在下载"
+                      : activeDownload.waiting_reason
+                        ? "等待重试"
+                        : "正在下载"
                     : busy
                       ? "处理中"
                       : tab === "download"
@@ -3254,7 +3283,7 @@ function Datasets({ data, mutate, notify, startDownload, downloadSubmitting }) {
           setErr("");
           notify(
             config.interval !== "1m"
-              ? "已载入区间与交易对，新任务将按 1 分钟下载，请确认总数据量"
+              ? "已载入区间与交易对，新任务将按 1 分钟自动分页下载"
               : "已载入失败任务配置，确认后点击下载 K 线",
           );
         }}
@@ -3270,7 +3299,7 @@ function Datasets({ data, mutate, notify, startDownload, downloadSubmitting }) {
         </div>
         {data.datasets?.length ? (
           <div className="table-wrap">
-            <table>
+            <table className="dataset-table">
               <thead>
                 <tr>
                   <th>数据集</th>
@@ -3282,6 +3311,7 @@ function Datasets({ data, mutate, notify, startDownload, downloadSubmitting }) {
                   <th className="numeric">数据量</th>
                   <th>版本</th>
                   <th>来源</th>
+                  <th>操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -3312,6 +3342,31 @@ function Datasets({ data, mutate, notify, startDownload, downloadSubmitting }) {
                           : d.source || "导入"}
                       </span>
                     </td>
+                    <td className="dataset-actions">
+                      <Btn
+                        kind="danger"
+                        aria-label={`删除数据集 ${d.name}`}
+                        disabled={
+                          Number(d.experiment_count || 0) > 0 || deleteBusy
+                        }
+                        title={
+                          Number(d.experiment_count || 0) > 0
+                            ? `已有 ${d.experiment_count} 次实验引用，不能删除`
+                            : `删除数据集 ${d.name}`
+                        }
+                        onClick={() => {
+                          setDeleteTarget(d);
+                          setDeleteError("");
+                        }}
+                      >
+                        删除
+                      </Btn>
+                      {Number(d.experiment_count || 0) > 0 && (
+                        <small>
+                          已有 {d.experiment_count} 次实验引用，不能删除
+                        </small>
+                      )}
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -3321,6 +3376,80 @@ function Datasets({ data, mutate, notify, startDownload, downloadSubmitting }) {
           <Empty title="尚无行情数据" />
         )}
       </section>
+      {deleteTarget && (
+        <Modal
+          title="删除数据集"
+          subtitle="请确认需要删除的数据集。已有实验引用的数据不可删除。"
+          onClose={() => {
+            if (!deleteRequest.current) setDeleteTarget(null);
+          }}
+        >
+          <dl className="dataset-delete-details">
+            <div>
+              <dt>数据集</dt>
+              <dd>{deleteTarget.name}</dd>
+            </div>
+            <div>
+              <dt>交易对</dt>
+              <dd>{(deleteTarget.symbols || []).join(" / ") || "—"}</dd>
+            </div>
+            <div>
+              <dt>市场 / 周期</dt>
+              <dd>
+                {deleteTarget.market === "spot" ? "现货" : "永续合约"} ·{" "}
+                {deleteTarget.interval}
+              </dd>
+            </div>
+            <div>
+              <dt>区间 · 北京时间</dt>
+              <dd>
+                {formatBeijing(deleteTarget.start)} —{" "}
+                {formatBeijing(deleteTarget.end)}
+              </dd>
+            </div>
+          </dl>
+          <p className="dataset-delete-description">
+            删除后，该数据集不再可用于新回测；原下载任务记录仍会保留。
+          </p>
+          {deleteError && (
+            <div className="inline-error" role="alert">
+              {deleteError}
+            </div>
+          )}
+          <div className="modal-footer">
+            <Btn disabled={deleteBusy} onClick={() => setDeleteTarget(null)}>
+              取消
+            </Btn>
+            <Btn
+              kind="danger"
+              disabled={deleteBusy}
+              icon={deleteBusy ? Loader2 : undefined}
+              onClick={async () => {
+                if (deleteRequest.current) return;
+                deleteRequest.current = true;
+                setDeleteBusy(true);
+                setDeleteError("");
+                try {
+                  await mutate(
+                    `/datasets/${deleteTarget.id}`,
+                    undefined,
+                    "DELETE",
+                  );
+                  setDeleteTarget(null);
+                  notify("数据集已删除，下载任务记录仍保留");
+                } catch (error) {
+                  setDeleteError(error.message);
+                } finally {
+                  deleteRequest.current = false;
+                  setDeleteBusy(false);
+                }
+              }}
+            >
+              {deleteBusy ? "正在删除" : "确认删除"}
+            </Btn>
+          </div>
+        </Modal>
+      )}
     </>
   );
 }

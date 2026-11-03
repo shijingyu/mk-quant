@@ -176,6 +176,19 @@ def init_schema():
             con.execute(statement)
         con.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?) ON DUPLICATE KEY UPDATE version=VALUES(version)", ("mysql-001", now()))
         con.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?) ON DUPLICATE KEY UPDATE version=VALUES(version)", ("mysql-002-download-jobs", now()))
+        # MySQL 5.7 lacks ADD COLUMN IF NOT EXISTS. Serialize concurrent role
+        # startup and inspect the current columns before the additive migration.
+        lock_name = "mk-schema-" + hashlib.sha256(os.environ["MK_DB_NAME"].encode()).hexdigest()[:40]
+        if con.execute("SELECT GET_LOCK(?,30)", (lock_name,)).fetchone()[0] != 1:
+            raise RuntimeError("数据库结构更新锁等待超时")
+        try:
+            columns = {row["COLUMN_NAME"] for row in con.execute("SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='data_download_jobs'").fetchall()}
+            for column, definition in (("waiting_reason", "TEXT NULL"), ("retry_at", "DOUBLE NULL")):
+                if column not in columns:
+                    con.execute(f"ALTER TABLE data_download_jobs ADD COLUMN `{column}` {definition}")
+            con.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?) ON DUPLICATE KEY UPDATE version=VALUES(version)", ("mysql-003-download-waits", now()))
+        finally:
+            con.execute("SELECT RELEASE_LOCK(?)", (lock_name,))
 
 
 def init_db():

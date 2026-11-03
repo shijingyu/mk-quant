@@ -225,3 +225,171 @@ class BinanceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def history_row(stamp):
+    return [stamp, "1", "2", "1", "2", "10", stamp + 59999]
+
+
+class TestHistoricalDownloads:
+    def test_pages_stream_past_100000_without_accumulating_or_requesting_large_pages(self):
+        exchange = FakeExchange()
+        exchange.now = 10_000_000
+        count = 100_005
+
+        def page(method, params):
+            start = int(params["startTime"][0]) // 60000
+            size = int(params["limit"][0])
+            assert size == 1000
+            return [history_row(i * 60000) for i in range(start, min(start + size, count))]
+
+        exchange.routes["/fapi/v1/klines"] = page
+        progress = []
+        iterator = exchange.client().iter_klines("BTCUSDT", "1m", 0, count * 60000, progress=progress.append)
+        assert exchange.calls == []
+        first = next(iterator)
+        assert len(first) == 1000
+        assert len(exchange.calls) == 2  # Metadata plus only the first requested page.
+        total, last = len(first), first[-1]["timestamp"]
+        for rows in iterator:
+            assert rows[0]["timestamp"] == last + 60000
+            assert len(rows) <= 1000
+            total += len(rows)
+            last = rows[-1]["timestamp"]
+        assert total == count and last == (count - 1) * 60000
+        assert progress[-1] == {"rows": count, "cursor": count * 60000, "end": count * 60000}
+        assert len(exchange.calls) == 102
+        assert all("X-MBX-APIKEY" not in call[3] for call in exchange.calls)
+
+    @pytest.mark.parametrize("status,reason", [(429, "rate_limit"), (418, "ip_ban")])
+    def test_full_retry_after_waits_and_renews_even_with_zero_transport_retries(self, status, reason):
+        exchange = FakeExchange()
+        calls, events = [], []
+
+        def page(method, params):
+            calls.append(exchange.now)
+            if len(calls) == 1:
+                return status, {"Retry-After": "125"}, {"code": -1003}
+            return [history_row(0)]
+
+        exchange.routes["/fapi/v1/klines"] = page
+        client = exchange.client()
+        client.max_retries = 0
+        rows = list(client.iter_klines("BTCUSDT", "1m", 0, 60000, on_wait=events.append))
+        assert len(rows) == 1 and len(rows[0]) == 1
+        assert calls[1] - calls[0] >= 125
+        cooldown = [event for event in events if event["reason"] == reason]
+        assert cooldown[0]["seconds"] == 125 and cooldown[-1]["seconds"] == 0
+        assert len(cooldown) >= 10
+        assert len({event["retry_at"] for event in cooldown}) == 1
+        assert max(exchange.sleeps) <= 15
+
+    def test_weight_header_near_dynamic_limit_waits_for_next_window(self):
+        exchange = FakeExchange()
+        exchange.routes["/fapi/v1/exchangeInfo"]["rateLimits"] = [
+            {"rateLimitType": "REQUEST_WEIGHT", "interval": "MINUTE", "intervalNum": 1, "limit": 2400},
+        ]
+        calls, events = [], []
+
+        def page(method, params):
+            calls.append(exchange.now)
+            if len(calls) == 1:
+                return 200, {"X-MBX-USED-WEIGHT-1M": "2390"}, [history_row(0)]
+            return [history_row(60000)]
+
+        exchange.routes["/fapi/v1/klines"] = page
+        pages = list(exchange.client().iter_klines("BTCUSDT", "1m", 0, 120000, on_wait=events.append))
+        assert len(pages) == 2
+        assert calls[1] >= 2041  # Server minute rollover plus conservative cushion.
+        assert any(e["reason"] == "request_weight" for e in events)
+
+    def test_exchange_metadata_limits_set_conservative_request_spacing(self):
+        exchange = FakeExchange()
+        exchange.routes["/fapi/v1/exchangeInfo"]["rateLimits"] = [
+            {"rateLimitType": "REQUEST_WEIGHT", "interval": "MINUTE", "intervalNum": 1, "limit": 12},
+        ]
+        calls = []
+
+        def page(method, params):
+            calls.append(exchange.now)
+            return [history_row(int(params["startTime"][0]))]
+
+        exchange.routes["/fapi/v1/klines"] = page
+        list(exchange.client().iter_klines("BTCUSDT", "1m", 0, 120000))
+        assert calls[1] - calls[0] >= 50  # Weight 5 with half of 12/minute budget.
+
+    def test_raw_request_limits_are_respected_independent_of_weight(self):
+        exchange = FakeExchange()
+        exchange.routes["/fapi/v1/exchangeInfo"]["rateLimits"] = [
+            {"rateLimitType": "REQUEST_WEIGHT", "interval": "MINUTE", "intervalNum": 1, "limit": 2400},
+            {"rateLimitType": "RAW_REQUEST", "interval": "MINUTE", "intervalNum": 1, "limit": 2},
+        ]
+        calls = []
+
+        def page(method, params):
+            calls.append(exchange.now)
+            return [history_row(int(params["startTime"][0]))]
+
+        exchange.routes["/fapi/v1/klines"] = page
+        list(exchange.client().iter_klines("BTCUSDT", "1m", 0, 120000))
+        assert calls[1] - calls[0] >= 60
+
+    def test_metadata_request_also_honors_long_cooldown(self):
+        exchange = FakeExchange()
+        raw = exchange.routes["/fapi/v1/exchangeInfo"]
+        responses = [(429, {"Retry-After": "65"}, {"code": -1003}), raw]
+        exchange.routes["/fapi/v1/exchangeInfo"] = lambda *_: responses.pop(0)
+        exchange.routes["/fapi/v1/klines"] = [history_row(0)]
+        events = []
+        assert len(list(exchange.client().iter_klines("BTCUSDT", "1m", 0, 60000, on_wait=events.append))) == 1
+        assert any(e["reason"] == "rate_limit" and e["seconds"] == 65 for e in events)
+
+    def test_wait_callback_can_fence_download_before_any_retry(self):
+        exchange = FakeExchange()
+        exchange.routes["/fapi/v1/klines"] = (418, {"Retry-After": "900"}, {"code": -1003})
+
+        def fence(event):
+            if event["reason"] == "ip_ban":
+                raise RuntimeError("lease lost")
+
+        with pytest.raises(RuntimeError, match="lease lost"):
+            list(exchange.client().iter_klines("BTCUSDT", "1m", 0, 60000, on_wait=fence))
+        assert len([c for c in exchange.calls if c[1].endswith("/klines")]) == 1
+
+    def test_duplicate_page_boundary_is_not_emitted_twice(self):
+        exchange = FakeExchange()
+        pages = [[history_row(0)], [history_row(0), history_row(60000)]]
+        exchange.routes["/fapi/v1/klines"] = lambda *_: pages.pop(0)
+        output = list(exchange.client().iter_klines("BTCUSDT", "1m", 0, 120000))
+        assert [row["timestamp"] for page in output for row in page] == [0, 60000]
+
+    @pytest.mark.parametrize("page", [
+        [history_row(60000), history_row(0)],
+        [[0, "1", "2", "1", "2", "10", -1]],
+        [history_row(0)] * 1001,
+        {"unexpected": []},
+    ])
+    def test_invalid_pages_fail_without_false_success(self, page):
+        exchange = FakeExchange()
+        exchange.routes["/fapi/v1/klines"] = page
+        with pytest.raises(BinanceError):
+            list(exchange.client().iter_klines("BTCUSDT", "1m", 0, 120000))
+
+    def test_nonadvancing_pages_stop_instead_of_looping(self):
+        exchange = FakeExchange()
+        exchange.routes["/fapi/v1/klines"] = [history_row(0)]
+        with pytest.raises(BinanceError, match="没有前进"):
+            list(exchange.client().iter_klines("BTCUSDT", "1m", 60000, 120000))
+
+    def test_bad_range_rejected_before_network_and_runtime_remains_fast_fail(self):
+        exchange = FakeExchange()
+        client = exchange.client()
+        with pytest.raises(BinanceError):
+            list(client.iter_klines("BTCUSDT", "1m", True, 120000))
+        assert exchange.calls == []
+        exchange.routes["/fapi/v1/klines"] = (429, {"Retry-After": "120"}, {"code": -1003})
+        with pytest.raises(BinanceError):
+            client.klines("BTCUSDT", "1m", 0, 60000)
+        assert exchange.sleeps == []
+        with pytest.raises(ValueError, match="公开 GET"):
+            client._request("POST", "/fapi/v1/order", historical=True)

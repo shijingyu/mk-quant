@@ -2715,3 +2715,83 @@ footer {
   max-height: 480px;
   overflow: auto;
 }
+
+.dataset-actions {
+  min-width: 150px;
+}
+.dataset-actions small {
+  display: block;
+  margin-top: 7px;
+  color: var(--muted);
+  white-space: normal;
+  max-width: 175px;
+  font-size: 12px;
+}
+.dataset-delete-details {
+  margin: 0;
+}
+.dataset-delete-details > div {
+  display: grid;
+  grid-template-columns: 110px minmax(0, 1fr);
+  gap: 14px;
+  padding: 11px 0;
+  border-bottom: 1px solid var(--border);
+}
+.dataset-delete-details dt {
+  color: var(--muted);
+}
+.dataset-delete-details dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+.dataset-delete-description {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.7;
+  margin-top: 18px;
+}
+.download-waiting {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  color: var(--amber);
+  font-size: 13px;
+  line-height: 1.7;
+  margin-top: 12px;
+}
+.download-waiting svg {
+  flex-shrink: 0;
+  margin-top: 3px;
+}
+@media (max-width: 760px) {
+  .dataset-delete-details > div {
+    grid-template-columns: 1fr;
+    gap: 4px;
+  }
+}
+
+/* Keep the destructive control associated with its row when data columns scroll. */
+.dataset-table th:last-child,
+.dataset-table td:last-child {
+  position: sticky;
+  right: 0;
+  z-index: 1;
+  background: var(--panel);
+  box-shadow: -1px 0 var(--border);
+}
+.dataset-table th:last-child {
+  z-index: 2;
+  background: var(--panel-alt);
+}
+.dataset-table td:first-child {
+  min-width: 190px;
+  max-width: 230px;
+  white-space: normal;
+}
+.dataset-table td:nth-child(3) {
+  min-width: 180px;
+  max-width: 230px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}

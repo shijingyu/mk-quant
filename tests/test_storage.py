@@ -169,3 +169,32 @@ def test_aborted_report_stream_closes_active_artifact_iterator(artifact_root,mon
     next(stream)
     stream.close()
     assert closed==[True] and count[0]<100
+
+
+def test_streamed_candles_are_canonical_compatible_and_lossless(artifact_root):
+    original={symbol:[{**{key:float(row[key]) for key in ("open","high","low","close","volume")},"timestamp":row["timestamp"]} for row in candles()["BTCUSDT"]] for symbol in ("BTCUSDC","ETHUSDC")}
+    ticks=[]
+    with storage.CandleStreamWriter(list(reversed(original)),heartbeat=lambda:ticks.append(True)) as writer:
+        for symbol,rows in original.items():
+            writer.append(symbol,rows[:1])
+            writer.append(symbol,rows[1:])
+        streamed=writer.finish()
+    assert streamed==storage.write_candles(original)
+    assert storage.read_candles(streamed)==original
+    assert streamed["count"]==8 and len(ticks)>=4
+    assert not list(artifact_root.rglob(".writing-*"))
+
+
+@pytest.mark.parametrize("mutation",["gap","duplicate","unaligned","bad_ohlc","missing_symbol"])
+def test_stream_rejects_invalid_pages_without_publishing(artifact_root,mutation):
+    rows=candles()["BTCUSDT"]
+    if mutation=="gap":rows[2]["timestamp"]+=60000
+    elif mutation=="duplicate":rows[2]["timestamp"]=rows[1]["timestamp"]
+    elif mutation=="unaligned":rows[2]["timestamp"]+=1
+    elif mutation=="bad_ohlc":rows[2]["high"]=1
+    with pytest.raises(storage.ArtifactError):
+        with storage.CandleStreamWriter(["BTCUSDT","ETHUSDT"] if mutation=="missing_symbol" else ["BTCUSDT"]) as writer:
+            writer.append("BTCUSDT",rows[:2])
+            writer.append("BTCUSDT",rows[2:])
+            writer.finish()
+    assert not list(artifact_root.rglob("*.parquet"))

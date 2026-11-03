@@ -85,3 +85,11 @@ python scripts/migrate_sqlite_to_mysql.py --source /private-backup/legacy.sqlite
 每份权限 600 的归档包含 `database.sql.gz`、`artifacts/` 和 `manifest.json`；清单记录压缩 SQL 及每个文件的 SHA-256，命令输出整体归档校验和。临时目录权限 700，凭证通过权限 600 的临时 MySQL 选项文件传给工具，不进入参数。`mysqldump` 与应用采用同一 `MK_DB_SSL_MODE` / `MK_DB_SSL_CA` 规则，远程数据库要求 `VERIFY_IDENTITY`，客户端需支持相应选项。Fernet 主密钥单独保管，归档不含环境文件。
 
 恢复时停止写入，先核对归档及清单哈希，在空的隔离 MySQL 库解压导入 `database.sql.gz`，将 `artifacts/` 的内容恢复到 `MK_ARTIFACT_ROOT`，配置运行用户的读写权限。核对表的 InnoDB 引擎、关键行数、文件清单和数据库引用，再进行历史结果回读、回放及权限验收。迁移到另一个数据库名时，更新连接配置；文件清单使用相对路径，恢复时不改变其子目录结构。备份并发期间不做 DDL 或删除文件。宝塔的单库备份可额外保留，但单独一份 MySQL SQL 文件不能恢复完整历史研究数据。
+
+## 数据集删除
+
+`DELETE /api/datasets/{id}` 仅管理员可调用，并要求 CSRF。对数据集行加锁后检查实验引用；有引用返回 409，即使实验已完成、失败或取消也保留输入。新实验持久化时也锁定数据集，避免删除与入队竞态。未引用数据集从目录删除，下载任务保留并清空其 dataset_id，审计保留内容哈希和文件清单。
+
+Parquet 使用内容寻址且允许多份目录记录引用同一文件；联合备份也可能引用历史文件。因此删除目录不直接 unlink 文件，不承诺即时释放磁盘。物理归档回收必须另外依据全部现存引用及备份保留期设计，不能直接删除 candles 目录。
+
+`mysql-003-download-waits` 为 data_download_jobs 增加 waiting_reason TEXT 和 retry_at DOUBLE（Unix 秒），只在限流/网络等待时显示。迁移通过数据库锁及列检查兼容已有 MySQL 5.7 环境，不清库。

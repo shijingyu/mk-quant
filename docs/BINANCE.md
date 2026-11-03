@@ -1,6 +1,6 @@
 # Binance 适配器与实盘边界
 
-本文件对应 `backend/binance.py`。接口文档核对日期为 2026-11-02。测试通过注入运输层完成，未使用真实密钥，也未执行真实下单。使用 curl 真实读取 BTCUSDT 永续和 BTCUSDC 现货公开 K 线成功；本机独立 Python 的证书链验证失败，适配器会明确报错。部署需通过 `SSL_CERT_FILE` 等方式配置组织认可的 CA 证书链，不得关闭 TLS 验证。
+本文件对应 `backend/binance.py`。接口文档核对日期为 2026-11-03。测试通过注入运输层完成，未使用真实密钥，也未执行真实下单。使用 curl 真实读取 BTCUSDT 永续和 BTCUSDC 现货公开 K 线成功；本机独立 Python 的证书链验证失败，适配器会明确报错。部署需通过 `SSL_CERT_FILE` 等方式配置组织认可的 CA 证书链，不得关闭 TLS 验证。
 
 ## 连接与行情
 
@@ -11,11 +11,12 @@
 | `exchange_info(refresh=False)` | `{market,symbols,rate_limits,fetched_at,source}`；每个 symbol 含 tick_size、step_size、min_qty、min_notional 及原始 filters |
 | `klines(symbol, interval, start_ms, end_ms)` | UTC 毫秒区间 `[start,end)`，只返回完整闭合蜡烛；含 timestamp/open/high/low/close/volume/close_time |
 | `download_klines` / `fetch_klines` | 同 `klines` |
+| `iter_klines(..., progress=None, on_wait=None)` | 历史下载专用，逐页最多 1000 根，累计不设上限；限流等待每最多 15 秒回调续租 |
 | `commission(symbol)` | 帐户实际 maker/taker 小数费率，需签名；无密钥时抛出错误，不冒充自动读取 |
 
 行情接口为 `GET /api/v3/exchangeInfo`、`GET /api/v3/klines` 以及 `GET /fapi/v1/exchangeInfo`、`GET /fapi/v1/klines`。按时间分页每页 1000 条，并防止游标停滞。交易数量和价格按 `PRICE_FILTER`、`LOT_SIZE`、`MARKET_LOT_SIZE` 的实际步长使用 Decimal 向下量化，不能拿展示小数位替代交易规则。参见 [USDⓈ-M 行情接口](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/market-data) 和 [Binance 官方现货 REST 文档](https://github.com/binance/binance-spot-api-docs/blob/master/rest-api.md)。
 
-只对 GET 做有界重试。429 遵循 `Retry-After`，长冷却或 418 返回错误并阻止提前请求；写操作不自动重试。API 错误不输出 URL、签名、Key、Secret 或原始服务器回显。币安限额按 IP 统计，因此生产中的行情进程应统一下载，并在部署出口统一管理请求额度；本类的进程内节流不是跨进程限流器。[官方现货 HTTP 与限流说明](https://developers.binance.com/en/docs/products/spot/rest-api)
+普通 GET 对网络/服务器错误做有界重试，长冷却或 418 快速返回错误并阻止提前请求；写操作不自动重试。历史 `iter_klines` 路径另读取 exchangeInfo 的 REQUEST_WEIGHT/RAW_REQUEST(S) 限额与 X-MBX-USED-WEIGHT 响应头，以至少 0.5 秒间隔和保守权重预算主动延时；429/418 完整等待 Retry-After，再继续当前分页。等待回调供持久任务续租和展示，不使用固定总下载时限，也不影响写请求的重试规则。API 错误不输出 URL、签名、Key、Secret 或原始服务器回显。币安限额按 IP 统计，因此生产中的行情进程应统一下载，并在部署出口统一管理请求额度；本类的进程内节流不是跨进程限流器。[官方现货 HTTP 与限流说明](https://developers.binance.com/en/docs/products/spot/rest-api)
 
 ## 只读账户检查
 
