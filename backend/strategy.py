@@ -9,8 +9,12 @@ Every call sees completed bars only. ``context`` contains ``params``, current
 ``candles`` keyed by symbol, trailing ``history`` keyed by symbol, ``positions``,
 ``account``, ``timestamp``, ``bar_index``, ``log(level, message, data=None)`` and
 ``emit(**display_fields)``. Return order intents with symbol, side, quantity and
-optional reduce_only/reason. The default model executes at the next common
-bar's open. maker_grid_v1 provides persistent post-only limit orders, hedge
+optional reduce_only/reason. MANIFEST.timeframes declares the primary decision
+period and additional periods synthesized from complete minute buckets. Current
+candles/history are primary-period views; timeframe_candles/timeframe_history
+contain declared periods, execution_candles contains the current closed minute.
+The default model executes at the next minute's open within that minute's range.
+maker_grid_v1 provides persistent post-only limit orders, hedge
 lots and execution_events, with the conservative OHLC rules in the protocol.
 Keep persistent instance fields (``self.*``) JSON-compatible: the paper worker
 serializes/restores the instance dictionary between bars and after restarts.
@@ -24,6 +28,7 @@ import copy
 import importlib
 import math
 from pathlib import Path
+from .timeframes import normalize_timeframes
 
 
 class StrategyValidationError(ValueError):
@@ -120,6 +125,10 @@ def validate_manifest(manifest: dict) -> dict:
     _require(isinstance(required, list) and all(key in props for key in required), "parameters.required 包含未知参数")
     window = result.setdefault("history_window", 1000)
     _require(type(window) is int and 1 <= window <= 10000, "history_window 必须为 1 至 10000 的整数")
+    try:
+        result["timeframes"] = normalize_timeframes(result.get("timeframes"))
+    except ValueError as exc:
+        raise StrategyValidationError(str(exc)) from exc
     validate_parameters(result, {})
     return result
 

@@ -2563,3 +2563,155 @@ footer {
     width: auto;
   }
 }
+
+/* Minute execution data and linked portfolio/symbol result views. */
+.minute-data-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 14px 16px;
+  margin-bottom: 20px;
+  border-radius: var(--radius-control);
+  background: var(--soft-green);
+  color: var(--green);
+}
+.minute-data-notice svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+.minute-data-notice p {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.7;
+}
+.strategy-timeframes,
+.minute-dataset-help {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.7;
+}
+.strategy-timeframes {
+  margin: 0 0 16px;
+}
+.minute-dataset-help {
+  margin: 0 0 16px;
+}
+.experiment-scope {
+  padding: 0 22px 18px;
+}
+.experiment-scope-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+.experiment-scope-controls > span {
+  font-size: 13px;
+  color: var(--muted);
+  margin-right: 4px;
+}
+.experiment-scope-controls button {
+  min-height: 36px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  padding: 7px 12px;
+  color: var(--text);
+  background: var(--panel);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+.experiment-scope-controls button:not(:disabled):hover {
+  background: var(--hover);
+}
+.experiment-scope-controls button.selected {
+  background: var(--soft-green);
+  color: var(--green);
+  border-color: var(--green);
+}
+.experiment-scope-controls button:disabled {
+  color: var(--muted);
+  background: var(--panel-alt);
+  cursor: not-allowed;
+}
+.experiment-scope-controls button:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: 3px;
+}
+.experiment-scope-note {
+  margin: 12px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.7;
+}
+.result-metrics-caption {
+  margin: 0 22px 12px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.experiment-curve-split {
+  flex-shrink: 0;
+}
+.experiment-detail-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 20px 0 16px;
+}
+.experiment-detail-heading h3 {
+  margin: 0;
+  font-size: 16px;
+}
+.experiment-detail-results .experiment-scope {
+  padding: 0 0 18px;
+}
+.experiment-detail-results .result-metrics {
+  padding: 0 0 20px;
+}
+.experiment-detail-results .result-metrics-caption {
+  margin-left: 0;
+}
+.experiment-detail-results .result-incomplete {
+  padding-left: 0;
+}
+@media (max-width: 760px) {
+  .experiment-scope {
+    padding: 0 18px 18px;
+  }
+  .experiment-scope-controls > span {
+    width: 100%;
+  }
+  .result-metrics-caption {
+    margin-left: 18px;
+  }
+  .experiment-curve-split button {
+    min-height: 38px;
+    padding: 8px 11px;
+  }
+}
+
+.experiment-record-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin: 18px 0;
+}
+.experiment-record-toolbar > span,
+.experiment-record-range {
+  color: var(--muted);
+  font-size: 13px;
+}
+.experiment-record-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 42px 16px;
+  color: var(--muted);
+}
+.experiment-records .code-block {
+  max-height: 480px;
+  overflow: auto;
+}

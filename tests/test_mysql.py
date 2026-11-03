@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 import threading
 import time
+import hashlib
 from types import SimpleNamespace
 
 import pytest
@@ -120,3 +121,33 @@ def test_strategy_version_is_immutable(mysql_database):
         assert len(version) == 64
         with pytest.raises(ValueError, match="不可覆盖"):
             db.pin_strategy_version(con, row["id"], {**manifest,"description":"changed without new source"}, row["source"], row["source_hash"])
+
+
+@pytest.mark.parametrize('guard',['idle','running','queued','custom','untrusted'])
+def test_builtin_minute_upgrade_pins_old_version_and_preserves_edits(mysql_database,monkeypatch,guard):
+    with db.connect() as con:
+        current=dict(con.execute("SELECT * FROM strategies WHERE id='momentum'").fetchone())
+    old_source=current['source'].replace('"version": "1.1.0"','"version": "1.0.0"')
+    old_manifest=db.parse(current['manifest']);old_manifest['version']='1.0.0'
+    old_hash=hashlib.sha256(old_source.encode()).hexdigest()
+    monkeypatch.setattr(db,'_MINUTE_PREDECESSOR_HASHES',{'momentum':old_hash})
+    if guard=='custom':
+        old_source+='\n# administrator customization\n'
+        old_hash=hashlib.sha256(old_source.encode()).hexdigest()
+    with db.connect() as con:
+        con.execute("UPDATE strategies SET source=?,source_hash=?,manifest=? WHERE id='momentum'",(old_source,old_hash,db.dump(old_manifest)))
+        if guard=='untrusted':con.execute("UPDATE strategies SET trusted=0 WHERE id='momentum'")
+    if guard=='running':make_account()
+    if guard=='queued':
+        with db.connect() as con:
+            con.execute("INSERT INTO datasets VALUES('upgrade-data','旧数据','futures','1m','[\"BTCUSDT\"]','{}',?,'synthetic',?)",('a'*64,db.now()))
+            con.execute("INSERT INTO experiments(id,name,strategy_id,dataset_id,status,config,provenance,created_at) VALUES('upgrade-job','未完成任务','momentum','upgrade-data','queued','{}','{}',?)",(db.now(),))
+    db.init_db()
+    with db.connect() as con:
+        saved=con.execute("SELECT * FROM strategies WHERE id='momentum'").fetchone()
+        old=con.execute("SELECT source FROM strategy_versions WHERE strategy_id='momentum' AND source_hash=?",(old_hash,)).fetchone()
+        assert old['source']==old_source
+        assert saved['source_hash']==(current['source_hash'] if guard in {'idle','untrusted'} else old_hash)
+        if guard=='untrusted':assert saved['trusted']==0
+        upgraded=con.execute("SELECT COUNT(*) FROM audit_records WHERE action='strategy.builtin.minute_upgrade'").fetchone()[0]
+        assert upgraded==(1 if guard in {'idle','untrusted'} else 0)

@@ -1,9 +1,7 @@
 """Authenticated control plane. Trading and backtesting run in independent workers."""
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-import csv
 import hashlib
-import io
 import itertools
 import json
 import math
@@ -13,7 +11,7 @@ import secrets
 import time
 from urllib.parse import urlparse
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from . import db, storage, downloads
 from .security import decrypt_secret, encrypt_secret, hash_password, token_hash, verify_password
@@ -190,10 +188,10 @@ def all_accounts(current):
     return [account_data(row) for row in rows]
 
 
-def experiment_data(row,detail=False):
+def experiment_data(row,detail=False,*,preview=True):
     d=dict(row)
     config=db.parse(d.pop("config"),{})
-    result=storage.load_result(d.pop("result"), detail=detail)
+    result=storage.load_result(d.pop("result"), detail=detail, preview=preview)
     d.update(config)
     d["provenance"]=db.parse(d["provenance"],{})
     d.update(result)
@@ -206,7 +204,7 @@ def experiment_data(row,detail=False):
     d.setdefault("curve",[])
     d.setdefault("validation_curve",[])
     d["incomplete"]=d["status"]!="completed"
-    if not detail:
+    if not detail and preview:
         d.pop("decisions",None)
         d.pop("orders",None)
     return d
@@ -575,6 +573,9 @@ def datasets(current=Depends(admin)):
 
 
 def store_dataset(body,source,actor_id=None,*,download_id=None,download_owner=None):
+    interval=body.get("interval","1m")
+    if interval!="1m":
+        raise HTTPException(422,"仅接受 1 分钟基础 K 线；其他周期由框架合成，请重新下载或导入 1 分钟数据")
     market=body.get("market","futures")
     if market=="perpetual":
         market="futures"
@@ -604,6 +605,9 @@ def store_dataset(body,source,actor_id=None,*,download_id=None,download_owner=No
             except (KeyError,TypeError,ValueError) as exc:
                 raise HTTPException(422,f"{symbol} 的 K 线格式、OHLC 范围或时间唯一性校验失败") from exc
         normalized[symbol].sort(key=lambda r:r["timestamp"])
+        times=[row["timestamp"] for row in normalized[symbol]]
+        if any(t%60000 for t in times) or any(b-a!=60000 for a,b in zip(times,times[1:])):
+            raise HTTPException(422,f"{symbol} 必须是对齐且连续的 1 分钟 K 线，不能将高周期数据标记成 1m；缺口需要补齐")
     id=download_id or db.uid()
     artifact=storage.write_candles(normalized)
     content_hash=artifact["content_sha256"] if download_id else hashlib.sha256(db.dump(normalized).encode()).hexdigest()
@@ -612,7 +616,7 @@ def store_dataset(body,source,actor_id=None,*,download_id=None,download_owner=No
             job=con.execute("SELECT * FROM data_download_jobs WHERE id=? FOR UPDATE",(download_id,)).fetchone()
             if not job or job["status"]!="running" or job["owner"]!=download_owner or job["lease_until"]<=time.time():
                 raise downloads.DownloadLeaseLost("下载任务租约失效，结果未发布")
-        con.execute("INSERT INTO datasets VALUES(?,?,?,?,?,?,?,?,?)",(id,str(body.get("name","导入 K 线")),market,str(body.get("interval","1h")),db.dump(symbols),db.dump(artifact),content_hash,source,db.now()))
+        con.execute("INSERT INTO datasets VALUES(?,?,?,?,?,?,?,?,?)",(id,str(body.get("name","导入 K 线")),market,interval,db.dump(symbols),db.dump(artifact),content_hash,source,db.now()))
         db.audit(con,actor_id,"dataset.create","dataset",id,{"source":source,"count":count,"hash":artifact["content_sha256"]})
         if download_id:
             con.execute("UPDATE data_download_jobs SET status='completed',progress=100,downloaded_bars=?,completed_symbols=total_symbols,current_symbol=NULL,dataset_id=?,active_slot=NULL,lease_until=0,error=NULL,completed_at=?,updated_at=? WHERE id=?",(count,id,db.now(),db.now(),download_id))
@@ -672,6 +676,8 @@ def enqueue_experiment(body, *, persist=True, rules_snapshot=None, actor_id=None
         dataset=con.execute("SELECT * FROM datasets WHERE id=?",(body.get("dataset_id",""),)).fetchone()
     if not dataset:
         raise HTTPException(422,"请选择可用的 K 线数据集")
+    if dataset["interval"]!="1m":
+        raise HTTPException(422,"新回测必须使用 1 分钟基础 K 线；当前为历史高周期数据，请重新下载 1 分钟行情，原实验结果仍可查看")
     if (dataset["market"]=="spot") != (manifest.get("market","futures")=="spot"):
         raise HTTPException(422,"K 线数据市场与策略市场不一致")
     symbols=body.get("symbols",["BTCUSDT"])
@@ -681,11 +687,18 @@ def enqueue_experiment(body, *, persist=True, rules_snapshot=None, actor_id=None
     if not ranges[0]<ranges[1]<=ranges[2]<ranges[3]:
         raise HTTPException(422,"训练集和验证集必须按时间顺序分离，区间采用 [开始,结束) 且不可重叠")
     dataset_candles=storage.read_candles(dataset["candles"], symbols=symbols, start=ranges[0], end=ranges[3])
+    split_times={}
     for symbol in symbols:
         times=[timestamp(c["timestamp"]) for c in dataset_candles[symbol]]
-        for start,end in (ranges[:2],ranges[2:]):
-            if sum(start<=t<end for t in times)<2:
+        for index,(start,end) in enumerate((ranges[:2],ranges[2:])):
+            window=[t for t in times if start<=t<end]
+            if len(window)<2:
                 raise HTTPException(422,f"{symbol} 在选中区间不足 2 根 K 线")
+            if any(t%60000 for t in window) or any(b-a!=60000 for a,b in zip(window,window[1:])):
+                raise HTTPException(422,f"{symbol} 在选中区间不是连续 1 分钟行情，禁止用高周期或缺口数据撮合")
+            if index in split_times and split_times[index]!=window:
+                raise HTTPException(422,"多币种回测必须覆盖相同的完整 1 分钟时间戳，不会取交集丢弃行情")
+            split_times[index]=window
     maker=manifest.get("execution",{}).get("model")=="maker_grid_v1"
     try:
         capital=float(body.get("initial_capital",10000)); fee=float(body.get("fee_rate",.0002 if maker else .0004)); slip=float(body.get("slippage_bps",0 if maker else 2)); seed=int(body.get("seed",42))
@@ -724,9 +737,12 @@ def enqueue_experiment(body, *, persist=True, rules_snapshot=None, actor_id=None
     # Do not copy display fields (id/status/result/provenance) from a cloned
     # experiment into its immutable configuration: they would shadow DB state.
     config={key:body[key] for key in ("name","strategy_id","dataset_id","train_start","train_end","validation_start","validation_end") if key in body}
-    config.update(parameters=params,symbols=symbols,initial_capital=capital,fee_rate=fee,slippage_bps=slip,seed=seed,market=manifest.get("market","futures"),leverage=int(leverage),ranges_ms=ranges,symbol_filters=filters)
+    from .timeframes import normalize_timeframes
+    timeframes=normalize_timeframes(manifest.get("timeframes"))
+    config.update(parameters=params,symbols=symbols,initial_capital=capital,fee_rate=fee,slippage_bps=slip,seed=seed,market=manifest.get("market","futures"),leverage=int(leverage),ranges_ms=ranges,symbol_filters=filters,base_interval="1m",timeframes=timeframes)
     provenance={"strategy_version":manifest.get("version"),"strategy_hash":strategy["source_hash"],"parameters_hash":hashlib.sha256(db.dump(params).encode()).hexdigest(),"data_version":dataset["id"],"data_hash":dataset["sha256"],"engine_version":db.ENGINE_VERSION,"fee_model":{"taker_rate":fee,"source":"manual"},"slippage_model":{"bps":slip,"type":"fixed_adverse"},"seed":seed,"intervals":dict(zip(("train_start","train_end","validation_start","validation_end"),ranges)),"environment":{"python":platform.python_version(),"platform":platform.system()},"source":"synthetic" if dataset["source"]=="synthetic" else "historical"}
     provenance["symbol_filters"]={"source":filters_source,"rules":filters}
+    provenance.update(base_interval="1m",timeframes=timeframes,fill_model="minute_ohlc_inclusive_range_v1",symbol_attribution="equal_initial_capital_shared_execution")
     if maker:
         provenance.update(execution_model="maker_grid_v1",position_mode="hedge",fee_model={"maker_rate":fee,"source":"manual"},slippage_model={"bps":0,"type":"post_only_limit_no_taker_fallback"})
     prepared={"id":db.uid(),"name":str(body.get("name") or manifest.get("name","策略")+" · 参数实验"),"strategy_id":strategy["id"],"dataset_id":dataset["id"],"config":config,"provenance":provenance,"strategy_snapshot":strategy}
@@ -766,13 +782,48 @@ def create_experiment(body:dict,current=Depends(admin)):
     return {"experiments":store_experiments(prepared,actor_id=current["id"])}
 
 
-@app.get("/api/experiments/{experiment_id}")
-def experiment_detail(experiment_id:str,current=Depends(admin)):
+def experiment_row(experiment_id):
     with db.connect() as con:
         row=con.execute("SELECT * FROM experiments WHERE id=?",(experiment_id,)).fetchone()
     if not row:
         raise HTTPException(404,"实验不存在")
-    return experiment_data(row,True)
+    return row
+
+
+@app.get("/api/experiments/{experiment_id}")
+def experiment_detail(experiment_id:str,view:str="full",current=Depends(admin)):
+    row=experiment_row(experiment_id)
+    if view=="interactive":
+        detail=experiment_data(row)
+        raw=db.parse(row["result"],{})
+        detail["detail_pagination"]={kind:{"total":int(raw.get("artifacts",{}).get(kind,{}).get("count",len(raw.get(kind,[])))),"limit":50} for kind in ("orders","decisions")}
+        return detail
+    if view!="full":
+        raise HTTPException(422,"详情视图仅支持 full 或 interactive")
+    return StreamingResponse(storage.stream_report_json(experiment_data(row,preview=False)),media_type="application/json")
+
+
+@app.get("/api/experiments/{experiment_id}/records/{kind}")
+def experiment_records(experiment_id:str,kind:str,offset:int=Query(0,ge=0),limit:int=Query(50,ge=1,le=100),symbol:str=None,split:str=None,current=Depends(admin)):
+    if kind not in {"orders","decisions"}:
+        raise HTTPException(422,"明细类型仅支持 orders 或 decisions")
+    if split not in {None,"train","validation"}:
+        raise HTTPException(422,"明细区间仅支持 train 或 validation")
+    if symbol is not None and kind!="orders":
+        raise HTTPException(422,"策略决策包含全部交易对，请按训练或验证区间筛选")
+    row=experiment_row(experiment_id)
+    result=db.parse(row["result"],{})
+    if symbol is not None and symbol not in db.parse(row["config"],{}).get("symbols",[]):
+        raise HTTPException(422,"交易对不属于该实验")
+    manifest=result.get("artifacts",{}).get(kind)
+    if manifest:
+        total=storage.count_records(manifest,symbol=symbol,split=split)
+        rows=storage.read_records(manifest,offset=offset,limit=limit,symbol=symbol,split=split)
+    else:
+        matches=[item for item in result.get(kind,[]) if (symbol is None or item.get("symbol")==symbol) and (split is None or item.get("split")==split)]
+        total=len(matches)
+        rows=matches[offset:offset+limit]
+    return {"kind":kind,"rows":rows,"total":total,"offset":offset,"limit":limit,"has_more":offset+len(rows)<total}
 
 
 @app.post("/api/experiments/{experiment_id}/cancel")
@@ -799,17 +850,14 @@ def retry_experiment(experiment_id:str,current=Depends(admin)):
 
 @app.get("/api/experiments/{experiment_id}/export")
 def export_experiment(experiment_id:str,format:str="json",current=Depends(admin)):
-    detail=experiment_detail(experiment_id,current)
+    if format not in {"json","csv"}:
+        raise HTTPException(422,"导出格式仅支持 json 或 csv")
+    detail=experiment_data(experiment_row(experiment_id),preview=False)
     if format=="csv":
-        stream=io.StringIO(); writer=csv.writer(stream)
-        writer.writerow(["split","timestamp","equity"])
-        for split,key in (("train","curve"),("validation","validation_curve")):
-            for row in detail[key]:
-                writer.writerow([split,row.get("timestamp",row.get("time")),row.get("equity")])
-        content=stream.getvalue();media="text/csv; charset=utf-8"
+        content=storage.stream_equity_csv(detail);media="text/csv; charset=utf-8"
     else:
-        content=json.dumps(detail,ensure_ascii=False,indent=2);media="application/json"
-    return Response(content,media_type=media,headers={"Content-Disposition":f'attachment; filename="experiment-{experiment_id}.{format if format=="csv" else "json"}"'})
+        content=storage.stream_report_json(detail);media="application/json"
+    return StreamingResponse(content,media_type=media,headers={"Content-Disposition":f'attachment; filename="experiment-{experiment_id}.{format}"'})
 
 
 @app.get("/api/logs")

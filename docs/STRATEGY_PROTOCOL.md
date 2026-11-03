@@ -1,6 +1,6 @@
-# MK Quant 策略接入协议 v1.2
+# MK Quant 策略接入协议 v1.3
 
-协议与引擎版本：`1.2.0`。本文以 `backend/strategy.py`、`backend/engine.py`、`backend/worker.py` 的当前实现为准，适用于开发者及协助编写策略的 AI。未声明执行模型的已有策略继续使用单向市价模型；`maker_grid_v1` 增加双向限价订单簿与逐格保护，不改变旧策略的成交时序。
+协议与引擎版本：`1.3.0`。本文以 `backend/strategy.py`、`backend/engine.py`、`backend/worker.py` 的当前实现为准，适用于开发者及协助编写策略的 AI。未声明执行模型的已有策略继续使用单向市价模型；`maker_grid_v1` 增加双向限价订单簿与逐格保护，新的实验统一使用 1m 成交检查及完整高周期合成；旧实验保留原结果与引擎版本。
 
 策略负责根据已完成的行情生成交易意图。框架负责参数校验、行情对齐、数量及价格规则、资金检查、模拟成交、账本、指标、日志与任务状态。策略不读取 API Key，不连接交易所，不创建线程，也不自行下单。
 
@@ -26,6 +26,7 @@ MANIFEST = {
         "min_capital": 100,
     },
     "history_window": 200,
+    "timeframes": {"primary": "1h", "additional": ["4h"]},
     "parameters": {
         "type": "object",
         "properties": {
@@ -100,7 +101,8 @@ class Strategy:
 | `account` | 是 | 持仓模式、保证金模式、杠杆范围、最低资金，所有字段均须声明。 |
 | `parameters` | 是 | 当前支持的 JSON Schema 子集，必须为 `type: object`。 |
 | `execution` | 否 | 执行模型声明；缺省等同 `{"model": "market_next_open_v1"}`，也可明确声明 `{"model": "maker_grid_v1"}`。 |
-| `history_window` | 否 | 保留的每币种历史长度，整数 1–10000，默认 1000。持续模拟行情目前最多提供 1000 根。 |
+| `history_window` | 否 | 各周期每币历史上限，整数 1–10000，默认 1000。持续模拟首次仅从共享的最多 1000 根分钟缓存预热，后续完整高周期历史随快照积累。 |
+| `timeframes` | 否 | `{primary, additional}`：主周期默认 `1m`，辅助周期默认空列表；全部由连续 1m 合成，详见 7.1。 |
 
 币种约束：
 
@@ -134,20 +136,24 @@ class Strategy:
 
 唯一必需方法为 `on_bar(self, context)`。构造函数如有定义，必须支持无参数实例化。当前没有 `on_tick`、`on_fill`、定时器、订单簿订阅或异步回调协议。
 
-每根已完成的公共时间戳 K 线调用一次。多币种回测取时间戳交集，不向策略补造 K 线；不对齐而被丢弃的根数写入 `assumptions.dropped_unaligned_bars`。`timestamp` 是蜡烛开盘时间标识，调用发生在其 OHLC 已完整可见之后。控制服务统一存储 UTC 毫秒；直接引擎调用也可输入统一的秒时间戳，禁止在同一数据集中混用单位。
+每根完整收盘的主周期 K 线调用一次。基础 1m 必须连续、整分钟对齐且所有交易对时间戳一致，否则回测失败，不取交集丢弃缺失分钟。`timestamp` 是本次决策对应的最后一根执行分钟的开盘时间，`decision_time` 是其收盘边界；合成 K 线自身的 `timestamp` 为该周期开盘时间。所有时间统一使用 UTC 毫秒。
 
 | 上下文键 | 类型与内容 |
 | --- | --- |
 | `params` | 已验证、填充默认值的参数字典。 |
-| `timestamp` | 当前共同 K 线的时间标识。 |
-| `bar_index` | 从 0 开始的本次策略实例计数；不是 Unix 时间。 |
-| `candles` | `{symbol: {timestamp, open, high, low, close, volume}}`，仅含当前完成的 K 线。 |
-| `history` | `{symbol: [bar, ...]}`，时间升序，包含当前 K 线，仅保留 `history_window` 根，不包含未来数据。 |
+| `timestamp` | 本次决策对应执行分钟的开盘时间（UTC 毫秒）。 |
+| `bar_index` | 从 0 开始的主周期回调序号；不是分钟序号或 Unix 时间。 |
+| `candles` | `{symbol: {timestamp, open, high, low, close, volume}}`，仅含当前完整收盘的主周期 K 线。 |
+| `history` | `{symbol: [bar, ...]}`，主周期完整 K 线，时间升序，包含当前已收盘 K 线，最多 `history_window` 根。 |
+| `timeframe_candles` / `timeframe_history` | `{interval: {symbol: bar或bar列表}}`，包含 1m、主周期和辅助周期，只提供完整收盘数据。 |
+| `execution_candles` | 当前基础 1m K 线，用于撮合；与主周期 candles 区别。 |
+| `base_interval` / `signal_interval` | 固定 `1m` / 策略声明的主周期。 |
+| `decision_time` | 当前分钟收盘边界的 UTC 毫秒时间；`timestamp` 保持执行分钟开盘时间。 |
 | `positions` | 当前非零持仓；市价模型键为 symbol，Maker 双向模型键为 `symbol:LONG` / `symbol:SHORT`，空仓键不一定存在。 |
 | `account` | 统一模拟账户快照，结构见下表。 |
 | `open_orders` | 仅 Maker 模型提供：状态为 `NEW` / `PENDING_TRIGGER` 的委托快照；不等于成交列表。 |
 | `lots` | 仅 Maker 模型提供：剩余数量大于 0 的逐格仓位快照，包含关联入场单和保护状态。 |
-| `execution_events` | 仅 Maker 模型提供：执行事件列表。回测提供当前 `process_bar` 产生的事件；持续模拟提供自上次策略事件游标以来的事件。不是实时 `on_fill` 回调。 |
+| `execution_events` | 仅 Maker 模型提供：执行事件列表。回测累积自上次主周期回调以来的撮合事件；持续模拟提供自上次策略事件游标以来的事件。不是实时 `on_fill` 回调。 |
 | `log` | `log(level, message, data=None)`，`level` 使用 `debug` 或 `error`。 |
 | `emit` | `emit(**display_fields)`，输出阶段、指标、原因等扩展展示数据。 |
 
@@ -191,9 +197,9 @@ Maker `lots` 包含 `id` / `lot_id`、`entry_order_id`、`symbol`、`position_si
 
 该模型不会因附加 `price`、`stop_price` 等字段而变成限价/止损执行器；明确声明的非市价订单类型会被拒绝。需要限价语义必须选择 Maker 模型并遵守其订单协议。也不要用返回 `None` 表示空闲。
 
-处理顺序为：上一根意图 → 当前共同 K 线开盘价 → 资金/交易规则检查及模拟成交 → 按当前收盘价盯市 → 调用策略 → 把新意图排入下一根。意图按返回列表顺序执行，因此同根多币种订单会竞争可用资金。最后一根产生的意图标记 `expired`，不使用未来价格补成交。
+处理顺序为：上一主周期信号 → 下一分钟开盘价 → 资金/交易规则及分钟范围检查 → 按当前分钟收盘价盯市 → 更新高周期合成 → 仅在主周期完整收盘时调用策略。意图按返回列表顺序执行，因此同根多币种订单会竞争可用资金。最后一根产生的意图标记 `expired`，不使用未来价格补成交。
 
-数量以 Decimal 向下量化，价格按买入向上、卖出向下对齐 tick；滑点对买卖两边都不利。检查最小数量、最大数量、最小名义金额以及 `LOT_SIZE`/`MARKET_LOT_SIZE` 的共同步长。合约只减仓可按模型豁免最小名义金额；现货卖出仍受最小金额约束，尘埃仓位不会被伪造成已成交。成交并不自动保证所有交易所过滤器都已模拟，例如动态百分比价格限制和盘口流动性尚未实现。
+数量以 Decimal 向下量化，价格按买入向上、卖出向下对齐 tick；滑点对买卖两边都不利。量化/滑点后的价格还须满足该分钟 `low <= price <= high` 且 `volume > 0`，否则记录未成交原因，不截价、不补成交。检查最小数量、最大数量、最小名义金额以及 `LOT_SIZE`/`MARKET_LOT_SIZE` 的共同步长。合约只减仓可按模型豁免最小名义金额；现货卖出仍受最小金额约束，尘埃仓位不会被伪造成已成交。成交并不自动保证所有交易所过滤器都已模拟，例如动态百分比价格限制和盘口流动性尚未实现。
 
 每次成交扣费，增加新风险前按成交滑点和费用后的权益检查保证金；纯减仓仍允许执行。现货卖出后净数量不得小于零。回测结束后保留未平仓头寸，按最后收盘价计权益，不人为创造末尾平仓订单。
 
@@ -231,9 +237,9 @@ Maker `lots` 包含 `id` / `lot_id`、`entry_order_id`、`symbol`、`position_si
 }
 ```
 
-处理顺序为：已存在委托处理当前完整共同 K 线 → 按收盘价估值 → 调用 `on_bar` → 提交本根新意图。新单最早下一根有效；仅触价不成交，买单需 `low < limit`，卖单需 `high > limit`，且该根 `volume > 0`，满足时按限价全量成交。零成交量即使穿价也不成交，但仍可观察到止损触发；没有盘口队列、按成交量分配或部分成交模拟。最后一根新单保留为未成交，不虚构终局平仓。
+处理顺序为：已存在委托处理当前完整共同 1m K 线 → 按分钟收盘价估值 → 更新高周期合成 → 主周期完整收盘时调用 `on_bar` → 提交新意图。新单最早下一分钟有效；买卖单均须满足 `low <= limit <= high` 且该分钟 `volume > 0`，含边界触价，满足时按限价全量成交。跳空后整个分钟范围未触及限价时不成交。零成交量即使触价也不成交，但仍可观察到止损触发；没有盘口队列、按成交量分配或部分成交模拟。最后一根新单保留为未成交，不虚构终局平仓。
 
-入场成交时，执行器同步创建 lot、`LIMIT GTX` 止盈单和 `STOP_LIMIT GTX` 条件止损单，二者最早下一根有效，无需策略再次回调。止损触发的当根只检查并挂出限价单，最早再下一根严格穿价成交；触发参考价为卖单 `min(open, stop_price)`、买单 `max(open, stop_price)`。若该限价会相对参考价立即成交，则拒绝并保留风险，不转市价。无法判断同根止盈/止损先后时优先处理止损，并抑制该 lot 当根的盈利退出；这不等于保证止损成交。
+入场成交时，执行器同步创建 lot、`LIMIT GTX` 止盈单和 `STOP_LIMIT GTX` 条件止损单，二者最早下一根有效，无需策略再次回调。止损触发的当根只检查并挂出限价单，最早再下一分钟触价区间检查通过后成交；触发参考价为卖单 `min(open, stop_price)`、买单 `max(open, stop_price)`。若该限价会相对参考价立即成交，则拒绝并保留风险，不转市价。无法判断同根止盈/止损先后时优先处理止损，并抑制该 lot 当根的盈利退出；这不等于保证止损成交。
 
 lot 全部退出后，执行器取消该 lot 尚存的所有兄弟退出单；手动退出部分 lot 会同步缩减其他退出单数量。这种内部数量调整不是对真实盘口部分成交的建模。保护缺失或止损拒单会停止新增入场委托。止损触发或拒绝本身不撤止盈，止盈在后续 K 线仍可能退出该 lot；不能将这种结果描述为已完成止损。
 
@@ -279,11 +285,11 @@ python -m backend.worker trust-strategy STRATEGY_ID --source-hash SHA256 --accep
 run_backtest(
     strategy_source, params, candles, initial_capital, fee_rate, slippage_bps,
     market="futures", leverage=1, symbol_filters=None,
-    progress=None, cancelled=None,
+    progress=None, cancelled=None, base_interval="1m",
 )
 ```
 
-`candles` 为 `{symbol: [bar, ...]}`，时间必须严格递增且不重复，价格为正、成交量非负，OHLC 范围须一致。`fee_rate=0.0004` 表示 0.04%，`slippage_bps=2` 表示 0.02%。市价模型按 Taker 假设解释费率及不利滑点；Maker 模型按 Maker 费率解释，非零滑点会拒绝运行。`symbol_filters` 为按 symbol 索引的规则快照，包括 `tick_size`、`step_size`、`min_qty`、`max_qty`、`min_notional` 等。
+`candles` 为 `{symbol: [bar, ...]}`，基础周期只允许 1m，开盘时间须对齐整分钟，各币时间戳相同且连续；缺口、粗周期和重复数据会明确失败。价格为正、成交量非负，OHLC 范围须一致。`fee_rate=0.0004` 表示 0.04%，`slippage_bps=2` 表示 0.02%。市价模型按 Taker 假设解释费率及不利滑点；Maker 模型按 Maker 费率解释，非零滑点会拒绝运行。`symbol_filters` 为按 symbol 索引的规则快照，包括 `tick_size`、`step_size`、`min_qty`、`max_qty`、`min_notional` 等。
 
 返回 `metrics`、`equity`、`orders`、`decisions`、`positions`、`account`、`parameters`、`engine_version`、`status`、`assumptions`。`equity` 每点包含 `timestamp/equity/drawdown/margin_used/unrealized_pnl`。`orders` 是实际完成的模拟成交记录，不把被拒绝的意图记为成交。Maker 结果另含 `open_orders`、`lots`、完整 `events` 和可恢复 `order_book`；曲线另含 `pending_margin`，成交带 `lot_id/role/client_order_id/order_type/time_in_force/liquidity`。`liquidity="simulated_maker"` 明确表示模型假设。
 
@@ -293,7 +299,15 @@ run_backtest(
 
 控制服务的实验绑定策略版本/源码哈希、参数哈希、数据 ID/内容哈希、引擎版本、费率/滑点、交易规则快照、种子、区间及 Python/系统环境。直接 `run_split_backtest` 也返回 `reproducibility` 哈希与区间信息。种子用于固定演示数据/执行环境，不意味着可以导入不受控随机模块。`generate_demo_candles` 生成确定性合成数据，必须始终标注为合成数据。
 
-当前持续模拟固定使用完整 1 分钟 K 线。市价模型沿用下一根开盘撮合；Maker 模型使用与回测相同的订单簿、双向账本和严格穿价时序。行情轮询得到闭合蜡烛后才补记该根的模拟结果，不是盘口实时撮合。行情断档超过 1 分钟会废弃市价待执行意图或撤销 Maker 入场挂单；Maker 保留退出单并明确记录缺失期间无法重建的风险。行情缓存或最后完整 K 线过期时禁止开仓。历史数据若选 1 小时周期，不能直接把收益或止损时效与 1 分钟模拟视作同条件对照。
+持续模拟使用与回测相同的 1m 区间撮合和高周期合成。聚合状态与完整历史随账户快照持久保存，不随共享分钟缓存滚动而丢失。初次从缓存预热，历史不足时策略继续等待；不会重放缓存中的历史交易。行情轮询得到闭合蜡烛后才补记该根的模拟结果，不是盘口实时撮合。行情断档超过 1 分钟会废弃市价待执行意图或撤销 Maker 入场挂单；Maker 保留退出单并明确记录缺失期间无法重建的风险。行情缓存或最后完整 K 线过期时禁止开仓。未完成的高周期桶在缺口后作废；下一完整桶可以恢复决策，不能用前后分钟拼出虚假连续 K 线。
+
+### 7.1 周期声明与每币归因
+
+`MANIFEST.timeframes = {"primary":"1h", "additional":["4h","1d"]}`；省略时主周期默认为 1m、辅助周期为空。支持 1/3/5/15/30m、1/2/4/6/8/12h、1/3d、1w，最多 8 个不重复辅助周期。按 UTC 桶聚合 open 首值、high 最大、low 最小、close 末值、volume 求和；周线从 UTC 周一开始。开头/末尾不足整桶的数据只参与分钟撮合和估值，不作为策略高周期输入。`bar_index` 是主周期回调序号。
+
+新回测返回 `symbol_results[symbol] = {metrics,equity,account,orders}`，进度另含 `symbol_equity`。API 按训练/验证组织为 `{metrics,validation_metrics,curve,validation_curve,differences,allocation}`；大曲线与汇总一起保存在 curve/validation_curve Parquet 中，使用 symbol 区分。初始资本按交易对等分，单币权益为本币初始归因资本加该币净已实现收益、浮动盈亏；各币权益/成交数可加总核对汇总，PF、胜率、回撤、夏普等比率不能直接相加。共享资金与风控仍按组合执行，不等于独立单币策略绩效。旧实验无此数据时显示未记录，必须重跑才能生成。
+
+页面详情使用 `GET /api/experiments/{id}?view=interactive`：完整统计、有界极值曲线预览及 `detail_pagination`。`GET /api/experiments/{id}/records/{orders|decisions}?offset=0&limit=20` 按需分页，服务端每页最多 100 条。默认详情与完整 JSON 报告保留全量合同，完整 JSON/CSV 以流式读取输出，CSV 包含 `TOTAL` 及各交易对的训练/验证权益；预览不得作为重新计算完整指标的数据源。
 
 ## 8. 指标定义与边界
 

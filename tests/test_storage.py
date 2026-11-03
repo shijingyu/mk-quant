@@ -1,4 +1,7 @@
 import copy
+import csv
+import io
+import json
 from pathlib import Path
 
 import pytest
@@ -92,3 +95,77 @@ def test_result_files_retain_full_decisions_while_summary_stays_bounded(artifact
         assert restored[key] == original[key]
     assert storage.read_records(stored["artifacts"]["decisions"], offset=999, limit=2) == original["decisions"][999:1001]
     assert original == snapshot
+
+
+def test_symbol_curves_share_files_and_restore_without_mixing_portfolio(artifact_root):
+    a=[{"timestamp":1788220800000+i*60000,"equity":500+(i%31)} for i in range(2000)]
+    b=[{"timestamp":p["timestamp"],"equity":500-(i%17)} for i,p in enumerate(a)]
+    total=[{"timestamp":x["timestamp"],"equity":x["equity"]+y["equity"]} for x,y in zip(a,b)]
+    original={"curve":total,"validation_curve":list(reversed(total)),"metrics":{"initial_equity":1000},"orders":[],"decisions":[],
+              "symbol_results":{symbol:{"metrics":{"initial_equity":500},"validation_metrics":{"initial_equity":500},
+                  "curve":curve,"validation_curve":list(reversed(curve)),"allocation":{"method":"equal_initial_capital","initial_capital":500}}
+                  for symbol,curve in (("BTCUSDT",a),("ETHUSDT",b))}}
+    snapshot=copy.deepcopy(original)
+    stored=storage.store_result(original)
+    assert set(stored["artifacts"])==set(storage.SERIES)
+    assert stored["artifacts"]["curve"]["count"]==6000
+    assert all(len(value["curve"])<=600 for value in stored["symbol_results"].values())
+    records=storage.read_records(stored["artifacts"]["curve"])
+    assert {row["symbol"] for row in records}=={"","BTCUSDT","ETHUSDT"}
+    restored=storage.load_result(stored,detail=True)
+    assert restored["curve"]==total
+    for symbol in original["symbol_results"]:
+        assert restored["symbol_results"][symbol]==original["symbol_results"][symbol]
+    preview=storage.result_preview(original)
+    assert all(len(value["curve"])<=600 for value in preview["symbol_results"].values())
+    assert original==snapshot
+
+
+def test_stream_report_keeps_full_portfolio_and_symbol_results(artifact_root):
+    curve=[{"timestamp":i*60000,"equity":1000+i,"margin_used":0} for i in range(1200)]
+    part=[{**point,"equity":point["equity"]/2} for point in curve]
+    original={"curve":curve,"validation_curve":curve,"orders":[{"symbol":"BTCUSDC","split":"train"}],
+              "decisions":[{"timestamp":i,"inputs":{"BTCUSDC":{"close":100}},"reason":"等待完整分钟"} for i in range(500)],
+              "metrics":{"profit_factor":None},"symbol_results":{symbol:{"curve":part,"validation_curve":part,"metrics":{"initial_equity":500}} for symbol in ("BTCUSDC","ETHUSDC")}}
+    stored=storage.store_result(original)
+    snapshot=copy.deepcopy(stored)
+    chunks=list(storage.stream_report_json(stored))
+    restored=json.loads("".join(chunks))
+    assert len(chunks)>1
+    assert all(restored[k]==original[k] for k in original)
+    assert restored["curve_sampling"]=="full_resolution"
+    assert stored==snapshot
+    # A legacy report with inline arrays follows the same streaming contract.
+    assert json.loads("".join(storage.stream_report_json(original)))==original
+
+
+def test_paginated_records_filter_before_offset_and_csv_ignores_decisions(artifact_root):
+    orders=[{"timestamp":i,"symbol":"BTCUSDC" if i%2 else "ETHUSDC","split":"train" if i<6 else "validation"} for i in range(10)]
+    stored=storage.store_result({"curve":[{"timestamp":0,"equity":100}],"validation_curve":[],"orders":orders,"decisions":[{"reason":"test"}]})
+    manifest=stored["artifacts"]["orders"]
+    assert storage.count_records(manifest,symbol="BTCUSDC",split="train")==3
+    assert storage.read_records(manifest,symbol="BTCUSDC",split="train",offset=1,limit=1)==[orders[3]]
+    assert storage.read_records(manifest,offset=100,limit=10)==[]
+    (artifact_root/stored["artifacts"]["decisions"]["path"]).unlink()
+    rows=list(csv.DictReader(io.StringIO("".join(storage.stream_equity_csv(stored)))))
+    assert rows==[{"split":"train","timestamp":"0","equity":"100","symbol":"TOTAL"}]
+    with pytest.raises(storage.ArtifactError,match="缺失"):
+        storage.stream_report_json(stored)
+
+
+def test_aborted_report_stream_closes_active_artifact_iterator(artifact_root,monkeypatch):
+    stored=storage.store_result({"orders":[{"symbol":"BTCUSDC"}]})
+    closed=[]
+    count=[0]
+    def rows(*args,**kwargs):
+        try:
+            for i in range(10000):
+                count[0]+=1
+                yield json.dumps({"i":i,"reason":"a"*1024})
+        finally:
+            closed.append(True)
+    monkeypatch.setattr(storage,"_iter_payloads",rows)
+    stream=storage.stream_report_json(stored)
+    next(stream)
+    stream.close()
+    assert closed==[True] and count[0]<100

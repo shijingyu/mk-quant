@@ -94,19 +94,19 @@ def test_pending_orders_reserve_margin_and_release_on_cancel():
     assert b.ledger.account()["available"] == pytest.approx(1.802)
 
 
-def test_next_bar_strict_cross_and_bracket_no_same_entry_bar_exit():
+def test_next_minute_inclusive_touch_and_bracket_no_same_entry_bar_exit():
     b = book()
     b.submit(entry(), 0, {SYMBOL: 100})
     b.process_bar(bar(0, high=120, low=80))
     assert not b.ledger.orders
     b.process_bar(bar(1, low=99))
-    assert not b.ledger.orders  # Merely touching a resting limit is not a fill.
-    b.process_bar(bar(2, high=120, low=80))
+    assert len(b.ledger.orders) == 1  # Inclusive minute range is the declared model.
+    b.process_bar(bar(2, high=105, low=95))
     assert len(b.ledger.orders) == 1
     assert b.ledger.orders[0]["price"] == 99
     assert len(b.open_orders()) == 2
     assert b.lot_snapshot()[0]["protection_status"] == "protected"
-    assert all(o["eligible_after"] == 2 for o in b.open_orders())
+    assert all(o["eligible_after"] == 1 for o in b.open_orders())
 
 
 def test_zero_volume_cannot_fill_entry_or_triggered_stop():
@@ -152,9 +152,9 @@ def test_stop_first_ambiguous_bar_and_next_bar_stop_limit_eligibility():
     assert b.orders["e:sl"]["triggered"] is True
     assert b.lot_snapshot()[0]["protection_status"] == "stop_triggered"
     assert any(e["type"] == "AMBIGUOUS_EXIT_DEFERRED" for e in b.events)
-    b.process_bar(bar(3, opening=89, high=90.1, low=88, close=89))
+    b.process_bar(bar(3, opening=89, high=90, low=88, close=89))
     assert len(b.ledger.orders) == 1
-    b.process_bar(bar(4, opening=89, high=91, low=88, close=90))
+    b.process_bar(bar(4, opening=89, high=90.1, low=88, close=90))
     assert len(b.ledger.orders) == 2
     assert b.ledger.orders[-1]["role"] == "sl"
     assert b.ledger.orders[-1]["closed_trade_pnl"] == pytest.approx(-8.9)
@@ -257,7 +257,7 @@ def test_flatten_is_passive_idempotent_and_never_claims_closed_before_fill():
     assert b.has_open_positions()
     assert b.lot_snapshot()[0]["protection_status"] == "flattening"
     assert b.orders["e:tp"]["status"] == b.orders["e:sl"]["status"] == "CANCELED"
-    b.process_bar(bar(2, high=100.1, low=99))
+    b.process_bar(bar(2, high=100, low=99))
     assert b.has_open_positions()
     b.process_bar(bar(3, high=100.2, low=99))
     assert not b.has_open_positions()
@@ -308,7 +308,7 @@ def test_backtest_uses_same_book_contract_and_reports_assumptions_and_orders():
     assert result["order_book"]["orders"]["e:sl"]["status"] == "CANCELED"
     assert result["assumptions"]["execution"] == "maker_grid_v1"
     assert result["assumptions"]["real_bid_ask_queue_available"] is False
-    assert result["engine_version"] == "1.2.0"
+    assert result["engine_version"] == "1.3.0"
     assert [event for decision in result["decisions"] for event in decision["execution_events"]] == result["events"]
     assert any(event["type"] == "ORDER_ACCEPTED" for event in result["decisions"][0]["execution_events"])
     json.dumps(result, allow_nan=False)
@@ -318,7 +318,7 @@ def test_backtest_uses_same_book_contract_and_reports_assumptions_and_orders():
 
 def test_last_bar_signal_stays_unfilled_and_no_terminal_liquidation_is_invented():
     code = source().replace("== 0", "== 1")
-    candles = {SYMBOL: [bar(100 + i)[SYMBOL] for i in range(2)]}
+    candles = {SYMBOL: [bar(1735689600000 + i*60000)[SYMBOL] for i in range(2)]}
     result = run_backtest(code, {}, candles, 1000, 0, 0, symbol_filters=RULES)
     assert not result["orders"]
     assert result["open_orders"][0]["status"] == "NEW"

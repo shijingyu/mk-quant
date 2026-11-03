@@ -61,9 +61,9 @@ def normalize_config(body):
     symbols = body.get("symbols", [])
     if not isinstance(symbols, list) or not 1 <= len(symbols) <= 10 or any(not isinstance(s, str) or not re.fullmatch(r"[A-Z0-9]{4,32}", s) or not s.endswith(("USDT", "USDC")) for s in symbols) or len(set(symbols)) != len(symbols):
         raise ValueError("单次选择 1–10 个不重复的 USDT / USDC 交易对")
-    interval = body.get("interval", "1h")
-    if not isinstance(interval,str) or interval not in BinanceClient.INTERVALS:
-        raise ValueError("不支持该 K 线周期")
+    interval = body.get("interval", "1m")
+    if interval != "1m":
+        raise ValueError("仅支持下载 1 分钟 K 线；其他策略周期由完整 1 分钟行情合成")
     start = _timestamp(body.get("start", body.get("start_date")))
     end = min(_timestamp(body.get("end", body.get("end_date"))), int(time.time() * 1000))
     if start < 0 or start >= end:
@@ -192,6 +192,8 @@ def run(identity, owner):
         previous_alarm = signal.signal(signal.SIGALRM,timed_out)
         signal.alarm(timeout_seconds())
     try:
+        if config.get("interval") != "1m":
+            raise ValueError("旧下载任务不是 1 分钟周期，请重新提交 1 分钟行情下载")
         client = BinanceClient(market=config["market"])
         total = len(config["symbols"])
         for index, symbol in enumerate(config["symbols"]):

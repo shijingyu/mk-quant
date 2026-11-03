@@ -80,7 +80,7 @@ export function displayBeijingTimes(value, key = "") {
       ]),
     );
   if (
-    /^(timestamp|time|train_start|train_end|validation_start|validation_end)$|(_timestamp|_at)$/.test(
+    /^(timestamp|time|decision_time|close_time|train_start|train_end|validation_start|validation_end)$|(_timestamp|_at)$/.test(
       key,
     )
   ) {

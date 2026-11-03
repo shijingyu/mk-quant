@@ -1,12 +1,12 @@
-"""Deterministic, bar-based execution shared by strategy experiments.
+"""Deterministic minute-based execution shared by strategy experiments.
 
-Legacy market signals fill at the *next* common timestamp's open. An explicit
+Market signals fill at the next minute's open subject to the minute range. An explicit
 ``execution.model='maker_grid_v1'`` instead selects the persistent hedge/lot
-order book: resting GTX limits, contingent GTX stop-limits, strict penetration
-and conservative later-bar eligibility. OHLC never establishes real maker
+order book: resting GTX limits, contingent GTX stop-limits, inclusive low/high
+range checks and conservative later-minute eligibility. OHLC never establishes real maker
 queue priority, intrabar price ordering or liquidity.
 No terminal close is invented: final positions remain marked at the last close.
-Bars are intersected across symbols, fees are charged on every fill and Decimal
+All symbols require identical continuous minute timestamps. Fees are charged on every fill and Decimal
 arithmetic enforces tick/quantity filters. Market fills use adverse fixed
 slippage; this model does not simulate order books, funding, borrowing or
 exchange liquidation. Those omissions are returned in ``assumptions``.
@@ -29,9 +29,10 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 
 from .strategy import load_strategy, validate_parameters, validate_strategy_source, validate_symbols
+from .timeframes import MINUTE_MS, MinuteFrames
 
 
-ENGINE_VERSION = "1.2.0"
+ENGINE_VERSION = "1.3.0"
 ZERO = Decimal("0")
 ONE = Decimal("1")
 
@@ -103,9 +104,14 @@ def _prepare_candles(candles):
             clean[timestamp] = bar
             previous = timestamp
         prepared[symbol] = clean
-    timestamps = sorted(set.intersection(*(set(rows) for rows in prepared.values())))
+    timestamp_sets = [set(rows) for rows in prepared.values()]
+    if any(times != timestamp_sets[0] for times in timestamp_sets[1:]):
+        raise ValueError("多交易对必须具有相同完整的 1 分钟数据，不能丢弃不对齐 K 线")
+    timestamps = sorted(timestamp_sets[0])
     if len(timestamps) < 2:
         raise ValueError("所有交易对至少需要两根共同时间戳的 K 线")
+    if any(stamp % MINUTE_MS for stamp in timestamps) or any(right-left!=MINUTE_MS for left,right in zip(timestamps,timestamps[1:])):
+        raise ValueError("回测基础 K 线必须为连续、对齐的 1 分钟数据；请重新下载 1 分钟 K 线")
     return prepared, timestamps
 
 
@@ -184,6 +190,8 @@ class Ledger:
         self.orders = []
         self.closed_pnls = []
         self.fees = ZERO
+        self.symbol_realized = {}
+        self.symbol_fees = {}
 
     def unrealized(self):
         return sum(((self.prices[symbol.split(":")[0]] - position.average_price) * position.quantity
@@ -222,7 +230,9 @@ class Ledger:
                 "pending_fees": str(self.pending_fees), "fees": str(self.fees),
                 "positions": {key: {"quantity": str(p.quantity), "average_price": str(p.average_price), "entry_fees": str(p.entry_fees)} for key, p in self.positions.items()},
                 "prices": {key: str(value) for key, value in self.prices.items()},
-                "orders": copy.deepcopy(self.orders), "closed_pnls": [str(v) for v in self.closed_pnls]}
+                "orders": copy.deepcopy(self.orders), "closed_pnls": [str(v) for v in self.closed_pnls],
+                "symbol_realized": {s:str(v) for s,v in self.symbol_realized.items()},
+                "symbol_fees": {s:str(v) for s,v in self.symbol_fees.items()}}
 
     @classmethod
     def load(cls, state):
@@ -235,9 +245,17 @@ class Ledger:
         obj.prices = {key: _decimal(value) for key, value in state["prices"].items()}
         obj.orders = copy.deepcopy(state["orders"])
         obj.closed_pnls = [_decimal(v) for v in state["closed_pnls"]]
+        for key,field in (("symbol_realized","realized_pnl"),("symbol_fees","fee")):
+            if key in state:
+                setattr(obj,key,{s:_decimal(v) for s,v in state[key].items()})
+            else:
+                values={}
+                for order in obj.orders:
+                    values[order["symbol"]]=values.get(order["symbol"],ZERO)+_decimal(order.get(field,0))
+                setattr(obj,key,values)
         return obj
 
-    def execute(self, intent, timestamp, filters, slippage, signal_timestamp, *, fill_price=None, fee_rate=None, lot_basis=None):
+    def execute(self, intent, timestamp, filters, slippage, signal_timestamp, *, fill_price=None, fee_rate=None, lot_basis=None, execution_bar=None):
         # Legacy market execution must never silently reinterpret conditional or limit orders.
         if str(intent.get("type", "MARKET")).upper() != "MARKET":
             return "当前市价执行器不接受 LIMIT/STOP；请声明 maker_grid_v1 并使用订单簿"
@@ -290,6 +308,12 @@ class Ledger:
         price = _quantize(raw_price, rule["tick_size"], ROUND_CEILING if side == "buy" else ROUND_FLOOR)
         if price <= 0:
             return "成交价格量化后不大于零"
+        if execution_bar is not None:
+            low, high = _decimal(execution_bar["low"]), _decimal(execution_bar["high"])
+            if not low <= price <= high:
+                return "量化及滑点后的成交价不在当前 1 分钟 K 线最低价与最高价之间，未成交"
+            if _decimal(execution_bar.get("volume", 0)) <= 0:
+                return "当前 1 分钟 K 线成交量为零，未成交"
         notional = quantity * price
         if notional < rule["min_notional"] and not (self.market == "futures" and intent.get("reduce_only")):
             return "委托名义金额小于交易对最小金额"
@@ -312,6 +336,8 @@ class Ledger:
         closed_net = gross - allocated_entry_fee - closing_fee
         self.balance += gross - fee
         self.fees += fee
+        self.symbol_realized[symbol] = self.symbol_realized.get(symbol,ZERO) + gross - fee
+        self.symbol_fees[symbol] = self.symbol_fees.get(symbol,ZERO) + fee
         if closing:
             self.closed_pnls.append(closed_net)
         remaining_old = abs(old_quantity) - closing
@@ -346,10 +372,11 @@ class Ledger:
 class MakerOrderBook:
     """Durable conservative OHLC maker simulation, not a real bid/ask queue.
 
-    Close-generated LIMITs rest from the next bar. A touch never fills. Bracket
-    children rest only after their entry bar; a triggered STOP_LIMIT also waits
-    a complete bar boundary. Stop precedence suppresses a same-lot TP whenever
-    the bar cannot establish which happened first. There is no taker fallback.
+    Close-generated LIMITs rest from the next minute and fill only within that
+    minute's inclusive low/high range. Bracket children rest only after their
+    entry minute; a triggered STOP_LIMIT also waits for the next minute. Stop
+    precedence suppresses a same-lot TP whenever OHLC cannot establish which
+    happened first. There is no taker fallback or real liquidity guarantee.
     """
 
     OPEN = {"NEW", "PENDING_TRIGGER"}
@@ -742,7 +769,7 @@ class MakerOrderBook:
                 self.cancel_entries(timestamp, "止损 GTX 被拒，停止继续开仓")
             else:
                 order["status"] = "NEW"
-                self._event("STOP_LIMIT_RESTING", timestamp, order, reason="触发 bar 不撮合，最早下一 bar 严格穿价成交")
+                self._event("STOP_LIMIT_RESTING", timestamp, order, reason="触发 bar 不撮合，最早下一分钟价格落在高低价范围内成交")
         eligible.sort(key=lambda o: (0 if o["role"] == "sl" else 1 if o["reduce_only"] else 2, o["submitted_at"], o["id"]))
         for order in eligible:
             if order["status"] != "NEW" or order["eligible_after"] >= timestamp:
@@ -751,10 +778,10 @@ class MakerOrderBook:
                 self._event("AMBIGUOUS_EXIT_DEFERRED", timestamp, order, reason="同一 bar 触发止损，不能凭未知先后假设止盈")
                 continue
             bar, price = clean[order["symbol"]], _decimal(order["price"])
-            crossed = bar["low"] < price if order["side"] == "buy" else bar["high"] > price
+            crossed = bar["low"] <= price <= bar["high"]
             if crossed:
                 if bar["volume"] == 0:
-                    self._event("ZERO_VOLUME_FILL_SKIPPED", timestamp, order, reason="完整 K 线成交量为零，严格穿价也不模拟成交")
+                    self._event("ZERO_VOLUME_FILL_SKIPPED", timestamp, order, reason="完整 K 线成交量为零，即使触价也不模拟成交")
                     continue
                 if order["role"] == "sl":
                     suppressed_tp_lots.add(order["lot_id"])
@@ -842,14 +869,72 @@ def calculate_metrics(equity, orders, initial_capital, *, closed_pnls=None, acco
     }
 
 
+class SymbolAttribution:
+    """Attribute one shared execution ledger; never rerun a multi-coin strategy."""
+    def __init__(self,ledger,symbols):
+        self.ledger=ledger
+        self.symbols=sorted(symbols)
+        part=ledger.initial/len(self.symbols)
+        self.initial={symbol:part for symbol in self.symbols}
+        self.initial[self.symbols[-1]]=ledger.initial-part*(len(self.symbols)-1)
+        self.curves={symbol:[] for symbol in self.symbols}
+        self.peaks=dict(self.initial)
+
+    def account(self,symbol,book=None):
+        ledger=self.ledger
+        positions=[p for key,p in ledger.positions.items() if key.split(":")[0]==symbol]
+        price=ledger.prices.get(symbol,ZERO)
+        unrealized=sum(((price-p.average_price)*p.quantity for p in positions),ZERO)
+        margin=sum((abs(p.quantity)*price/ledger.leverage for p in positions),ZERO)
+        realized=ledger.symbol_realized.get(symbol,ZERO)
+        balance=self.initial[symbol]+realized
+        equity=balance+unrealized
+        pending_margin=pending_fee=ZERO
+        if book is not None:
+            for key in book._active_order_ids:
+                order=book.orders[key]
+                if order["symbol"]==symbol and not order["reduce_only"]:
+                    notional=_decimal(order["quantity"])*_decimal(order["price"])
+                    pending_margin+=notional/ledger.leverage
+                    pending_fee+=notional*book.maker_fee_rate
+        return {"initial_equity":_float(self.initial[symbol]),"balance":_float(balance),"equity":_float(equity),
+                "realized_pnl":_float(realized),"unrealized_pnl":_float(unrealized),"margin_used":_float(margin),
+                "pending_margin":_float(pending_margin),"pending_fee_reserve":_float(pending_fee),
+                "available":_float(max(ZERO,equity-margin-pending_margin-pending_fee)),
+                "total_fees":_float(ledger.symbol_fees.get(symbol,ZERO)),"capital_is_virtual_allocation":True}
+
+    def append(self,timestamp,book=None):
+        for symbol in self.symbols:
+            account=self.account(symbol,book)
+            equity=_decimal(account["equity"])
+            peak=max(self.peaks[symbol],equity)
+            self.peaks[symbol]=peak
+            self.curves[symbol].append({"timestamp":timestamp,"equity":account["equity"],
+                "drawdown":_float((peak-equity)/peak) if peak>0 else 0,
+                "margin_used":account["margin_used"],"pending_margin":account["pending_margin"],
+                "unrealized_pnl":account["unrealized_pnl"]})
+
+    def result(self,book=None):
+        results={}
+        for symbol in self.symbols:
+            account=self.account(symbol,book)
+            orders=[copy.deepcopy(order) for order in self.ledger.orders if order["symbol"]==symbol]
+            results[symbol]={"metrics":calculate_metrics(self.curves[symbol],orders,self.initial[symbol],account=account),
+                "equity":self.curves[symbol],"account":account,"orders":orders,
+                "allocation":{"method":"equal_initial_capital","initial_capital":_float(self.initial[symbol])}}
+        return results
+
+
 def run_backtest(strategy_source, params, candles, initial_capital, fee_rate, slippage_bps,
-                 market="futures", leverage=1, symbol_filters=None, progress=None, cancelled=None):
+                 market="futures", leverage=1, symbol_filters=None, progress=None, cancelled=None, *, base_interval="1m"):
     """Run a fresh deterministic strategy with optional batched progress callback.
 
     ``progress({processed,total,status,equity:[new points]})`` marks intermediate
     results as running; full metrics are computed only after every bar. A true
     ``cancelled()`` raises BacktestCancelled and does not return partial metrics.
     """
+    if base_interval != "1m":
+        raise ValueError("新回测只接受 1 分钟基础 K 线；其他策略周期由分钟线合成")
     manifest = validate_strategy_source(strategy_source)
     parameters = validate_parameters(manifest, params)
     maker = manifest.get("execution", {}).get("model") == "maker_grid_v1"
@@ -884,7 +969,8 @@ def run_backtest(strategy_source, params, candles, initial_capital, fee_rate, sl
     filters = {symbol: _filters_for(symbol, symbol_filters) for symbol in symbols}
     strategy = load_strategy(strategy_source)
     ledger = Ledger(initial, market, lev, fees)
-    histories = {symbol: [] for symbol in symbols}
+    frames = MinuteFrames(symbols, manifest["timeframes"], manifest["history_window"])
+    attribution = SymbolAttribution(ledger, symbols)
     curve, decisions, pending = [], [], []
     peak = initial
     batch_start = 0
@@ -895,17 +981,14 @@ def run_backtest(strategy_source, params, candles, initial_capital, fee_rate, sl
         bars = {symbol: prepared[symbol][timestamp] for symbol in symbols}
         ledger.prices = {symbol: _decimal(bar["open"]) for symbol, bar in bars.items()}
         for intent, decision_index, signal_timestamp in pending:
-            reason = ledger.execute(intent, timestamp, filters, slippage, signal_timestamp)
+            reason = ledger.execute(intent, timestamp, filters, slippage, signal_timestamp, execution_bar=bars.get(intent.get("symbol")))
             decisions[decision_index]["risk"].append({"symbol": intent.get("symbol"),
                 "status": "rejected" if reason else "accepted", "reason": reason or "通过资金、市场和交易精度检查",
                 "execution_timestamp": timestamp, "order_id": None if reason else ledger.orders[-1]["id"]})
             decisions[decision_index]["status"] = "executed"
         pending = []
         ledger.prices = {symbol: _decimal(bar["close"]) for symbol, bar in bars.items()}
-        for symbol, bar in bars.items():
-            histories[symbol].append(bar)
-            if len(histories[symbol]) > manifest["history_window"]:
-                histories[symbol].pop(0)
+        ready = frames.push(bars)
         net_asset = ledger.equity()
         peak = max(peak, net_asset)
         curve.append({"timestamp": timestamp, "equity": _float(net_asset),
@@ -921,28 +1004,29 @@ def run_backtest(strategy_source, params, candles, initial_capital, fee_rate, sl
         def emit(**fields):
             display.update(_json_safe(fields))
 
-        context = {"params": copy.deepcopy(parameters), "candles": copy.deepcopy(bars),
-                   "history": copy.deepcopy(histories), "positions": ledger.position_snapshot(),
-                   "account": ledger.account(), "timestamp": timestamp, "bar_index": index,
-                   "log": log, "emit": emit}
-        intents = strategy.on_bar(context)
-        if not isinstance(intents, list) or len(intents) > 1000 or any(not isinstance(item, dict) for item in intents):
-            raise ValueError("on_bar 必须返回最多 1000 项的委托字典列表；无交易时返回 []")
-        intents = _json_safe(intents)
-        decision = {"timestamp": timestamp, "status": "pending" if intents else "no_trade",
-                    "inputs": {symbol: dict(bar) for symbol, bar in bars.items()},
-                    "account": ledger.account(), "indicators": display.get("indicators", {}),
-                    "stage": display.get("stage", ""), "reason": display.get("reason", "无交易信号"),
-                    "display": display, "intents": intents, "risk": [], "logs": logs}
-        decisions.append(decision)
-        if index < len(timestamps) - 1:
-            pending = [(intent, len(decisions) - 1, timestamp) for intent in intents]
-        elif intents:
-            decision["status"] = "expired"
-            decision["risk"] = [{"symbol": item.get("symbol"), "status": "not_executed", "reason": "区间结束，没有下一根 K 线"} for item in intents]
+        if ready:
+            context = {**frames.context(), "params": copy.deepcopy(parameters), "positions": ledger.position_snapshot(),
+                       "account": ledger.account(), "log": log, "emit": emit}
+            intents = strategy.on_bar(context)
+            if not isinstance(intents, list) or len(intents) > 1000 or any(not isinstance(item, dict) for item in intents):
+                raise ValueError("on_bar 必须返回最多 1000 项的委托字典列表；无交易时返回 []")
+            intents = _json_safe(intents)
+            decision = {"timestamp": timestamp, "decision_time":timestamp+MINUTE_MS, "signal_interval":manifest["timeframes"]["primary"],
+                        "status": "pending" if intents else "no_trade", "inputs": copy.deepcopy(context["candles"]),
+                        "execution_inputs":copy.deepcopy(bars), "account": ledger.account(), "indicators": display.get("indicators", {}),
+                        "stage": display.get("stage", ""), "reason": display.get("reason", "无交易信号"),
+                        "display": display, "intents": intents, "risk": [], "logs": logs}
+            decisions.append(decision)
+            if index < len(timestamps) - 1:
+                pending = [(intent, len(decisions) - 1, timestamp) for intent in intents]
+            elif intents:
+                decision["status"] = "expired"
+                decision["risk"] = [{"symbol": item.get("symbol"), "status": "not_executed", "reason": "区间结束，没有下一根 1 分钟 K 线"} for item in intents]
+        attribution.append(timestamp)
         if progress and ((index + 1) % batch_size == 0 or index == len(timestamps) - 1):
             progress({"processed": index + 1, "total": len(timestamps),
-                      "status": "running", "equity": copy.deepcopy(curve[batch_start:])})
+                      "status": "running", "equity": copy.deepcopy(curve[batch_start:]),
+                      "symbol_equity":{symbol:copy.deepcopy(rows[batch_start:]) for symbol,rows in attribution.curves.items()}})
             batch_start = index + 1
     metrics = calculate_metrics(curve, ledger.orders, initial, closed_pnls=ledger.closed_pnls, account=ledger.account())
     if progress:
@@ -950,8 +1034,12 @@ def run_backtest(strategy_source, params, candles, initial_capital, fee_rate, sl
     dropped = {symbol: len(prepared[symbol]) - len(timestamps) for symbol in symbols}
     return {"metrics": metrics, "equity": curve, "orders": ledger.orders, "decisions": decisions,
             "positions": ledger.position_snapshot(), "account": ledger.account(),
+            "symbol_results": attribution.result(),
             "engine_version": ENGINE_VERSION, "status": "completed", "parameters": parameters,
-            "assumptions": {"execution": "signal_at_close_fill_next_common_open",
+            "assumptions": {"execution": "closed_primary_signal_fill_next_1m_open_within_inclusive_high_low",
+                "base_interval":"1m", "timeframes":manifest["timeframes"],
+                "higher_timeframe_buckets":"UTC_aligned_complete_minutes_only",
+                "symbol_attribution":"equal_initial_capital_shared_execution_not_independent_reruns",
                 "fee_rate": float(fees), "slippage_bps": float(slippage_bps), "funding_included": False,
                 "liquidation_simulated": False, "order_book_simulated": False,
                 "margin_model": "cash" if market == "spot" else "cross_equity",
@@ -969,8 +1057,10 @@ def _run_maker_backtest(source, manifest, parameters, prepared, timestamps,
     ledger = Ledger(initial, "futures", leverage, fee, position_mode="hedge")
     book = MakerOrderBook(ledger, symbol_filters, maker_fee_rate=fee)
     strategy = load_strategy(source)
-    histories = {symbol: [] for symbol in prepared}
+    frames = MinuteFrames(prepared, manifest["timeframes"], manifest["history_window"])
+    attribution = SymbolAttribution(ledger, prepared)
     curve, decisions = [], []
+    unreported_events = []
     peak, batch_start = initial, 0
     batch_size = max(1, min(100, len(timestamps) // 30))
     for index, timestamp in enumerate(timestamps):
@@ -979,9 +1069,8 @@ def _run_maker_backtest(source, manifest, parameters, prepared, timestamps,
         bars = {symbol: values[timestamp] for symbol, values in prepared.items()}
         event_start = len(book.events)
         execution_events = book.process_bar(bars)
-        for symbol, bar in bars.items():
-            histories[symbol].append(bar)
-            histories[symbol] = histories[symbol][-manifest["history_window"]:]
+        unreported_events.extend(execution_events)
+        ready = frames.push(bars)
         equity = ledger.equity()
         peak = max(peak, equity)
         point = {"timestamp": timestamp, "equity": _float(equity),
@@ -998,29 +1087,33 @@ def _run_maker_backtest(source, manifest, parameters, prepared, timestamps,
         def emit(**fields):
             display.update(_json_safe(fields))
 
-        context = {"params": copy.deepcopy(parameters), "candles": copy.deepcopy(bars),
-                   "history": copy.deepcopy(histories), "positions": ledger.position_snapshot(),
-                   "account": ledger.account(), "timestamp": timestamp, "bar_index": index,
-                   "open_orders": book.open_orders(), "lots": book.lot_snapshot(),
-                   "execution_events": execution_events, "log": log, "emit": emit}
-        intents = strategy.on_bar(context)
-        if not isinstance(intents, list) or len(intents) > 1000 or any(not isinstance(i, dict) for i in intents):
-            raise ValueError("on_bar 必须返回最多 1000 项的委托字典列表")
-        intents = _json_safe(intents)
+        intents = []
+        if ready:
+            context = {**frames.context(), "params": copy.deepcopy(parameters), "positions": ledger.position_snapshot(),
+                       "account": ledger.account(), "open_orders": book.open_orders(), "lots": book.lot_snapshot(),
+                       "execution_events": copy.deepcopy(unreported_events), "log": log, "emit": emit}
+            intents = strategy.on_bar(context)
+            if not isinstance(intents, list) or len(intents) > 1000 or any(not isinstance(i, dict) for i in intents):
+                raise ValueError("on_bar 必须返回最多 1000 项的委托字典列表")
+            intents = _json_safe(intents)
+            unreported_events = []
         submitted = book.submit_many(intents, timestamp, {s: bar["close"] for s, bar in bars.items()})
         risk = [{"order_id": result.get("id"), "status": "rejected" if result["status"] == "REJECTED" else "accepted",
                  "order_status": result["status"], "reason": result.get("reason", "已记录委托，尚不代表成交")}
                 for result in submitted]
-        decisions.append({"timestamp": timestamp, "status": "submitted" if intents else "no_trade",
-                          "inputs": copy.deepcopy(bars), "account": ledger.account(),
+        decisions.append({"timestamp": timestamp, "decision_time":timestamp+MINUTE_MS, "signal_interval":manifest["timeframes"]["primary"],
+                          "status": "submitted" if intents else "no_trade" if ready else "waiting_for_primary",
+                          "inputs": copy.deepcopy(context["candles"] if ready else {}), "execution_inputs":copy.deepcopy(bars), "account": ledger.account(),
                           "indicators": display.get("indicators", {}), "stage": display.get("stage", ""),
-                          "reason": display.get("reason", "无交易信号"), "display": display,
+                          "reason": display.get("reason", "无交易信号" if ready else "等待完整策略周期收盘"), "display": display,
                           "intents": intents, "risk": risk, "logs": logs,
                           "execution_events": copy.deepcopy(book.events[event_start:])})
         point["pending_margin"] = _float(ledger.pending_margin)
         curve.append(point)
+        attribution.append(timestamp,book)
         if progress and ((index + 1) % batch_size == 0 or index == len(timestamps) - 1):
-            progress({"processed": index + 1, "total": len(timestamps), "status": "running", "equity": copy.deepcopy(curve[batch_start:])})
+            progress({"processed": index + 1, "total": len(timestamps), "status": "running", "equity": copy.deepcopy(curve[batch_start:]),
+                      "symbol_equity":{symbol:copy.deepcopy(rows[batch_start:]) for symbol,rows in attribution.curves.items()}})
             batch_start = index + 1
     metrics = calculate_metrics(curve, ledger.orders, initial, closed_pnls=ledger.closed_pnls, account=ledger.account())
     if progress:
@@ -1028,11 +1121,15 @@ def _run_maker_backtest(source, manifest, parameters, prepared, timestamps,
     return {"metrics": metrics, "equity": curve, "orders": ledger.orders, "decisions": decisions,
             "positions": ledger.position_snapshot(), "account": ledger.account(), "open_orders": book.open_orders(),
             "lots": book.lot_snapshot(), "events": copy.deepcopy(book.events), "order_book": book.dump(),
+            "symbol_results":attribution.result(book),
             "engine_version": ENGINE_VERSION, "status": "completed", "parameters": parameters,
             "assumptions": {"execution": "maker_grid_v1", "position_mode": "hedge", "fee_rate": _float(fee),
                 "fee_kind": "maker", "slippage_bps": 0, "funding_included": False, "liquidation_simulated": False,
                 "order_book_simulated": False, "real_bid_ask_queue_available": False, "partial_fills_simulated": False,
-                "maker_fill_model": "next_bar_resting_strict_price_penetration_full_fill_at_limit_no_volume_queue_model",
+                "maker_fill_model": "next_1m_resting_inclusive_low_high_full_fill_at_limit_no_volume_queue_model",
+                "base_interval":"1m", "timeframes":manifest["timeframes"],
+                "higher_timeframe_buckets":"UTC_aligned_complete_minutes_only",
+                "symbol_attribution":"equal_initial_capital_shared_execution_not_independent_reruns",
                 "zero_volume_bars": "never_fill_orders_price_conditions_can_trigger_without_a_fill",
                 "gtx_check": "submission_reference_price_only_not_real_bid_ask",
                 "stop_trigger_reference": "sell_min_open_trigger_buy_max_open_trigger",
@@ -1065,7 +1162,7 @@ def _hash(value):
 
 def run_split_backtest(strategy_source, params, candles, initial_capital, fee_rate, slippage_bps,
                        train_start, train_end, validation_start, validation_end, market="futures",
-                       leverage=1, symbol_filters=None, progress=None, cancelled=None, seed=42):
+                       leverage=1, symbol_filters=None, progress=None, cancelled=None, seed=42, *, base_interval="1m"):
     """Independently evaluate [start, end) train/validation periods without leakage."""
     a, b, c, d = map(_timestamp, (train_start, train_end, validation_start, validation_end))
     if not a < b <= c < d:
@@ -1075,21 +1172,29 @@ def run_split_backtest(strategy_source, params, candles, initial_capital, fee_ra
         subset = {symbol: [row for row in rows if start <= _timestamp(row["timestamp"]) < end] for symbol, rows in candles.items()}
         callback = (lambda event, current=name: progress(dict(event, split=current))) if progress else None
         outputs[name] = run_backtest(strategy_source, params, subset, initial_capital, fee_rate,
-                                    slippage_bps, market, leverage, symbol_filters, callback, cancelled)
+                                    slippage_bps, market, leverage, symbol_filters, callback, cancelled, base_interval=base_interval)
     outputs["differences"] = {key: outputs["validation"]["metrics"][key] - value
         if type(value) in {float, int} and type(outputs["validation"]["metrics"].get(key)) in {float, int} else None
         for key, value in outputs["train"]["metrics"].items()}
+    outputs["symbol_results"] = {
+        symbol:{"train":train,"validation":outputs["validation"]["symbol_results"][symbol],
+                "allocation":train["allocation"],
+                "differences":{key:outputs["validation"]["symbol_results"][symbol]["metrics"][key]-value
+                    if type(value) in {int,float} and type(outputs["validation"]["symbol_results"][symbol]["metrics"].get(key)) in {int,float} else None
+                    for key,value in train["metrics"].items()}}
+        for symbol,train in outputs["train"]["symbol_results"].items()}
     outputs["reproducibility"] = {"strategy_hash": hashlib.sha256(strategy_source.encode()).hexdigest(),
         "strategy_version": validate_strategy_source(strategy_source)["version"],
         "parameter_hash": _hash(validate_parameters(validate_strategy_source(strategy_source), params)),
         "data_hash": _hash(candles), "engine_version": ENGINE_VERSION, "seed": seed,
         "fee_rate": fee_rate, "slippage_bps": slippage_bps, "market": market, "leverage": leverage,
         "intervals": {"train": [a, b], "validation": [c, d]}, "interval_boundary": "[start,end)",
+        "base_interval":"1m", "timeframes":validate_strategy_source(strategy_source)["timeframes"],
         "validation_state": "fresh_account_and_strategy"}
     return outputs
 
 
-def generate_demo_candles(symbols=None, count=720, interval_ms=3600000, seed=42, start_ms=1735689600000):
+def generate_demo_candles(symbols=None, count=720, interval_ms=60000, seed=42, start_ms=1735689600000):
     """Synthetic OHLCV fixture. Never describe this output as Binance history."""
     symbols = symbols or ["BTCUSDT", "ETHUSDT"]
     if type(count) is not int or not 2 <= count <= 100000:

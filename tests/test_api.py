@@ -107,11 +107,12 @@ def test_fence_expiry_and_single_owner(client):
 
 
 def experiment_body():
-    return {"strategy_id":"momentum","dataset_id":"demo-30m","parameters":{"fast_period":4,"slow_period":12},"symbols":["BTCUSDT"],"market":"futures","initial_capital":1000,"fee_rate":.0004,"slippage_bps":2,"train_start":"2026-09-01","train_end":"2026-09-10","validation_start":"2026-09-10","validation_end":"2026-09-15","seed":42}
+    return {"strategy_id":"momentum","dataset_id":"demo-1m","parameters":{"fast_period":4,"slow_period":12},"symbols":["BTCUSDT"],"market":"futures","initial_capital":1000,"fee_rate":.0004,"slippage_bps":2,"train_start":"2026-09-01","train_end":"2026-09-02","validation_start":"2026-09-02","validation_end":"2026-09-03","seed":42}
 
 
 def test_split_backtest_job_results_and_export(client):
     body=experiment_body()
+    body["symbols"]=["BTCUSDT","ETHUSDT"]
     response=client.post("/api/experiments",json=body)
     assert response.status_code==202,response.text
     id=response.json()["id"]
@@ -123,13 +124,38 @@ def test_split_backtest_job_results_and_export(client):
     assert result["validation_metrics"]["final_equity"]>0
     assert result["provenance"]["data_hash"]
     assert result["provenance"]["symbol_filters"]["source"]=="synthetic_documented_fixture"
+    assert result["provenance"]["base_interval"]=="1m"
+    assert result["provenance"]["timeframes"]["primary"]=="1h"
+    assert set(result["symbol_results"])==set(body["symbols"])
+    for symbol,item in result["symbol_results"].items():
+        assert item["allocation"]=={"method":"equal_initial_capital","initial_capital":500}
+        assert item["metrics"]["initial_equity"]==500
+        assert len(item["curve"])==len(result["curve"])
+        assert len(item["validation_curve"])==len(result["validation_curve"])
+    for index,point in enumerate(result["curve"]):
+        assert sum(item["curve"][index]["equity"] for item in result["symbol_results"].values())==pytest.approx(point["equity"])
     assert result["curve"][-1]["timestamp"]<result["validation_curve"][0]["timestamp"]
     with db.connect() as con:
         persisted=db.parse(con.execute("SELECT result FROM experiments WHERE id=?",(id,)).fetchone()[0])
     assert "orders" not in persisted and "decisions" not in persisted
+    assert all(len(item["curve"])<=600 for item in persisted["symbol_results"].values())
     assert persisted["artifacts"]["orders"]["count"]==len(result["orders"])
     assert len(client.get("/api/experiments").json()[0]["curve"])<=600
-    assert "split,timestamp,equity" in client.get(f"/api/experiments/{id}/export?format=csv").text
+    exported=client.get(f"/api/experiments/{id}/export?format=csv").text
+    assert "split,timestamp,equity,symbol" in exported and "BTCUSDT" in exported and "ETHUSDT" in exported and "TOTAL" in exported
+    interactive=client.get(f"/api/experiments/{id}?view=interactive").json()
+    assert len(interactive["curve"])<=600 and "decisions" not in interactive and "orders" not in interactive
+    assert interactive["detail_pagination"]["orders"]["total"]==len(result["orders"])
+    assert all(len(item["curve"])<=600 for item in interactive["symbol_results"].values())
+    page=client.get(f"/api/experiments/{id}/records/decisions?offset=1&limit=2").json()
+    assert page["rows"]==result["decisions"][1:3] and page["total"]==len(result["decisions"]) and page["has_more"]
+    subset=[item for item in result["orders"] if item["symbol"]=="BTCUSDT" and item["split"]=="train"]
+    page=client.get(f"/api/experiments/{id}/records/orders?symbol=BTCUSDT&split=train&offset=1&limit=2").json()
+    assert page["rows"]==subset[1:3] and page["total"]==len(subset)
+    assert client.get(f"/api/experiments/{id}/records/decisions?symbol=BTCUSDT").status_code==422
+    assert client.get(f"/api/experiments/{id}/records/orders?limit=101").status_code==422
+    assert client.get(f"/api/experiments/{id}/records/orders?offset=-1").status_code==422
+    assert client.get(f"/api/experiments/{id}/export?format=json").json()==result
     body["validation_start"]="2026-09-09"
     assert client.post("/api/experiments",json=body).status_code==422
 
@@ -185,18 +211,38 @@ def test_dataset_uses_parquet_and_backfill_is_repeatable(client):
     assert storage.backfill_artifacts()=={"datasets":0,"experiments":0}
 
 
+def test_minute_import_rejects_coarse_mislabeled_and_gapped_rows(client):
+    row={"timestamp":1788220800000,"open":100,"high":102,"low":99,"close":101,"volume":1}
+    for interval,stamps in (("1h",[0,60000]),("1m",[0,3600000]),("1m",[0,60000,180000]),("1m",[1,60001])):
+        response=client.post("/api/datasets",json={"symbols":["BTCUSDT"],"market":"futures","interval":interval,
+            "candles":{"BTCUSDT":[dict(row,timestamp=row["timestamp"]+offset) for offset in stamps]}})
+        assert response.status_code==422,response.text
+
+
+def test_new_backtest_rejects_legacy_dataset_but_preserves_existing_reports(client):
+    with db.connect() as con:
+        con.execute("UPDATE datasets SET `interval`='30m' WHERE id='demo-1m'")
+    response=client.post("/api/experiments",json=experiment_body())
+    assert response.status_code==422 and "1 分钟" in response.text
+    existing=client.get('/api/experiments/demo-exp-1')
+    assert existing.status_code==200 and existing.json()["status"]=="completed"
+
+
 def test_paper_fills_orders_and_audit_commit_together(client,monkeypatch):
     account=new_paper(client)
     command=client.post("/api/commands",json={"account_ids":[account["id"]],"action":"resume"}).json()["commands"][0]
-    tick=int(time.time()//60)*60000
-    bars=[{"timestamp":tick-(10-i)*60000,"open":100+i,"high":102+i,"low":99+i,"close":101+i,"volume":100} for i in range(10)]
+    # The builtin signal runs on complete 1h bars, while execution remains 1m.
+    # Prime five complete hours and advance just one minute for the next fill.
+    tick=int(time.time()//3600)*3600000
+    clock=tick/1000+5
+    monkeypatch.setattr(time,"time",lambda:clock)
+    bars=[{"timestamp":tick-(300-i)*60000,"open":100+i,"high":102+i,"low":99+i,"close":101+i,"volume":100} for i in range(300)]
     rules={"tick_size":"0.01","step_size":"0.001","min_qty":"0.001","min_notional":"5"}
     with db.connect() as con:
         con.execute("INSERT INTO market_cache VALUES(?,?,'1m',?,?,?)",("futures","BTCUSDT",db.dump(bars),db.dump(rules),time.time()))
     runtime_tick(account["id"],"fill-test")
-    later=time.time()+61
-    monkeypatch.setattr(time,"time",lambda:later)
-    bars.append({"timestamp":tick,"open":110,"high":112,"low":109,"close":111,"volume":100})
+    clock+=61
+    bars.append({"timestamp":tick,"open":400,"high":402,"low":399,"close":401,"volume":100})
     with db.connect() as con:
         con.execute("UPDATE market_cache SET candles=?,fetched_at=?",(db.dump(bars),time.time()))
     runtime_tick(account["id"],"fill-test")

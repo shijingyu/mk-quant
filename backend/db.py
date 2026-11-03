@@ -18,7 +18,14 @@ import pymysql
 from pymysql.err import IntegrityError
 from .schema import SCHEMA, TABLES
 
-ENGINE_VERSION = "1.2.0"
+ENGINE_VERSION = "1.3.0"
+# Exact bundled predecessors only. Administrator-edited strategies must never
+# be replaced merely because they use a builtin id or an older version label.
+_MINUTE_PREDECESSOR_HASHES = {
+    "momentum": "dbbe401ac11bde6da57c6eb3746b2ad4d79ea9e98459ab0ceeda0da54e40e844",
+    "spot_dca": "0836a82552f3107a229be3c29d6fbe93e7e167b7e5c362b5681f8131e58ad732",
+    "usdc_hedge_grid": "b512435a3ede06c087a671eaa07abb7533d0a596b4d6badff187c110f2f4f41a",
+}
 SQL_MODE = "STRICT_ALL_TABLES,ERROR_FOR_DIVISION_BY_ZERO,NO_ZERO_DATE,NO_ZERO_IN_DATE,NO_ENGINE_SUBSTITUTION"
 
 
@@ -180,8 +187,16 @@ def init_db():
             source = item["source"]
             con.execute("INSERT INTO strategies VALUES(?,?,?,?,1,?) ON DUPLICATE KEY UPDATE id=VALUES(id)",
                         (item["id"], dump(manifest), source, hashlib.sha256(source.encode()).hexdigest(), now()))
-            saved = con.execute("SELECT * FROM strategies WHERE id=?", (item["id"],)).fetchone()
+            saved = con.execute("SELECT * FROM strategies WHERE id=? FOR UPDATE", (item["id"],)).fetchone()
             pin_strategy_version(con, saved["id"], parse(saved["manifest"]), saved["source"], saved["source_hash"])
+            if saved["source_hash"] == _MINUTE_PREDECESSOR_HASHES.get(item["id"]) and saved["source_hash"] != hashlib.sha256(source.encode()).hexdigest():
+                states = con.execute("SELECT i.desired_state,i.observed_state FROM accounts a JOIN instances i ON i.account_id=a.id WHERE a.strategy_id=? FOR UPDATE", (item["id"],)).fetchall()
+                unfinished = con.execute("SELECT id FROM experiments WHERE strategy_id=? AND status IN ('queued','running') FOR UPDATE", (item["id"],)).fetchall()
+                if not unfinished and all(row["desired_state"] == row["observed_state"] == "stopped" for row in states):
+                    digest = hashlib.sha256(source.encode()).hexdigest()
+                    pin_strategy_version(con,item["id"],manifest,source,digest)
+                    con.execute("UPDATE strategies SET manifest=?,source=?,source_hash=? WHERE id=? AND source_hash=?", (dump(manifest),source,digest,item["id"],saved["source_hash"]))
+                    audit(con,None,"strategy.builtin.minute_upgrade","strategy",item["id"],{"previous_source_hash":saved["source_hash"],"source_hash":digest,"version":manifest["version"]})
 
 
 def pin_strategy_version(con, strategy_id, manifest, source, source_hash):
@@ -329,20 +344,20 @@ def seed_demo():
             previous=base
             for j in range(2880):
                 close=base*(1+j*.000035+.035*math.sin(j*.027)+.016*math.sin(j*.119))
-                rows.append({"timestamp":base_ts+j*1800000,"open":previous,"high":max(previous,close)*1.002,"low":min(previous,close)*.998,"close":close,"volume":120+j%87})
+                rows.append({"timestamp":base_ts+j*60000,"open":previous,"high":max(previous,close)*1.002,"low":min(previous,close)*.998,"close":close,"volume":120+j%87})
                 previous=close
             candles[symbol]=rows
         serialized=dump(candles)
-        con.execute("INSERT INTO datasets VALUES(?,?,?,?,?,?,?,?,?)", ("demo-30m","演示行情 · BTC / ETH / SOL","futures","30m",dump(list(candles)),dump(write_candles(candles)),hashlib.sha256(serialized.encode()).hexdigest(),"synthetic",now()))
+        con.execute("INSERT INTO datasets VALUES(?,?,?,?,?,?,?,?,?)", ("demo-1m","演示行情 · BTC / ETH / SOL","futures","1m",dump(list(candles)),dump(write_candles(candles)),hashlib.sha256(serialized.encode()).hexdigest(),"synthetic",now()))
         for i in range(3):
             strat=strategies[0]
-            config={"strategy_id":strat["id"],"parameters":{},"symbols":["BTCUSDT"],"market":"futures","initial_capital":10000,"fee_rate":.0004,"slippage_bps":2,"train_start":"2026-09-01","train_end":"2026-09-30","validation_start":"2026-10-01","validation_end":"2026-10-30","dataset_id":"demo-30m","seed":42}
+            config={"strategy_id":strat["id"],"parameters":{},"symbols":["BTCUSDT"],"market":"futures","initial_capital":10000,"fee_rate":.0004,"slippage_bps":2,"train_start":"2026-09-01","train_end":"2026-09-30","validation_start":"2026-10-01","validation_end":"2026-10-30","dataset_id":"demo-1m","seed":42}
             curve=[{"timestamp":base_ts+j*86400000,"equity":round(10000*(1+j*.003+math.sin(j*.7+i)*.012),2)} for j in range(30)]
             metrics={"total_return_pct":18.64-i*3.2,"annualized_return_pct":87.9-i*8,"max_drawdown_pct":5.24+i*.6,"profit_factor":1.86-i*.12,"win_rate":58.2+i*2,"sharpe":1.72-i*.16,"final_equity":11864-i*320,"total_trades":84+i*12,"long_trades":51+i*4,"short_trades":33+i*8,"max_consecutive_losses":4+i,"net_profit":1864-i*320}
             validation={**metrics,"total_return_pct":11.27-i*2,"max_drawdown_pct":6.12+i*.4,"profit_factor":1.59-i*.1,"sharpe":1.41-i*.12,"final_equity":11127-i*200}
             result={"metrics":metrics,"validation_metrics":validation,"curve":curve,"validation_curve":[{**p,"equity":round(10000+(p["equity"]-10000)*.72,2),"timestamp":p["timestamp"]+30*86400000} for p in curve],"orders":[],"decisions":[],"illustrative":True}
             provenance={"strategy_version":parse(strat["manifest"],{}).get("version","1.0.0"),"strategy_hash":strat["source_hash"],"data_hash":hashlib.sha256(serialized.encode()).hexdigest(),"engine_version":ENGINE_VERSION,"seed":42,"source":"demo","environment":"illustrative fixture"}
-            con.execute("INSERT INTO experiments(id,name,strategy_id,dataset_id,status,progress,config,provenance,result,created_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (f"demo-exp-{i+1}",f"趋势参数实验 #{i+1}",strat["id"],"demo-30m","completed",100,dump(config),dump(provenance),dump(store_result(result)),now(),now()))
+            con.execute("INSERT INTO experiments(id,name,strategy_id,dataset_id,status,progress,config,provenance,result,created_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (f"demo-exp-{i+1}",f"趋势参数实验 #{i+1}",strat["id"],"demo-1m","completed",100,dump(config),dump(provenance),dump(store_result(result)),now(),now()))
         for level,message in [("debug","演示数据已载入：收益与订单均为示例，不代表实际交易"),("debug","控制服务启动；等待独立运行进程连接"),("error","实盘执行闸门关闭，禁止提交交易所订单"),("debug","策略接入协议已加载，上传策略将执行静态契约检查")]:
             con.execute("INSERT INTO logs(level,message,source,created_at) VALUES(?,?,?,?)", (level,message,"demo",now()))
     return True

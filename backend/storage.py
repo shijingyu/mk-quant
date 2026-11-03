@@ -237,34 +237,199 @@ def write_records(kind, rows):
     return _publish(kind, pa.Table.from_pylist(records, schema=schema), digest, len(rows))
 
 
-def read_records(manifest, *, offset=0, limit=None):
+def _iter_payloads(path, *, offset=0, limit=None, symbol=None, split=None):
+    """Read bounded batches; a slow/aborted HTTP reader never retains a report."""
+    _, pq = _arrow()
+    skipped = emitted = 0
+    if limit == 0:
+        return
+    with pq.ParquetFile(path) as parquet:
+        for batch in parquet.iter_batches(batch_size=32, columns=["symbol", "split", "payload"], use_threads=False):
+            for row in batch.to_pylist():
+                if symbol is not None and row["symbol"] != symbol:
+                    continue
+                if split is not None and row["split"] != split:
+                    continue
+                if skipped < offset:
+                    skipped += 1
+                    continue
+                yield row["payload"]
+                emitted += 1
+                if limit is not None and emitted >= limit:
+                    return
+
+
+def iter_records(manifest, *, offset=0, limit=None, symbol=None, split=None):
     if offset < 0 or (limit is not None and limit < 0):
         raise ArtifactError("明细分页范围无效")
-    _, pq = _arrow()
     path = _resolve(manifest)
-    if limit == 0:
-        return []
-    end = offset + limit if limit is not None else None
-    result = []
-    for batch in pq.ParquetFile(path).iter_batches(batch_size=4096, columns=["row_index", "payload"], use_threads=False):
-        for row in batch.to_pylist():
-            if row["row_index"] < offset:
-                continue
-            if end is not None and row["row_index"] >= end:
-                return result
-            result.append(json.loads(row["payload"]))
-    return result
+    for payload in _iter_payloads(path, offset=offset, limit=limit, symbol=symbol, split=split):
+        yield json.loads(payload)
+
+
+def read_records(manifest, *, offset=0, limit=None, symbol=None, split=None):
+    return list(iter_records(manifest, offset=offset, limit=limit, symbol=symbol, split=split))
+
+
+def count_records(manifest, *, symbol=None, split=None):
+    path = _resolve(manifest)
+    if symbol is None and split is None:
+        return int(manifest["count"])
+    _, pq = _arrow()
+    count = 0
+    # Counts and filters use compact typed columns, never large decision JSON.
+    with pq.ParquetFile(path) as parquet:
+        for batch in parquet.iter_batches(batch_size=4096, columns=["symbol", "split"], use_threads=False):
+            count += sum((symbol is None or row["symbol"] == symbol) and
+                         (split is None or row["split"] == split) for row in batch.to_pylist())
+    return count
+
+
+def _chunk_text(parts, budget=65536):
+    buffer, size = [], 0
+    try:
+        for part in parts:
+            buffer.append(part)
+            size += len(part)
+            if size >= budget:
+                yield "".join(buffer)
+                buffer, size = [], 0
+        if buffer:
+            yield "".join(buffer)
+    finally:
+        close = getattr(parts, "close", None)
+        if close:
+            close()
+
+
+def stream_report_json(report):
+    """Preserve the full report contract without expanding all Parquet JSON.
+
+    Integrity checks happen before response headers. Generators own each file
+    only while iterating it, and close it when the client cancels consumption.
+    """
+    paths = {kind: _resolve(manifest) for kind, manifest in report.get("artifacts", {}).items() if kind in SERIES}
+    scoped = report.get("curve_layout") == "portfolio_and_symbol_v1"
+
+    def array(kind, fallback, symbol=None):
+        yield "["
+        first = True
+        if kind in paths:
+            payloads = _iter_payloads(paths[kind], symbol=(symbol or "") if scoped and kind in {"curve", "validation_curve"} else None)
+        else:
+            payloads = (db.dump(row) for row in fallback)
+        try:
+            for payload in payloads:
+                if not first:
+                    yield ","
+                if scoped and kind in paths and kind in {"curve", "validation_curve"}:
+                    point = json.loads(payload)
+                    point.pop("symbol", None)
+                    payload = db.dump(point)
+                yield payload
+                first = False
+        finally:
+            payloads.close()
+        yield "]"
+
+    def fields(item, symbol=None):
+        yield "{"
+        keys = list(item)
+        if symbol is None:
+            keys.extend(kind for kind in paths if kind not in item)
+        for index, key in enumerate(keys):
+            if index:
+                yield ","
+            yield db.dump(key) + ":"
+            if key in SERIES and (symbol is None or key in {"curve", "validation_curve"}):
+                yield from array(key, item.get(key, []), symbol=symbol)
+            elif key == "symbol_results":
+                yield "{"
+                for symbol_index, (name, result) in enumerate(item[key].items()):
+                    if symbol_index:
+                        yield ","
+                    yield db.dump(name) + ":"
+                    yield from fields(result, symbol=name)
+                yield "}"
+            elif key == "curve_sampling" and paths:
+                yield db.dump("full_resolution")
+            else:
+                yield db.dump(item[key])
+        yield "}"
+
+    return _chunk_text(fields(report))
+
+
+def stream_equity_csv(report):
+    """Read only equity files; CSV never loads order or decision artifacts."""
+    import csv
+    import io
+    paths = {kind: _resolve(report["artifacts"][kind]) for kind in ("curve", "validation_curve") if kind in report.get("artifacts", {})}
+
+    def lines():
+        stream = io.StringIO()
+        writer = csv.writer(stream)
+        writer.writerow(["split", "timestamp", "equity", "symbol"])
+        yield stream.getvalue()
+        for split, kind in (("train", "curve"), ("validation", "validation_curve")):
+            if kind in paths:
+                payloads = _iter_payloads(paths[kind])
+                rows = (json.loads(payload) for payload in payloads)
+            else:
+                payloads = None
+                rows = iter([dict(row, symbol="") for row in report.get(kind, [])] +
+                            [dict(row, symbol=symbol) for symbol, item in report.get("symbol_results", {}).items() for row in item.get(kind, [])])
+            try:
+                for row in rows:
+                    stream.seek(0)
+                    stream.truncate(0)
+                    writer.writerow([split, row.get("timestamp", row.get("time")), row.get("equity"), row.get("symbol") or "TOTAL"])
+                    yield stream.getvalue()
+            finally:
+                if payloads is not None:
+                    payloads.close()
+    return _chunk_text(lines())
+
+
+def result_preview(result):
+    """Bound portfolio and symbol curves independently without mixing extrema."""
+    preview = {key: value for key, value in result.items() if key not in {"orders", "decisions", "symbol_results"}}
+    for kind in ("curve", "validation_curve"):
+        preview[kind] = curve_preview(result.get(kind, []))
+    if "symbol_results" in result:
+        preview["symbol_results"] = {}
+        for symbol, value in result["symbol_results"].items():
+            item = {key: item for key, item in value.items() if key not in SERIES}
+            for kind in ("curve", "validation_curve"):
+                item[kind] = curve_preview(value.get(kind, []))
+            preview["symbol_results"][symbol] = item
+    preview["curve_sampling"] = "bucket_min_max_preserves_extrema"
+    return preview
 
 
 def store_result(result):
     """All detailed series are independent files; DB keeps summaries/previews."""
-    stored = {key: value for key, value in result.items() if key not in SERIES and key != "artifacts"}
+    stored = {key: value for key, value in result.items() if key not in SERIES and key not in {"artifacts", "symbol_results"}}
+    symbols = result.get("symbol_results", {})
+    if symbols:
+        stored["symbol_results"] = {symbol: {key: item for key, item in value.items() if key not in SERIES}
+                                    for symbol, value in symbols.items()}
+        stored["curve_layout"] = "portfolio_and_symbol_v1"
     artifacts = dict(result.get("artifacts", {}))
     for kind in SERIES:
         rows = result.get(kind)
         if rows is None:
             continue
-        artifacts[kind] = write_records(kind, rows)
+        # The empty symbol denotes the portfolio. Each other group is an
+        # attribution from the same execution, not an independent strategy run.
+        if kind in {"curve", "validation_curve"} and symbols:
+            scoped_rows = [dict(row, symbol="") for row in rows]
+            for symbol, value in symbols.items():
+                scoped_rows.extend(dict(row, symbol=symbol) for row in value.get(kind, []))
+                stored["symbol_results"][symbol][kind] = curve_preview(value.get(kind, []))
+            artifacts[kind] = write_records(kind, scoped_rows)
+        else:
+            artifacts[kind] = write_records(kind, rows)
         if kind in {"curve", "validation_curve"}:
             stored[kind] = curve_preview(rows)
     stored["artifacts"] = artifacts
@@ -272,18 +437,29 @@ def store_result(result):
     return stored
 
 
-def load_result(value, *, detail=False):
+def load_result(value, *, detail=False, preview=True):
     result = db.parse(value, {}) if isinstance(value, str) else dict(value or {})
     result = dict(result)
+    if "symbol_results" in result:
+        result["symbol_results"] = {symbol: dict(item) for symbol, item in result["symbol_results"].items()}
     if detail:
         for kind, manifest in result.get("artifacts", {}).items():
             if kind in SERIES:
-                result[kind] = read_records(manifest)
-    else:
-        result.pop("orders", None)
-        result.pop("decisions", None)
-        for kind in ("curve", "validation_curve"):
-            result[kind] = curve_preview(result.get(kind, []))
+                rows = read_records(manifest)
+                if kind in {"curve", "validation_curve"} and result.get("curve_layout") == "portfolio_and_symbol_v1":
+                    groups = {symbol: [] for symbol in ("", *result.get("symbol_results", {}))}
+                    for row in rows:
+                        symbol = row.get("symbol", "")
+                        if symbol not in groups:
+                            raise ArtifactError("回测曲线交易对与统计清单不一致")
+                        groups[symbol].append({key: value for key, value in row.items() if key != "symbol"})
+                    result[kind] = groups.pop("")
+                    for symbol, curve in groups.items():
+                        result["symbol_results"][symbol][kind] = curve
+                else:
+                    result[kind] = rows
+    elif preview:
+        result = result_preview(result)
     return result
 
 

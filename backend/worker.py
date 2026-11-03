@@ -57,13 +57,18 @@ def run_experiment(id):
             strategy={**dict(version),"trusted":strategy["trusted"]}
         dataset=con.execute("SELECT * FROM datasets WHERE id=?",(row["dataset_id"],)).fetchone()
         con.execute("UPDATE experiments SET status='running',worker_pid=?,started_at=? WHERE id=?",(os.getpid(),db.now(),id))
-    partial={"curve":[],"validation_curve":[],"metrics":{},"validation_metrics":{},"incomplete":True}
+    partial={"curve":[],"validation_curve":[],"metrics":{},"validation_metrics":{},"incomplete":True,"symbol_results":{}}
     try:
         if not strategy or not strategy["trusted"]:
             raise ValueError("自定义代码未经离线安全审核，禁止执行")
         if not version or strategy["source_hash"]!=provenance.get("strategy_hash"):
             raise ValueError("实验固定的策略版本缺失或不匹配，拒绝使用变化后的源码")
         manifest=db.parse(strategy["manifest"],{})
+        if dataset["interval"]!="1m" or config.get("base_interval")!="1m":
+            raise ValueError("该任务使用旧高周期行情；请以 1 分钟基础数据重新创建回测，历史结果仍可查看")
+        partial["symbol_results"]={symbol:{"curve":[],"validation_curve":[],"metrics":{},"validation_metrics":{},
+            "allocation":{"method":"equal_initial_capital","initial_capital":config["initial_capital"]/len(config["symbols"])}}
+            for symbol in config["symbols"]}
         candles=storage.read_candles(dataset["candles"], symbols=config["symbols"], start=config["ranges_ms"][0], end=config["ranges_ms"][3])
         ranges=config["ranges_ms"]
         random.seed(config["seed"])
@@ -81,15 +86,29 @@ def run_experiment(id):
             curve_key="curve" if split=="train" else "validation_curve"
             def progress(event):
                 partial[curve_key].extend(event.get("equity",[]))
+                for symbol,points in event.get("symbol_equity",{}).items():
+                    partial["symbol_results"][symbol][curve_key].extend(points)
                 value=min(99.9,(i+event["processed"]/max(event["total"],1))*50)
-                preview={**partial,"curve":storage.curve_preview(partial["curve"]),"validation_curve":storage.curve_preview(partial["validation_curve"]),"curve_sampling":"bucket_min_max_preserves_extrema"}
+                preview=storage.result_preview(partial)
                 with db.connect() as con:
                     con.execute("UPDATE experiments SET progress=?,result=? WHERE id=? AND status='running'",(value,db.dump(preview),id))
-            output[split]=run_backtest(strategy["source"],config["parameters"],data,config["initial_capital"],config["fee_rate"],config["slippage_bps"],market=config["market"],leverage=config.get("leverage",manifest["account"]["leverage_min"]),symbol_filters=filters,progress=progress,cancelled=cancelled)
+            output[split]=run_backtest(strategy["source"],config["parameters"],data,config["initial_capital"],config["fee_rate"],config["slippage_bps"],market=config["market"],leverage=config.get("leverage",manifest["account"]["leverage_min"]),symbol_filters=filters,progress=progress,cancelled=cancelled,base_interval="1m")
             partial["metrics" if split=="train" else "validation_metrics"]=ui_metrics(output[split]["metrics"])
+            for symbol,value in output[split]["symbol_results"].items():
+                partial["symbol_results"][symbol]["metrics" if split=="train" else "validation_metrics"]=ui_metrics(value["metrics"])
         if cancelled():
             raise BacktestCancelled("任务取消")
         result={"metrics":ui_metrics(output["train"]["metrics"]),"validation_metrics":ui_metrics(output["validation"]["metrics"]),"curve":output["train"]["equity"],"validation_curve":output["validation"]["equity"],"orders":[dict(o,split=split) for split,r in output.items() for o in r["orders"]],"decisions":[dict(o,split=split) for split,r in output.items() for o in r["decisions"]],"assumptions":output["train"]["assumptions"],"incomplete":False}
+        result["symbol_results"]={}
+        for symbol in config["symbols"]:
+            train,validation=output["train"]["symbol_results"][symbol],output["validation"]["symbol_results"][symbol]
+            item={"metrics":ui_metrics(train["metrics"]),"validation_metrics":ui_metrics(validation["metrics"]),
+                  "curve":train["equity"],"validation_curve":validation["equity"],
+                  "allocation":train.get("allocation",{"method":"equal_initial_capital","initial_capital":train["metrics"]["initial_equity"]}),
+                  "account_summaries":{"train":train["account"],"validation":validation["account"]}}
+            item["differences"]={key:item["validation_metrics"][key]-value for key,value in item["metrics"].items()
+                                 if isinstance(value,(int,float)) and isinstance(item["validation_metrics"].get(key),(int,float))}
+            result["symbol_results"][symbol]=item
         if manifest.get("execution",{}).get("model")=="maker_grid_v1":
             result.update(open_orders=[dict(order,split=split) for split,value in output.items() for order in value["open_orders"]],
                           lots=[dict(lot,split=split) for split,value in output.items() for lot in value["lots"]],
@@ -384,6 +403,28 @@ def strategy_deadline(seconds=10):
         signal.signal(signal.SIGALRM,previous)
 
 
+def _runtime_frames(manifest, symbols, histories, timestamp, saved=None):
+    """Warm up only indicators; never replay historical orders on a live actor.
+
+    Completed higher-period history survives the 1000-minute shared cache
+    window. Missing minutes invalidate incomplete buckets rather than creating
+    a synthetic continuous candle. Only the newest minute may trigger a call.
+    """
+    from .timeframes import MinuteFrames, normalize_timeframes
+    frames=MinuteFrames.load(saved) if saved else MinuteFrames(symbols,manifest.get("timeframes"),manifest["history_window"])
+    if frames.symbols!=sorted(symbols) or frames.timeframes!=normalize_timeframes(manifest.get("timeframes")) or frames.history_window!=manifest["history_window"]:
+        frames=MinuteFrames(symbols,manifest.get("timeframes"),manifest["history_window"])
+    indexed={symbol:{bar["timestamp"]:bar for bar in histories[symbol] if bar["timestamp"]<=timestamp} for symbol in symbols}
+    common=sorted(set.intersection(*(set(rows) for rows in indexed.values())))
+    ready=False
+    for stamp in common:
+        if frames.last_timestamp is not None and stamp<=frames.last_timestamp:
+            continue
+        closed=frames.push({symbol:indexed[symbol][stamp] for symbol in symbols},allow_gap=True)
+        ready=closed and stamp==timestamp
+    return frames,ready
+
+
 def maker_runtime_tick(account, instance, commands, strategy, snapshot, fence, current_lease):
     """Advance a persisted Maker book; every mutation commits under one fence.
 
@@ -432,10 +473,11 @@ def maker_runtime_tick(account, instance, commands, strategy, snapshot, fence, c
     previous_strategy_error=strategy_error
     strategy_cursor=snapshot.get("strategy_event_cursor",0)
     bar_index=snapshot.get("bar_index",0)
+    frame_state=snapshot.get("frames")
     if revision_changed:
         if snapshot and (book.has_open_positions() or book.open_orders()):
             raise ValueError("Maker 持仓或挂单未清空，不能用新配置覆盖运行状态")
-        strategy_state={};strategy_error=None;strategy_cursor=len(book.events);bar_index=0
+        strategy_state={};strategy_error=None;strategy_cursor=len(book.events);bar_index=0;frame_state=None
         ledger.leverage=Decimal(str(manifest["account"]["leverage_min"]))
         ledger.fee_rate=Decimal(".0002")
         if snapshot.get("revision"):
@@ -475,25 +517,33 @@ def maker_runtime_tick(account, instance, commands, strategy, snapshot, fence, c
             book.cancel_entries(timestamp,"行情断档，过期开仓挂单作废")
             risk.append({"status":"warning","reason":"行情断档：缺失期间的成交先后与止损触发无法重建，仅处理当前完整 K 线上的保护单"})
         book.process_bar(bars)
+    primary_ready=False
+    frame_context={}
+    if new_bar:
+        frames,primary_ready=_runtime_frames(manifest,symbols,histories,timestamp,frame_state)
+        frame_state=frames.dump()
+        if primary_ready:
+            frame_context=frames.context()
+    decision_called=False
     references={symbol:bar["close"] for symbol,bar in bars.items()}
     if book.flattening:
         if fresh:
             book.request_flatten(timestamp,references)
         mode="stopped"
-    elif new_bar and mode=="running" and not strategy_error:
+    elif new_bar and primary_ready and mode=="running" and not strategy_error:
         try:
             strategy_obj=load_strategy(strategy["source"])
             strategy_obj.__dict__.update(copy.deepcopy(strategy_state))
             def strategy_log(level,message,data=None):
                 if len(buffered_logs)<1000:
                     buffered_logs.append(("error" if level=="error" else "debug",str(message)[:4000],data))
-            context={"params":validate_parameters(manifest,db.parse(account["config"],{})),"candles":copy.deepcopy(bars),
-                     "history":{symbol:[bar for bar in rows if bar["timestamp"]<=timestamp][-manifest["history_window"]:] for symbol,rows in histories.items()},
+            context={**frame_context,"params":validate_parameters(manifest,db.parse(account["config"],{})),
                      "positions":ledger.position_snapshot(),"account":ledger.account(),"timestamp":timestamp,"bar_index":bar_index,
                      "open_orders":book.open_orders(),"lots":book.lot_snapshot(),"execution_events":copy.deepcopy(book.events[strategy_cursor:]),
                      "log":strategy_log,"emit":lambda **fields:display.update(fields)}
             strategy_cursor=len(book.events)
             with strategy_deadline():
+                decision_called=True
                 intents=strategy_obj.on_bar(context)
             next_state=copy.deepcopy(strategy_obj.__dict__);db.dump(next_state)
             if not isinstance(intents,list) or len(intents)>1000 or any(not isinstance(intent,dict) for intent in intents):
@@ -538,11 +588,11 @@ def maker_runtime_tick(account, instance, commands, strategy, snapshot, fence, c
              "execution_events":copy.deepcopy(book.events[-100:]),"display":display,"risk":risk,"strategy_error":strategy_error,
              "data_updated_at":db.now() if fresh else previous_metrics.get("data_updated_at"),
              "execution_model":{"model":"maker_grid_v1","fee_rate":float(book.maker_fee_rate),"maker_fee_rate":float(book.maker_fee_rate),
-                 "slippage_bps":0,"fee_source":"documented_simulation_assumption","interval":"1m","position_mode":"hedge",
+                 "slippage_bps":0,"fee_source":"documented_simulation_assumption","interval":"1m","timeframes":manifest.get("timeframes",{"primary":"1m","additional":[]}),"position_mode":"hedge",
                  "funding_included":False,"liquidation_simulated":False,"liquidity":"simulated_maker","order_book_queue_simulated":False}}
     snapshot={"model":"maker_grid_v1","book":book.dump(),"strategy_state":strategy_state,"strategy_error":strategy_error,
               "strategy_event_cursor":strategy_cursor,"revision":revision,"last_timestamp":timestamp if new_bar else last,
-              "bar_index":bar_index+int(new_bar),"curve":curve,"display":display,"market_state":market_state,
+              "bar_index":bar_index+int(decision_called),"frames":frame_state,"curve":curve,"display":display,"market_state":market_state,
               "execution_id":execution_id,"last_command_id":command["id"] if command else None,"observed_state":observed,
               "desired_state":"paused" if strategy_error and not book.flattening else instance["desired_state"]}
     changed_orders=[dict(order,execution_id=execution_id) for key,order in book.orders.items() if previous_orders.get(key)!=db.dump(order)]
@@ -616,7 +666,7 @@ def runtime_tick(account_id,owner):
     ledger=_restore_ledger(account,manifest,snapshot)
     revision={"strategy_id":account["strategy_id"],"source_hash":strategy["source_hash"],"config_revision":instance["config_revision"]}
     if snapshot.get("revision")!=revision:
-        snapshot.update(pending=[],strategy_state={},bar_index=0)
+        snapshot.update(pending=[],strategy_state={},bar_index=0,frames=None)
     symbols=db.parse(account["symbols"],[])
     mode=instance["desired_state"]
     # The durable command order defines transitions; a stale frontend cannot erase them.
@@ -645,7 +695,7 @@ def runtime_tick(account_id,owner):
     if not common:
         return True
     timestamp=max(common)
-    if int(time.time()*1000)-timestamp>150000:
+    if int(time.time()*1000)-timestamp>150000 or timestamp>=int(time.time()//60)*60000 or timestamp<snapshot.get("last_timestamp",0):
         with db.connect() as con:
             if not current_lease(con):
                 return True
@@ -670,25 +720,38 @@ def runtime_tick(account_id,owner):
                 risk.append({"status":"rejected","reason":"账户已停止开仓"});continue
             if timestamp-last>60000:
                 risk.append({"status":"rejected","reason":"行情断档，过期交易意图作废"});continue
-            reason=ledger.execute(intent,timestamp,filters,Decimal(".0002"),last)
+            reason=ledger.execute(intent,timestamp,filters,Decimal(".0002"),last,execution_bar=bars.get(intent.get("symbol")))
             risk.append({"status":"rejected" if reason else "accepted","reason":reason or "模拟撮合通过"})
+        # A primary-period signal is one-shot. Waiting for the next higher
+        # candle must not replay it at every intervening minute.
+        pending=[]
     ledger.prices={s:Decimal(str(bar["close"])) for s,bar in bars.items()}
     if mode=="stopped":
         for symbol,position in list(ledger.positions.items()):
             if position.quantity:
-                reason=ledger.execute({"symbol":symbol,"side":"sell" if position.quantity>0 else "buy","quantity":float(abs(position.quantity)),"reduce_only":True,"reason":"管理员平仓并停止"},timestamp,filters,Decimal(".0002"),timestamp)
+                reason=ledger.execute({"symbol":symbol,"side":"sell" if position.quantity>0 else "buy","quantity":float(abs(position.quantity)),"reduce_only":True,"reason":"管理员平仓并停止"},timestamp,filters,Decimal(".0002"),timestamp,execution_bar=bars[symbol])
                 if reason:
                     raise ValueError(f"模拟平仓失败：{reason}")
         pending=[]
-    display={}
+    display=copy.deepcopy(db.parse(account["metrics"],{}).get("display",{}))
     strategy_state=snapshot.get("strategy_state",{})
-    if timestamp>last and mode in {"running","paused"}:
+    frame_state=snapshot.get("frames")
+    primary_ready=False
+    frame_context={}
+    if timestamp>last:
+        frames,primary_ready=_runtime_frames(manifest,symbols,histories,timestamp,frame_state)
+        frame_state=frames.dump()
+        if primary_ready:
+            frame_context=frames.context()
+    decision_called=False
+    if timestamp>last and primary_ready and mode in {"running","paused"}:
         strategy_obj=load_strategy(strategy["source"])
         strategy_obj.__dict__.update(copy.deepcopy(strategy_state))
         def strategy_log(level,message,data=None):
             db.log(level,message,strategy_id=account["strategy_id"],account_id=account_id,details=data)
-        context={"params":validate_parameters(manifest,db.parse(account["config"],{})),"candles":copy.deepcopy(bars),"history":{s:[c for c in rows if c["timestamp"]<=timestamp][-manifest["history_window"]:] for s,rows in histories.items()},"positions":ledger.position_snapshot(),"account":ledger.account(),"timestamp":timestamp,"bar_index":snapshot.get("bar_index",0),"log":strategy_log,"emit":lambda **fields:display.update(fields)}
+        context={**frame_context,"params":validate_parameters(manifest,db.parse(account["config"],{})),"positions":ledger.position_snapshot(),"account":ledger.account(),"timestamp":timestamp,"bar_index":snapshot.get("bar_index",0),"log":strategy_log,"emit":lambda **fields:display.update(fields)}
         with strategy_deadline():
+            decision_called=True
             pending=strategy_obj.on_bar(context)
         strategy_state=copy.deepcopy(strategy_obj.__dict__)
         db.dump(strategy_state)  # State is durable JSON; unsupported state fails closed.
@@ -706,7 +769,8 @@ def runtime_tick(account_id,owner):
         baseline=next((p["equity"] for p in reversed(curve) if p["timestamp"]<start),account["initial_equity"])
         return float(ledger.equity())-baseline
     metrics={"today_pnl":period_pnl(day_start),"month_pnl":period_pnl(month_start),"running_days":max(1,int((timestamp-curve[0]["timestamp"])/86400000)+1) if curve else 0,**ledger.account(),**stats,"return_pct":stats["total_return_pct"],"max_drawdown_u":stats["max_drawdown_amount"],"position_count":len(positions),"long_count":sum(p["quantity"]>0 for p in positions),"short_count":sum(p["quantity"]<0 for p in positions),"curve":curve,"positions":positions,"orders":ledger.orders,"display":display,"data_updated_at":db.now(),"risk":risk,"execution_model":{"fee_rate":float(ledger.fee_rate),"slippage_bps":2,"fee_source":"documented_simulation_assumption","interval":"1m","funding_included":False,"liquidation_simulated":False}}
-    snapshot={"model":"market_next_open_v1","balance":str(ledger.balance),"fees":str(ledger.fees),"positions":{s:{"quantity":str(p.quantity),"average_price":str(p.average_price),"entry_fees":str(p.entry_fees)} for s,p in ledger.positions.items()},"orders":ledger.orders,"closed_pnls":[str(v) for v in ledger.closed_pnls],"pending":pending,"strategy_state":strategy_state,"revision":revision,"last_timestamp":timestamp,"bar_index":snapshot.get("bar_index",0)+(timestamp>last),"curve":curve}
+    metrics["execution_model"]["timeframes"]=manifest.get("timeframes",{"primary":"1m","additional":[]})
+    snapshot={"model":"market_next_open_v1","balance":str(ledger.balance),"fees":str(ledger.fees),"positions":{s:{"quantity":str(p.quantity),"average_price":str(p.average_price),"entry_fees":str(p.entry_fees)} for s,p in ledger.positions.items()},"orders":ledger.orders,"closed_pnls":[str(v) for v in ledger.closed_pnls],"pending":pending,"strategy_state":strategy_state,"revision":revision,"last_timestamp":timestamp,"bar_index":snapshot.get("bar_index",0)+int(decision_called),"frames":frame_state,"curve":curve}
     with db.connect() as con:
         if not current_lease(con):
             return True

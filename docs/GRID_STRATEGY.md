@@ -1,6 +1,6 @@
 # USDC 双向 Maker 等比网格
 
-策略文件：[`backend/strategies/usdc_hedge_grid.py`](../backend/strategies/usdc_hedge_grid.py)，策略 ID `usdc_hedge_grid`，版本 `1.0.0`，执行模型 `maker_grid_v1`，协议/引擎 `1.2.0`。
+策略文件：[`backend/strategies/usdc_hedge_grid.py`](../backend/strategies/usdc_hedge_grid.py)，策略 ID `usdc_hedge_grid`，版本 `1.1.0`，执行模型 `maker_grid_v1`，协议/引擎 `1.3.0`。
 
 **当前支持历史回测和持续模拟，正式实盘运行尚未接入。** 本次没有使用真实交易凭据，也没有完成真实账户 Hedge / GTX / 条件止损验收。现有 Binance 适配器不具备这套网格所需的完整真实委托与对账链路；应用继续阻断实盘启动，不能靠设置 `MK_ENABLE_LIVE=1` 启用。
 
@@ -52,14 +52,14 @@
 
 入场和止盈都是 `LIMIT + GTX`；止盈是预先挂出的普通限价单，不等待新的止盈触发事件。止损是框架内部 `STOP_LIMIT + GTX`：条件满足后尝试挂被动限价，不包含 Taker 回退。
 
-1. 每根共同完成的 K 线先处理已有委托，再按收盘价估值并调用策略。
-2. 策略在本根收盘后提交的入场单最早下一根有效。买单只有 `low < price`、卖单只有 `high > price`，且该根成交量大于 0，才按限价全量成交；刚好触价或零成交量都不算成交。
+1. 每根共同完成的 1 分钟 K 线先处理已有委托，再按收盘价估值并调用策略。
+2. 策略在本根收盘后提交的入场单最早下一根有效。买卖单都必须满足 `low <= price <= high`，且该分钟成交量大于 0，才按限价全量成交；边界触价有效，跳空未触及和零成交量不成交。
 3. 入场成交时，执行器同步创建关联 lot、该实际模拟成交数量的 TP 和 SL；不等待下次策略回调。两张保护单最早下一根 K 线有效，不能利用入场当根未知的价格先后制造盈利退出。
 4. 卖出止损在 `low <= stop_price` 时触发，买入止损在 `high >= stop_price` 时触发。触发时分别以 `min(open, stop_price)`、`max(open, stop_price)` 检查 GTX；会立即成交的限价被拒绝。
-5. 通过检查的止损在触发当根只变成挂单，最早再下一根严格穿价才成交。同根止盈/止损顺序不明时，先处理止损并抑制该 lot 的当根盈利退出，不假定先止盈。
+5. 通过检查的止损在触发当根只变成挂单，最早再下一分钟区间触价检查通过才成交。同根止盈/止损顺序不明时，先处理止损并抑制该 lot 的当根盈利退出，不假定先止盈。
 6. 一个 lot 全部退出后取消该 lot 其余兄弟退出单；部分手动减仓按剩余数量缩减保护。另一 lot 或相反方向的持仓不会被这一退出意图消耗。止损触发或被拒本身不撤止盈；止盈在后续 K 线仍可能成交，但不代表止损已经完成。
 
-这里的“全量成交”是 OHLC 模型假设：没有真实买卖盘口、排队优先级、可成交量分配或部分成交模拟。零成交量只阻止成交，不阻止模型观察止损触发；记录 `ZERO_VOLUME_FILL_SKIPPED` 说明穿价却未成交。`GTX` 检查基于参考价，不能还原交易所撮合。模型保存 `liquidity="simulated_maker"` 及完整 `assumptions`；严格穿价和止损优先只是明确的保守处理规则，不是收益下界保证。回测结束保留未平 lot 与未成交单，不人为平仓。
+这里的“全量成交”是 OHLC 模型假设：没有真实买卖盘口、排队优先级、可成交量分配或部分成交模拟。零成交量只阻止成交，不阻止模型观察止损触发；记录 `ZERO_VOLUME_FILL_SKIPPED` 说明触价却未成交。`GTX` 检查基于参考价，不能还原交易所撮合。模型保存 `liquidity="simulated_maker"` 及完整 `assumptions`；分钟区间检查和止损优先只是明确的模型规则，不是收益下界保证。回测结束保留未平 lot 与未成交单，不人为平仓。
 
 **Maker 止损不能保证退出。** 例如多头下跌触发止损后，卖出限价仍可能留在市场上方长期未成交；把卖价改到可立即成交的一侧又可能违反 GTX 被拒。`stop_triggered` 只表示已触发，`stop_rejected` / `unprotected` 表示保护异常；这些状态都不意味着已止损。框架继续展示持仓、浮亏和风险，并停止新增敞口；不会暗中切换市价。限价不保证成交、Post Only 避免立即吃单的性质见 [Binance 订单类型说明](https://www.binance.com/en/support/faq/detail/360033779452)。
 
@@ -97,7 +97,7 @@
 
 ## 复验入口
 
-`tests/test_grid_strategy.py` 覆盖参数、五币任意子集、等比价格、资金均分/多空交替、层级去重、状态恢复和未受保护 lot 停补仓；`tests/test_maker_engine.py` 覆盖双向账本、GTX 拒单、资金预留、下一根/严格穿价、条件止损与同根歧义、逐 lot 费用、兄弟取消、重启和被动平仓。
+`tests/test_grid_strategy.py` 覆盖参数、五币任意子集、等比价格、资金均分/多空交替、层级去重、状态恢复和未受保护 lot 停补仓；`tests/test_maker_engine.py` 覆盖双向账本、GTX 拒单、资金预留、下一分钟/含边界区间触价及跳空排除、条件止损与同根歧义、逐 lot 费用、兄弟取消、重启和被动平仓。
 
 ```bash
 .venv/bin/python -m pytest -q tests/test_grid_strategy.py tests/test_maker_engine.py tests/test_engine.py

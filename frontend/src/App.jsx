@@ -227,12 +227,23 @@ function normalizeExperiment(e) {
     progress: (e.progress || 0) / 100,
     metrics: normalizeMetrics(e.metrics),
     validation_metrics: normalizeMetrics(e.validation_metrics),
+    symbol_results: Object.fromEntries(
+      Object.entries(e.symbol_results || {}).map(([symbol, result]) => [
+        symbol,
+        {
+          ...result,
+          metrics: normalizeMetrics(result.metrics),
+          validation_metrics: normalizeMetrics(result.validation_metrics),
+        },
+      ]),
+    ),
   };
 }
-async function api(path, body, method) {
+async function api(path, body, method, options = {}) {
   const res = await fetch(`/api${path}`, {
     method: method || (body ? "POST" : "GET"),
     credentials: "include",
+    signal: options.signal,
     headers: { "Content-Type": "application/json", "X-MK-CSRF": csrfToken },
     ...(body ? { body: JSON.stringify(body) } : {}),
   });
@@ -257,7 +268,7 @@ async function api(path, body, method) {
   if (data.csrf_token) csrfToken = data.csrf_token;
   if (path === "/bootstrap") {
     data.experiments = (data.experiments || []).map(normalizeExperiment);
-  } else if (/^\/experiments\/[^/]+$/.test(path) && !body)
+  } else if (/^\/experiments\/[^/]+$/.test(path.split("?")[0]) && !body)
     return normalizeExperiment(data);
   return data;
 }
@@ -588,54 +599,84 @@ export default function App() {
     [downloadSubmitting, setDownloadSubmitting] = useState(false);
   const downloadRequest = useRef(null);
   const refreshSequence = useRef(0);
+  const refreshRequest = useRef(null);
   const notify = (m) => {
     setToast(m);
     setTimeout(() => setToast(""), 4500);
   };
-  const refresh = async () => {
+  const refresh = (options = {}) => {
+    if (refreshRequest.current && !options.force)
+      return refreshRequest.current.promise;
+    refreshRequest.current?.controller.abort();
     const sequence = ++refreshSequence.current;
-    try {
-      const d = await api("/bootstrap");
-      if (sequence !== refreshSequence.current) return d;
-      setData(d);
-      setError("");
-      setUpdated(new Date());
-      return d;
-    } catch (e) {
-      if (sequence !== refreshSequence.current) return;
-      if (e.message === "请先登录") {
-        setData(null);
+    const controller = new AbortController();
+    const request = { controller, promise: null };
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, 20000);
+    refreshRequest.current = request;
+    request.promise = (async () => {
+      try {
+        const d = await api("/bootstrap", undefined, undefined, {
+          signal: controller.signal,
+        });
+        if (sequence !== refreshSequence.current) return d;
+        setData(d);
         setError("");
-      } else {
-        setError(`数据刷新失败 · ${e.message}`);
-        setData((previous) =>
-          previous
-            ? {
-                ...previous,
-                accounts: (previous.accounts || []).map((a) => ({
-                  ...a,
-                  stale: true,
-                  status: [
-                    "running",
-                    "paused",
-                    "starting",
-                    "flattening",
-                  ].includes(a.status)
-                    ? "unknown"
-                    : a.status,
-                })),
-              }
-            : previous,
-        );
+        setUpdated(new Date());
+        return d;
+      } catch (e) {
+        if (
+          sequence !== refreshSequence.current ||
+          (controller.signal.aborted && !timedOut)
+        )
+          return;
+        if (e.message === "请先登录") {
+          setData(null);
+          setError("");
+        } else {
+          setError(
+            `数据刷新失败 · ${timedOut ? "请求超时，将自动重试" : e.message}`,
+          );
+          setData((previous) =>
+            previous
+              ? {
+                  ...previous,
+                  accounts: (previous.accounts || []).map((a) => ({
+                    ...a,
+                    stale: true,
+                    status: [
+                      "running",
+                      "paused",
+                      "starting",
+                      "flattening",
+                    ].includes(a.status)
+                      ? "unknown"
+                      : a.status,
+                  })),
+                }
+              : previous,
+          );
+        }
+      } finally {
+        clearTimeout(timeout);
+        if (refreshRequest.current === request) refreshRequest.current = null;
+        if (sequence === refreshSequence.current) setLoading(false);
       }
-    } finally {
-      if (sequence === refreshSequence.current) setLoading(false);
-    }
+    })();
+    return request.promise;
   };
   useEffect(() => {
-    refresh();
-    const id = setInterval(refresh, 10000);
-    return () => clearInterval(id);
+    refresh({ force: true });
+    const id = setInterval(() => refresh(), 10000);
+    return () => {
+      clearInterval(id);
+      ++refreshSequence.current;
+      refreshRequest.current?.controller.abort();
+      refreshRequest.current = null;
+    };
   }, []);
   useEffect(() => {
     const fn = () => {
@@ -662,7 +703,7 @@ export default function App() {
   const mutate = async (path, body, method) => {
     try {
       const r = await api(path, body, method);
-      await refresh();
+      await refresh({ force: true });
       return r;
     } catch (e) {
       notify(e.message);
@@ -713,7 +754,7 @@ export default function App() {
           ? "该下载任务已完成，数据集已保存"
           : "下载任务已提交，切换页面或关闭网页后仍会继续",
       );
-      await refresh();
+      await refresh({ force: true });
       return job;
     } catch (error) {
       if (error.details?.job) remember(error.details.job);
@@ -723,7 +764,7 @@ export default function App() {
         } catch {}
       }
       notify(error.message);
-      await refresh();
+      await refresh({ force: true });
       throw error;
     } finally {
       downloadRequest.current = null;
@@ -747,7 +788,7 @@ export default function App() {
     return (
       <Login
         error={error}
-        onLogin={refresh}
+        onLogin={() => refresh({ force: true })}
         theme={theme}
         toggleTheme={toggleTheme}
       />
@@ -948,6 +989,9 @@ export default function App() {
               icon={LogOut}
               onClick={async () => {
                 await api("/logout", {});
+                ++refreshSequence.current;
+                refreshRequest.current?.controller.abort();
+                refreshRequest.current = null;
                 setData(null);
                 setModal(null);
               }}
@@ -2842,12 +2886,16 @@ function ClientView({ account: a, user }) {
 }
 
 function downloadForm(config = {}) {
+  const beijingDay = new Date(Date.now() + 8 * 3600000)
+    .toISOString()
+    .slice(0, 10);
+  const end = Date.parse(`${beijingDay}T00:00:00+08:00`);
   return {
     market: config.market || "futures",
     symbols: config.symbols?.join(",") || "BTCUSDT,ETHUSDT",
-    interval: config.interval || "1h",
-    start: config.start ? toBeijingInput(config.start) : "2025-01-01T00:00",
-    end: config.end ? toBeijingInput(config.end) : "2025-04-01T00:00",
+    interval: config.interval || "1m",
+    start: toBeijingInput(config.start ?? end - 7 * 86400000),
+    end: toBeijingInput(config.end ?? end),
   };
 }
 function DownloadTasks({ jobs, onReuse, disabled }) {
@@ -2949,6 +2997,12 @@ function Datasets({ data, mutate, notify, startDownload, downloadSubmitting }) {
     [err, setErr] = useState("");
   const change = (k, v) => setForm((f) => ({ ...f, [k]: v }));
   const downloadLocked = Boolean(activeDownload || downloadSubmitting);
+  const legacyActiveInterval =
+    tab === "download" &&
+    activeDownload?.config?.interval &&
+    activeDownload.config.interval !== "1m"
+      ? activeDownload.config.interval
+      : null;
   const submitting = busy || (tab === "download" && downloadLocked);
   useEffect(() => {
     if (activeDownload?.config) setForm(downloadForm(activeDownload.config));
@@ -2989,6 +3043,7 @@ function Datasets({ data, mutate, notify, startDownload, downloadSubmitting }) {
                 if (tab === "download") {
                   await startDownload({
                     ...form,
+                    interval: "1m",
                     symbols: form.symbols.split(/[,，\s]+/).filter(Boolean),
                     start: beijingInputToISO(form.start),
                     end: beijingInputToISO(form.end),
@@ -2998,7 +3053,7 @@ function Datasets({ data, mutate, notify, startDownload, downloadSubmitting }) {
                   await mutate("/datasets", {
                     name: filename || "导入数据",
                     market: form.market,
-                    interval: form.interval,
+                    interval: "1m",
                     symbols: form.symbols.split(/[,，\s]+/).filter(Boolean),
                     candles: parsed.candles || parsed,
                   });
@@ -3011,6 +3066,19 @@ function Datasets({ data, mutate, notify, startDownload, downloadSubmitting }) {
               }
             }}
           >
+            <div className="minute-data-notice" role="note">
+              <Clock3 size={17} aria-hidden="true" />
+              <p>
+                仅下载 1 分钟 K
+                线；其他周期由框架合成。成交价格须位于对应分钟的最低价与最高价之间，并满足挂单生效、触发和风控规则。
+              </p>
+            </div>
+            {legacyActiveInterval && (
+              <p className="minute-dataset-help">
+                已有任务仍按原 {legacyActiveInterval}{" "}
+                周期执行，任务结果保留原周期；完成后的新下载仅使用 1m。
+              </p>
+            )}
             <fieldset disabled={submitting} className="download-fields">
               <div className="form-grid">
                 <Field label="交易市场">
@@ -3022,27 +3090,20 @@ function Datasets({ data, mutate, notify, startDownload, downloadSubmitting }) {
                     <option value="spot">现货</option>
                   </select>
                 </Field>
-                <Field label="K 线周期">
-                  <select
-                    value={form.interval}
-                    onChange={(e) => change("interval", e.target.value)}
-                  >
-                    {[
-                      "1m",
-                      "3m",
-                      "5m",
-                      "15m",
-                      "30m",
-                      "1h",
-                      "2h",
-                      "4h",
-                      "6h",
-                      "12h",
-                      "1d",
-                    ].map((x) => (
-                      <option key={x}>{x}</option>
-                    ))}
-                  </select>
+                <Field
+                  label={
+                    legacyActiveInterval ? "当前任务 K 线周期" : "基础 K 线周期"
+                  }
+                >
+                  <input
+                    value={
+                      legacyActiveInterval
+                        ? `${legacyActiveInterval}（已有任务）`
+                        : "1 分钟（1m）"
+                    }
+                    readOnly
+                    aria-readonly="true"
+                  />
                 </Field>
               </div>
               <Field
@@ -3160,7 +3221,7 @@ function Datasets({ data, mutate, notify, startDownload, downloadSubmitting }) {
             [
               "01",
               "仅使用已收盘 K 线",
-              "按北京时间选择区间；保留币安原始时间戳与分桶，不重采样。",
+              "按北京时间选择区间；以原始 1 分钟数据检查成交，仅用完整收盘分钟合成策略周期。",
             ],
             [
               "02",
@@ -3188,10 +3249,14 @@ function Datasets({ data, mutate, notify, startDownload, downloadSubmitting }) {
         jobs={jobs}
         disabled={downloadLocked || busy}
         onReuse={(config) => {
-          setForm(downloadForm(config));
+          setForm({ ...downloadForm(config), interval: "1m" });
           setTab("download");
           setErr("");
-          notify("已载入失败任务配置，确认后点击下载 K 线");
+          notify(
+            config.interval !== "1m"
+              ? "已载入区间与交易对，新任务将按 1 分钟下载，请确认总数据量"
+              : "已载入失败任务配置，确认后点击下载 K 线",
+          );
         }}
       />
       <section className="panel">
@@ -3360,6 +3425,9 @@ function Strategies({ strategies, mutate, notify, go }) {
                   </b>
                 </span>
                 <span>
+                  策略周期<b>{m.timeframes?.primary || "1m"} · 1m 撮合</b>
+                </span>
+                <span>
                   参数数量
                   <b>{Object.keys(m.parameters?.properties || {}).length} 项</b>
                 </span>
@@ -3460,6 +3528,14 @@ function Strategies({ strategies, mutate, notify, go }) {
               {strategyManifest(detail).symbols?.values?.length
                 ? strategySymbols(detail).join(" / ")
                 : "交易对可配置"}
+            </strong>
+            <span>策略周期</span>
+            <strong>
+              {(detail.manifest || detail).timeframes?.primary || "1m"}
+              {(detail.manifest || detail).timeframes?.additional?.length
+                ? ` · 辅助 ${(detail.manifest || detail).timeframes.additional.join(" / ")}`
+                : ""}
+              {" · 基于 1m 合成与撮合"}
             </strong>
             <span>执行模型</span>
             <strong>
@@ -3670,6 +3746,143 @@ function MetricComparison({ train = {}, validation = {} }) {
     </div>
   );
 }
+function ExperimentScope({ experiment, value, onChange }) {
+  if (!experiment) return null;
+  const symbols = [
+    ...new Set([
+      ...(experiment.symbols || experiment.config?.symbols || []),
+      ...Object.keys(experiment.symbol_results || {}),
+    ]),
+  ];
+  const available = experiment.symbol_results || {};
+  const pending = ["queued", "running"].includes(experiment.status);
+  const allocation = available[value]?.allocation;
+  return (
+    <div className="experiment-scope">
+      <div
+        className="experiment-scope-controls"
+        role="group"
+        aria-label="实验结果范围"
+      >
+        <span>结果范围</span>
+        <button
+          type="button"
+          aria-pressed={value === "all"}
+          className={value === "all" ? "selected" : ""}
+          onClick={() => onChange("all")}
+        >
+          汇总
+        </button>
+        {symbols.map((symbol) => (
+          <button
+            type="button"
+            key={symbol}
+            aria-pressed={value === symbol}
+            className={value === symbol ? "selected" : ""}
+            disabled={!available[symbol]}
+            title={
+              !available[symbol]
+                ? pending
+                  ? "等待该交易对的回测数据"
+                  : "该交易对暂无可用结果"
+                : undefined
+            }
+            onClick={() => onChange(symbol)}
+          >
+            {symbol}
+          </button>
+        ))}
+      </div>
+      {value !== "all" && available[value] && (
+        <p className="experiment-scope-note">
+          同一次组合运行的交易对归因，初始资金按交易对等分
+          {allocation?.initial_capital != null
+            ? `，本币 ${money(allocation.initial_capital)} U`
+            : ""}
+          ；包含该币的手续费与未平仓盈亏。
+        </p>
+      )}
+      {symbols.length > 1 && !Object.keys(available).length && (
+        <p className="experiment-scope-note">
+          {pending
+            ? "按交易对结果将在处理对应行情后显示。"
+            : experiment.status === "completed"
+              ? "此历史实验未记录按交易对结果，请使用 1 分钟数据重新运行后查看。"
+              : "实验未完成，尚无按交易对结果；请先处理失败原因后重新运行。"}
+        </p>
+      )}
+    </div>
+  );
+}
+function ResultMetrics({ metrics }) {
+  return (
+    <>
+      <p className="result-metrics-caption">回测集核心指标</p>
+      <div className="result-metrics">
+        {[
+          ["最终权益", metrics?.final_equity, "U"],
+          [
+            "总收益率",
+            metrics?.total_return != null ? metrics.total_return * 100 : null,
+            "%",
+          ],
+          [
+            "最大回撤",
+            metrics?.max_drawdown != null ? metrics.max_drawdown * 100 : null,
+            "%",
+          ],
+          ["成交订单", metrics?.total_orders, "笔"],
+        ].map(([label, value, unit]) => (
+          <div key={label}>
+            <span>{label}</span>
+            <strong
+              className={
+                label === "总收益率"
+                  ? valueTone(value)
+                  : label === "最大回撤" && value > 0
+                    ? "negative"
+                    : ""
+              }
+            >
+              {value == null
+                ? "—"
+                : unit === "%"
+                  ? Number(value).toFixed(2)
+                  : unit === "笔"
+                    ? value
+                    : money(value)}
+              <small>{unit}</small>
+            </strong>
+          </div>
+        ))}
+      </div>
+    </>
+  );
+}
+function CurveSplit({ value, onChange }) {
+  return (
+    <div
+      className="segmented experiment-curve-split"
+      role="group"
+      aria-label="权益曲线区间"
+    >
+      {[
+        ["train", "回测集"],
+        ["validation", "验证集"],
+      ].map(([key, title]) => (
+        <button
+          type="button"
+          key={key}
+          aria-pressed={value === key}
+          className={value === key ? "selected" : ""}
+          onClick={() => onChange(key)}
+        >
+          {title}
+        </button>
+      ))}
+    </div>
+  );
+}
 function Backtest({ data, mutate, notify, go }) {
   const strategies = data.strategies || [],
     datasets = data.datasets || [];
@@ -3687,7 +3900,12 @@ function Backtest({ data, mutate, notify, go }) {
     [configTab, setConfigTab] = useState("strategy"),
     [form, setForm] = useState({
       name: "",
-      dataset_id: datasets[0]?.id || "",
+      dataset_id:
+        datasets.find(
+          (d) =>
+            d.interval === "1m" &&
+            d.market === (initialStrategy?.manifest || initialStrategy)?.market,
+        )?.id || "",
       symbols: strategySymbols(initialStrategy).join(","),
       initial_capital: 10000,
       fee_rate: isMakerStrategy(initialStrategy) ? 0.0002 : 0.0004,
@@ -3701,12 +3919,18 @@ function Backtest({ data, mutate, notify, go }) {
     }),
     [busy, setBusy] = useState(false),
     [active, setActive] = useState(null),
+    [resultScope, setResultScope] = useState("all"),
+    [curveSplit, setCurveSplit] = useState("train"),
     [err, setErr] = useState("");
   const s = strategies.find((x) => x.id === sid) || strategies[0],
     manifest = s?.manifest || s || {},
     props = manifest.parameters?.properties || {},
     maker = isMakerStrategy(s),
-    strategyPresets = presets.filter((item) => item.strategy_id === sid);
+    strategyPresets = presets.filter((item) => item.strategy_id === sid),
+    minuteDatasets = datasets.filter(
+      (d) => d.interval === "1m" && d.market === manifest.market,
+    ),
+    selectedDataset = datasets.find((d) => d.id === form.dataset_id);
   useEffect(() => {
     setSelectedPreset("");
     setPreset("");
@@ -3728,6 +3952,13 @@ function Backtest({ data, mutate, notify, go }) {
   const job =
     (data.experiments || []).find((e) => e.id === active) ||
     (data.experiments || []).find((e) => e.strategy_id === sid);
+  const scopeResult =
+    resultScope === "all" ? job : job?.symbol_results?.[resultScope];
+  const finalResult = job?.status === "completed" ? scopeResult : null;
+  useEffect(() => {
+    setResultScope("all");
+    setCurveSplit("train");
+  }, [job?.id]);
   const pvalues = Object.fromEntries(
     Object.entries(props).map(([k, p]) => [k, params[k] ?? p.default]),
   );
@@ -3846,6 +4077,12 @@ function Backtest({ data, mutate, notify, go }) {
                   setConfigTab("data");
                   throw new Error("请补全回测集与验证集的北京时间区间");
                 }
+                if (!selectedDataset || selectedDataset.interval !== "1m") {
+                  setConfigTab("data");
+                  throw new Error(
+                    "新回测需要 1 分钟 K 线数据，请先下载或导入 1m 数据集",
+                  );
+                }
                 const intervals = Object.fromEntries(
                   [
                     "train_start",
@@ -3938,6 +4175,12 @@ function Backtest({ data, mutate, notify, go }) {
                   · 最低资金 {manifest.account?.min_capital ?? "—"} U
                 </span>
               </div>
+              <p className="strategy-timeframes">
+                成交检查 1m · 策略周期 {manifest.timeframes?.primary || "1m"}
+                {manifest.timeframes?.additional?.length
+                  ? ` · 辅助周期 ${manifest.timeframes.additional.join(" / ")}`
+                  : ""}
+              </p>
               {maker && <MakerNotice compact />}
               <div className="backtest-form-tabs" aria-label="实验配置分组">
                 {[
@@ -4050,9 +4293,17 @@ function Backtest({ data, mutate, notify, go }) {
                       }}
                     >
                       <option value="">请选择数据集</option>
-                      {datasets.map((d) => (
+                      {selectedDataset &&
+                        !minuteDatasets.some(
+                          (d) => d.id === selectedDataset.id,
+                        ) && (
+                          <option value={selectedDataset.id} disabled>
+                            {selectedDataset.name} · 需更换为匹配市场的 1m 数据
+                          </option>
+                        )}
+                      {minuteDatasets.map((d) => (
                         <option key={d.id} value={d.id}>
-                          {d.name}{" "}
+                          {d.name} · 1m{" "}
                           {["demo", "synthetic"].includes(d.source)
                             ? "[合成数据]"
                             : ""}
@@ -4077,6 +4328,13 @@ function Backtest({ data, mutate, notify, go }) {
                     />
                   </Field>
                 </div>
+                <p className="minute-dataset-help">
+                  {minuteDatasets.length
+                    ? "仅列出当前市场的 1 分钟数据。策略所需周期由完整收盘分钟合成。"
+                    : "暂无当前市场的 1 分钟数据集，请先到行情数据下载或导入。"}
+                  {datasets.some((d) => d.interval !== "1m") &&
+                    " 旧的其他周期数据和实验仍保留，不能用于新的分钟撮合回测。"}
+                </p>
                 <p className="fee-source">
                   数据覆盖（北京时间）：
                   {formatBeijing(
@@ -4299,48 +4557,12 @@ function Backtest({ data, mutate, notify, go }) {
               </div>
               {job && <Badge status={job.status} />}
             </div>
-            <div className="result-metrics">
-              {[
-                ["最终权益", job?.metrics?.final_equity, "U"],
-                [
-                  "总收益率",
-                  job?.metrics?.total_return != null
-                    ? job.metrics.total_return * 100
-                    : null,
-                  "%",
-                ],
-                [
-                  "最大回撤",
-                  job?.metrics?.max_drawdown != null
-                    ? job.metrics.max_drawdown * 100
-                    : null,
-                  "%",
-                ],
-                ["成交订单", job?.metrics?.total_orders, "笔"],
-              ].map(([label, value, unit]) => (
-                <div key={label}>
-                  <span>{label}</span>
-                  <strong
-                    className={
-                      label === "总收益率"
-                        ? valueTone(value)
-                        : label === "最大回撤" && value > 0
-                          ? "negative"
-                          : ""
-                    }
-                  >
-                    {value == null
-                      ? "—"
-                      : unit === "%"
-                        ? `${Number(value).toFixed(2)}`
-                        : unit === "笔"
-                          ? value
-                          : money(value)}
-                    <small>{unit}</small>
-                  </strong>
-                </div>
-              ))}
-            </div>
+            <ExperimentScope
+              experiment={job}
+              value={resultScope}
+              onChange={setResultScope}
+            />
+            <ResultMetrics metrics={finalResult?.metrics} />
             {job && job.status !== "completed" && (
               <p className="result-incomplete">
                 {["queued", "running"].includes(job.status)
@@ -4355,7 +4577,9 @@ function Backtest({ data, mutate, notify, go }) {
                 <h2>权益变化</h2>
                 {!job && <p>运行回测后显示结果</p>}
               </div>
-              {job && <Badge status={job.status} />}
+              {job && (
+                <CurveSplit value={curveSplit} onChange={setCurveSplit} />
+              )}
             </div>
             {job && ["queued", "running"].includes(job.status) && (
               <div className="progress-block">
@@ -4367,7 +4591,14 @@ function Backtest({ data, mutate, notify, go }) {
               </div>
             )}
             {job ? (
-              <Chart data={job.curve || []} height={320} />
+              <Chart
+                data={
+                  (curveSplit === "train"
+                    ? scopeResult?.curve
+                    : scopeResult?.validation_curve) || []
+                }
+                height={320}
+              />
             ) : (
               <Empty
                 icon={FlaskConical}
@@ -4377,7 +4608,7 @@ function Backtest({ data, mutate, notify, go }) {
             )}
             {job?.curve_sampling && (
               <p className="chart-data-note">
-                概览按区间保留极值 · 实验详情包含完整数据
+                曲线预览按区间保留极值 · 完整分钟数据见权益 CSV 或报告
               </p>
             )}
             {job?.error && <div className="inline-error">{job.error}</div>}
@@ -4391,15 +4622,20 @@ function Backtest({ data, mutate, notify, go }) {
               {job && (
                 <Btn
                   icon={Download}
-                  onClick={() => exportJson(`experiment-${job.id}.json`, job)}
+                  onClick={() =>
+                    downloadFile(
+                      `/api/experiments/${job.id}/export?format=json`,
+                      `experiment-${job.id}.json`,
+                    )
+                  }
                 >
                   导出
                 </Btn>
               )}
             </div>
             <MetricComparison
-              train={job?.metrics}
-              validation={job?.validation_metrics}
+              train={finalResult?.metrics}
+              validation={finalResult?.validation_metrics}
             />
           </section>
           <div className="notice">
@@ -4420,6 +4656,15 @@ function Backtest({ data, mutate, notify, go }) {
 function Experiments({ data, mutate, notify, go }) {
   const [chosen, setChosen] = useState([]),
     [detail, setDetail] = useState(null),
+    [detailScope, setDetailScope] = useState("all"),
+    [detailCurveSplit, setDetailCurveSplit] = useState("train"),
+    [detailLoading, setDetailLoading] = useState(null),
+    [detailRefreshError, setDetailRefreshError] = useState(""),
+    [recordOffset, setRecordOffset] = useState(0),
+    [recordRevision, setRecordRevision] = useState(0),
+    [recordData, setRecordData] = useState(null),
+    [recordLoading, setRecordLoading] = useState(false),
+    [recordError, setRecordError] = useState(""),
     [filter, setFilter] = useState("all"),
     [tab, setTab] = useState("metrics"),
     [batch, setBatch] = useState(false),
@@ -4428,14 +4673,133 @@ function Experiments({ data, mutate, notify, go }) {
   const list = (data.experiments || []).filter(
     (e) => filter === "all" || e.status === filter,
   );
+  const detailRequest = useRef(null);
+  const recordPageSize = 20;
   const load = async (e) => {
+    if (detailRequest.current) return;
+    const controller = new AbortController();
+    detailRequest.current = controller;
+    setDetailLoading(e.id);
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, 20000);
     try {
-      setDetail(await api(`/experiments/${e.id}`));
+      const next = await api(
+        `/experiments/${e.id}?view=interactive`,
+        undefined,
+        undefined,
+        { signal: controller.signal },
+      );
+      if (detailRequest.current !== controller) return;
+      setDetail(next);
+      setDetailScope("all");
+      setDetailCurveSplit("train");
+      setDetailRefreshError("");
+      setRecordOffset(0);
+      setRecordData(null);
       setTab("metrics");
     } catch (err) {
-      notify(err.message);
+      if (!controller.signal.aborted || timedOut)
+        notify(timedOut ? "实验详情读取超时，请稍后重试" : err.message);
+    } finally {
+      clearTimeout(timeout);
+      if (detailRequest.current === controller) {
+        detailRequest.current = null;
+        setDetailLoading(null);
+      }
     }
   };
+  useEffect(
+    () => () => {
+      const current = detailRequest.current;
+      detailRequest.current = null;
+      current?.abort();
+    },
+    [],
+  );
+  const detailResult =
+    detailScope === "all" ? detail : detail?.symbol_results?.[detailScope];
+  const finalDetailResult =
+    detail?.status === "completed" ? detailResult : null;
+  useEffect(() => {
+    if (!detail?.id || !["queued", "running"].includes(detail.status)) return;
+    let current = true,
+      timer,
+      controller;
+    const update = async () => {
+      controller = new AbortController();
+      let timedOut = false;
+      const timeout = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, 20000);
+      try {
+        const next = await api(
+          `/experiments/${detail.id}?view=interactive`,
+          undefined,
+          undefined,
+          { signal: controller.signal },
+        );
+        if (current) {
+          setDetail(next);
+          setDetailRefreshError("");
+        }
+      } catch (error) {
+        if (current && (!controller.signal.aborted || timedOut))
+          setDetailRefreshError(
+            timedOut
+              ? "详情更新超时，将自动重试；当前显示为上次读取的数据。"
+              : `详情更新失败：${error.message}`,
+          );
+      } finally {
+        clearTimeout(timeout);
+        if (current) timer = setTimeout(update, 10000);
+      }
+    };
+    timer = setTimeout(update, 10000);
+    return () => {
+      current = false;
+      clearTimeout(timer);
+      controller?.abort();
+    };
+  }, [detail?.id, detail?.status]);
+  useEffect(() => {
+    if (!detail?.id || !["orders", "decisions"].includes(tab)) return;
+    let current = true,
+      timedOut = false;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, 20000);
+    setRecordLoading(true);
+    setRecordData(null);
+    setRecordError("");
+    api(
+      `/experiments/${detail.id}/records/${tab}?offset=${recordOffset}&limit=${recordPageSize}`,
+      undefined,
+      undefined,
+      { signal: controller.signal },
+    )
+      .then((result) => {
+        if (current) setRecordData(result);
+      })
+      .catch((error) => {
+        if (current && (!controller.signal.aborted || timedOut))
+          setRecordError(timedOut ? "明细读取超时，请重试" : error.message);
+      })
+      .finally(() => {
+        clearTimeout(timeout);
+        if (current) setRecordLoading(false);
+      });
+    return () => {
+      current = false;
+      clearTimeout(timeout);
+      controller.abort();
+    };
+  }, [detail?.id, detail?.status, tab, recordOffset, recordRevision]);
   const compared = list.filter((e) => chosen.includes(e.id));
   return (
     <>
@@ -4510,7 +4874,11 @@ function Experiments({ data, mutate, notify, go }) {
                     />
                   </td>
                   <td>
-                    <button className="table-name" onClick={() => load(e)}>
+                    <button
+                      className="table-name"
+                      disabled={Boolean(detailLoading)}
+                      onClick={() => load(e)}
+                    >
                       <strong>{e.name || e.strategy_name}</strong>
                       <small>
                         {e.strategy_name}
@@ -4555,10 +4923,19 @@ function Experiments({ data, mutate, notify, go }) {
                     <div className="row-buttons">
                       <button
                         className="icon-btn"
-                        aria-label="实验详情"
+                        aria-label={
+                          detailLoading === e.id
+                            ? "正在加载实验详情"
+                            : "实验详情"
+                        }
+                        disabled={Boolean(detailLoading)}
                         onClick={() => load(e)}
                       >
-                        <ArrowUpRight size={17} />
+                        {detailLoading === e.id ? (
+                          <Loader2 size={17} className="spin" />
+                        ) : (
+                          <ArrowUpRight size={17} />
+                        )}
                       </button>
                       {["queued", "running"].includes(e.status) ? (
                         <button
@@ -4707,23 +5084,68 @@ function Experiments({ data, mutate, notify, go }) {
               <button
                 key={k}
                 className={tab === k ? "active" : ""}
-                onClick={() => setTab(k)}
+                onClick={() => {
+                  setTab(k);
+                  setRecordOffset(0);
+                }}
               >
                 {v}
               </button>
             ))}
           </div>
+          {detailRefreshError && (
+            <div className="inline-error" role="status">
+              {detailRefreshError}
+            </div>
+          )}
           {detail.error && (
             <div className="inline-error">失败原因：{detail.error}</div>
           )}
           {tab === "metrics" && (
-            <>
-              <Chart data={detail.curve || []} height={200} />
-              <MetricComparison
-                train={detail.metrics}
-                validation={detail.validation_metrics}
+            <div className="experiment-detail-results">
+              <div className="experiment-detail-heading">
+                <h3>实验结果</h3>
+                <Badge status={detail.status} />
+              </div>
+              <ExperimentScope
+                experiment={detail}
+                value={detailScope}
+                onChange={setDetailScope}
               />
-            </>
+              <ResultMetrics metrics={finalDetailResult?.metrics} />
+              {detail.status !== "completed" && (
+                <p className="result-incomplete">
+                  实验未完成，曲线仅显示已处理数据，最终统计尚不可用。
+                </p>
+              )}
+              <div className="experiment-detail-heading">
+                <h3>权益变化</h3>
+                <CurveSplit
+                  value={detailCurveSplit}
+                  onChange={setDetailCurveSplit}
+                />
+              </div>
+              <Chart
+                data={
+                  (detailCurveSplit === "train"
+                    ? detailResult?.curve
+                    : detailResult?.validation_curve) || []
+                }
+                height={260}
+              />
+              {detail.curve_sampling && (
+                <p className="chart-data-note">
+                  曲线预览按区间保留极值 · 完整分钟数据见权益 CSV 或报告
+                </p>
+              )}
+              <div className="experiment-detail-heading">
+                <h3>回测集与验证集对比</h3>
+              </div>
+              <MetricComparison
+                train={finalDetailResult?.metrics}
+                validation={finalDetailResult?.validation_metrics}
+              />
+            </div>
           )}
           {tab === "provenance" && (
             <pre className="code-block">
@@ -4737,27 +5159,75 @@ function Experiments({ data, mutate, notify, go }) {
               )}
             </pre>
           )}
-          {tab === "decisions" && (
-            <pre className="code-block">
-              {JSON.stringify(
-                displayBeijingTimes(
-                  detail.decisions || detail.result?.decisions || [],
-                ),
-                null,
-                2,
-              )}
-            </pre>
-          )}
-          {tab === "orders" && (
-            <pre className="code-block">
-              {JSON.stringify(
-                displayBeijingTimes(
-                  detail.orders || detail.result?.orders || [],
-                ),
-                null,
-                2,
-              )}
-            </pre>
+          {["orders", "decisions"].includes(tab) && (
+            <div className="experiment-records">
+              <div className="experiment-record-toolbar">
+                <span>
+                  {tab === "orders" ? "全部交易对成交记录" : "完整策略决策"} ·
+                  每页 {recordPageSize} 条
+                  {recordData
+                    ? ` · 共 ${recordData.total.toLocaleString("en-US")} 条`
+                    : ""}
+                </span>
+                <div className="row-buttons">
+                  <Btn
+                    disabled={recordLoading || recordOffset === 0}
+                    onClick={() =>
+                      setRecordOffset(
+                        Math.max(0, recordOffset - recordPageSize),
+                      )
+                    }
+                  >
+                    上一页
+                  </Btn>
+                  <Btn
+                    disabled={recordLoading || !recordData?.has_more}
+                    onClick={() =>
+                      setRecordOffset(recordOffset + recordPageSize)
+                    }
+                  >
+                    下一页
+                  </Btn>
+                  <Btn
+                    disabled={recordLoading}
+                    icon={RefreshCw}
+                    onClick={() => setRecordRevision((value) => value + 1)}
+                  >
+                    刷新
+                  </Btn>
+                </div>
+              </div>
+              {recordError && <div className="inline-error">{recordError}</div>}
+              {recordLoading ? (
+                <div className="experiment-record-loading" role="status">
+                  <Loader2 size={18} className="spin" />
+                  正在读取明细
+                </div>
+              ) : recordData?.rows?.length ? (
+                <>
+                  <p className="experiment-record-range">
+                    第 {recordData.offset + 1}–
+                    {recordData.offset + recordData.rows.length} 条
+                  </p>
+                  <pre className="code-block">
+                    {JSON.stringify(
+                      displayBeijingTimes(recordData.rows),
+                      null,
+                      2,
+                    )}
+                  </pre>
+                </>
+              ) : !recordError ? (
+                <Empty
+                  title="暂无明细记录"
+                  desc={
+                    detail.status === "completed"
+                      ? "该实验没有此类记录。"
+                      : "任务完成后可查看持久化明细。"
+                  }
+                />
+              ) : null}
+            </div>
           )}
           <div className="modal-footer">
             <Btn
@@ -4786,11 +5256,16 @@ function Experiments({ data, mutate, notify, go }) {
                 )
               }
             >
-              导出成交 CSV
+              导出权益 CSV
             </Btn>
             <Btn
               icon={Download}
-              onClick={() => exportJson(`experiment-${detail.id}.json`, detail)}
+              onClick={() =>
+                downloadFile(
+                  `/api/experiments/${detail.id}/export?format=json`,
+                  `experiment-${detail.id}.json`,
+                )
+              }
             >
               导出完整报告
             </Btn>
@@ -4822,7 +5297,9 @@ function Experiments({ data, mutate, notify, go }) {
               onClick={async () => {
                 setBusy(true);
                 try {
-                  const base = await api(`/experiments/${chosen[0]}`);
+                  const base = await api(
+                    `/experiments/${chosen[0]}?view=interactive`,
+                  );
                   const result = await mutate("/experiments", {
                     ...experimentConfig(base),
                     parameters: base.parameters,
@@ -4945,6 +5422,7 @@ const protocolExample = `MANIFEST = {
     "name": "My Strategy", "version": "1.0.0",
     "description": "策略说明", "market": "spot",
     "symbols": {"mode": "any", "values": [], "min_count": 1},
+    "timeframes": {"primary": "1h", "additional": ["4h"]},
     "account": {
         "position_modes": ["one_way"], "margin_modes": ["cash"],
         "leverage_min": 1, "leverage_max": 1, "min_capital": 100
@@ -4956,7 +5434,8 @@ const protocolExample = `MANIFEST = {
 
 class Strategy:
     def on_bar(self, context):
-        # 只能读取当前与历史数据，意图在下一根 K 线开盘执行
+        # 完整主周期收盘后回调；框架逐分钟检查成交
+        # history/candles 为主周期，其他周期见 timeframe_history/timeframe_candles
         symbol = next(iter(context["candles"]))
         context["log"]("debug", "等待入场条件")
         return []
@@ -5074,6 +5553,10 @@ function Protocol({ notify }) {
                     ],
                     ["market", "spot 或 futures；现货禁止杠杆与做空"],
                     ["symbols", "固定币种、多币种数量或不限币种"],
+                    [
+                      "timeframes",
+                      "primary 主周期与 additional 辅助周期；省略时主周期为 1m，均由完整收盘分钟合成",
+                    ],
                     ["account", "持仓模式、保证金模式、杠杆范围、最低 U 资金"],
                     [
                       "parameters",
@@ -5085,7 +5568,11 @@ function Protocol({ notify }) {
                     ],
                     [
                       "Strategy.on_bar(context)",
-                      "返回交易意图列表；不直接访问交易所",
+                      "完整主周期收盘后返回交易意图；框架每分钟检查成交，不直接访问交易所",
+                    ],
+                    [
+                      'context["timeframe_candles"] / context["timeframe_history"]',
+                      "按周期与交易对读取已完成的合成 K 线，不包含未收盘周期",
                     ],
                     ['context["log"]', "debug / error 级别结构化日志"],
                     ['context["emit"]', "策略阶段、指标、图表线和决策原因"],

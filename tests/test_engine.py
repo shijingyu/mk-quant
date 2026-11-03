@@ -27,7 +27,7 @@ def source(body, market="futures", manifest=None):
     return "MANIFEST = " + repr(manifest) + "\nclass Strategy:\n    def on_bar(self, context):\n" + "\n".join("        " + line for line in body.splitlines()) + "\n"
 
 
-def bars(prices, start=1735689600000, step=3600000):
+def bars(prices, start=1735689600000, step=60000):
     return [{"timestamp": start + index * step, "open": price, "high": price * 1.1,
              "low": price * 0.9, "close": price, "volume": 100} for index, price in enumerate(prices)]
 
@@ -88,7 +88,7 @@ class EngineExecutionTests(unittest.TestCase):
         result = run(code, prices=(100, 200, 300))
         order = result["orders"][0]
         self.assertEqual(order["price"], 200)
-        self.assertEqual(order["timestamp"] - order["signal_timestamp"], 3600000)
+        self.assertEqual(order["timestamp"] - order["signal_timestamp"], 60000)
         self.assertEqual(result["metrics"]["final_equity"], 1100)
         self.assertEqual(result["equity"][0]["equity"], 1000)
 
@@ -160,9 +160,11 @@ class EngineExecutionTests(unittest.TestCase):
                       "return []")
         btc = bars([100, 110, 120, 130])
         eth = bars([10, 11, 12, 13])[1:]
-        result = run(code, candles={"BTCUSDT": btc, "ETHUSDT": eth})
+        with self.assertRaisesRegex(ValueError, "相同完整"):
+            run(code, candles={"BTCUSDT": btc, "ETHUSDT": eth})
+        result = run(code, candles={"BTCUSDT": btc[1:], "ETHUSDT": eth})
         self.assertEqual(len(result["equity"]), 3)
-        self.assertEqual(result["assumptions"]["dropped_unaligned_bars"]["BTCUSDT"], 1)
+        self.assertEqual(result["assumptions"]["dropped_unaligned_bars"]["BTCUSDT"], 0)
 
     def test_reversal_short_profit_and_partial_fee_allocation(self):
         code = source("orders = {0: ('sell', 2), 1: ('buy', 1), 2: ('buy', 2)}\n"

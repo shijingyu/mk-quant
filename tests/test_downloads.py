@@ -30,16 +30,16 @@ def client(mysql_database):
 
 
 def body(**changes):
-    return {"name":"公开行情测试","market":"futures","symbols":["BTCUSDC"],"interval":"1h","start":"2026-09-01","end":"2026-09-02",**changes}
+    return {"name":"公开行情测试","market":"futures","symbols":["BTCUSDC"],"interval":"1m","start":"2026-09-01","end":"2026-09-02",**changes}
 
 
 def candles(start):
-    return [{"timestamp":start+i*3600000,"open":100,"high":102,"low":99,"close":101,"volume":10} for i in range(2)]
+    return [{"timestamp":start+i*60000,"open":100,"high":102,"low":99,"close":101,"volume":10} for i in range(2)]
 
 
 def fake_klines(self,symbol,interval,start,end,*,progress,max_rows):
     result=candles(start)
-    progress({"rows":len(result),"cursor":start+7200000,"end":end})
+    progress({"rows":len(result),"cursor":start+120000,"end":end})
     return result
 
 
@@ -124,8 +124,8 @@ from backend import downloads
 from backend.binance import BinanceClient
 
 def fixture(self,symbol,interval,start,end,*,progress,max_rows):
-    rows=[{"timestamp":start+i*3600000,"open":100,"high":102,"low":99,"close":101,"volume":10} for i in range(2)]
-    progress({"rows":2,"cursor":start+7200000,"end":end})
+    rows=[{"timestamp":start+i*60000,"open":100,"high":102,"low":99,"close":101,"volume":10} for i in range(2)]
+    progress({"rows":2,"cursor":start+120000,"end":end})
     return rows
 BinanceClient.klines=fixture
 downloads.run(sys.argv[1],sys.argv[2])
@@ -203,7 +203,7 @@ def test_active_job_is_not_lost_behind_recent_history(client):
 
 
 def test_limits_validation_and_worker_dispatch(client,monkeypatch):
-    invalid=[body(interval="bad"),body(symbols=["BTCUSDC","BTCUSDC"]),body(market="invalid"),body(start="2025-01-01",end="2026-01-01",interval="1m")]
+    invalid=[body(interval="bad"),body(interval="1h"),body(interval="1d"),body(symbols=["BTCUSDC","BTCUSDC"]),body(market="invalid"),body(start="2025-01-01",end="2026-01-01",interval="1m")]
     for config in invalid:
         assert client.post("/api/datasets/download",json=config).status_code==422
     assert downloads.MAX_CANDLES==100000 and downloads.LEASE_SECONDS==180
@@ -226,6 +226,12 @@ def test_limits_validation_and_worker_dispatch(client,monkeypatch):
     worker.backtest_loop(once=True)
     failed=downloads.get_job(job["id"])
     assert failed["status"]=="failed" and "资源上限" in failed["error"]
+
+
+def test_omitted_download_interval_defaults_to_minute(client):
+    config=body();config.pop("interval")
+    response=client.post("/api/datasets/download",json=config)
+    assert response.status_code==202 and response.json()["config"]["interval"]=="1m"
 
 
 def test_child_wall_deadline_bypasses_exchange_retry_chain(client,monkeypatch):

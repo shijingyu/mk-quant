@@ -3,7 +3,7 @@
 MANIFEST = {
     "id": "momentum",
     "name": "双均线趋势",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "description": "已收盘快慢均线交叉产生交易意图，下一根开盘执行。支持多币种单向合约持仓。",
     "market": "futures",
     "symbols": {"mode": "any", "values": [], "min_count": 1},
@@ -14,6 +14,7 @@ MANIFEST = {
         "leverage_max": 5,
         "min_capital": 100,
     },
+    "timeframes": {"primary": "1h", "additional": []},
     "history_window": 1000,
     "parameters": {
         "type": "object",

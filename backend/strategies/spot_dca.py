@@ -3,11 +3,12 @@
 MANIFEST = {
     "id": "spot_dca",
     "name": "现货定投",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "description": "按固定 K 线间隔定额买入现货，到达止盈比例时卖出；不借币、不做空、不使用杠杆。",
     "market": "spot",
     "symbols": {"mode": "any", "values": [], "min_count": 1},
     "account": {"position_modes": ["one_way"], "margin_modes": ["cash"], "leverage_min": 1, "leverage_max": 1, "min_capital": 100},
+    "timeframes": {"primary": "1h", "additional": []},
     "history_window": 2,
     "parameters": {
         "type": "object",

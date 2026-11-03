@@ -4,7 +4,7 @@ import math
 MANIFEST = {
     "id": "usdc_hedge_grid",
     "name": "等比网格 · USDC 双向 Maker",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "description": "五种 USDC 永续可组合运行；独立多空等比网格，入场成交后由执行器立即建立对应止盈和条件止损。全部 Post Only，止损可能触发后仍未成交，不转市价。",
     "market": "futures",
     "symbols": {"mode": "any", "values": ["BTCUSDC", "ETHUSDC", "SOLUSDC", "BNBUSDC", "XRPUSDC"], "min_count": 1},
@@ -13,6 +13,7 @@ MANIFEST = {
         "leverage_min": 1, "leverage_max": 5, "min_capital": 1000,
     },
     "execution": {"model": "maker_grid_v1", "fee_role": "maker", "time_in_force": "GTX"},
+    "timeframes": {"primary": "1m", "additional": []},
     "history_window": 2,
     "parameters": {
         "type": "object",
