@@ -23,9 +23,6 @@ const money = (value) =>
 function GridResult({ type, result }) {
   const geometric = type === "geometric";
   const grid = result[type];
-  const nextPrice = geometric
-    ? result.upperPrice / grid.ratio
-    : result.lowerPrice + grid.spacing * (grid.gridCount - 1);
   return (
     <article
       className="panel grid-result"
@@ -44,7 +41,6 @@ function GridResult({ type, result }) {
           <dd>
             {format(grid.gridCount, 0)} <span>格</span>
           </dd>
-          <small>理论 {format(grid.rawCount)} 格，向上取整</small>
         </div>
         <div>
           <dt>实际加仓间距</dt>
@@ -56,17 +52,8 @@ function GridResult({ type, result }) {
                 : `${format(grid.spacing, 6)} 元`}
             </strong>
           </dd>
-          <small>
-            {geometric
-              ? `对应向上格距 ${format(grid.risePercent)}%`
-              : `价差占区间均价的 ${format(grid.densityPercent)}%`}
-          </small>
         </div>
       </dl>
-      <p className="grid-buy-rule">
-        从上一档网格价向下，每跨一格买入 {result.sharesPerGrid} 股。
-        从上限开始，首档加仓价约 {format(nextPrice, 6)} 元。
-      </p>
       <div className="grid-capital">
         <span>所需资金（逐格合计）</span>
         <strong>
@@ -177,14 +164,12 @@ export default function Toolbox() {
               <dd>
                 {result ? format(result.midpointPrice, 6) : "—"} <span>元</span>
               </dd>
-              <small>（上限 + 下限）÷ 2</small>
             </div>
             <div>
               <dt>买入 100 股所需资金</dt>
               <dd>
                 {result ? money(result.costPerGrid) : "—"} <span>元</span>
               </dd>
-              <small>区间均价 × 100 股</small>
             </div>
           </dl>
         </div>
