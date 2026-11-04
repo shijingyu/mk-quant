@@ -1,0 +1,226 @@
+.toolbox-page {
+  min-width: 0;
+}
+.toolbox-categories {
+  display: flex;
+  margin-bottom: 20px;
+  border-bottom: 1px solid var(--border);
+}
+.toolbox-categories a {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  padding: 8px 16px;
+  color: var(--green);
+  border-bottom: 2px solid var(--green);
+  font-weight: 600;
+}
+.toolbox-page .grid-input-panel {
+  margin-bottom: 20px;
+}
+.toolbox-page .panel-heading {
+  gap: 16px;
+}
+.toolbox-page .panel-heading .btn {
+  min-height: 44px;
+  flex-shrink: 0;
+}
+.grid-inputs {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 20px;
+}
+.grid-inputs .field {
+  margin: 0;
+  min-width: 0;
+}
+.grid-inputs label {
+  font-weight: 500;
+}
+.grid-inputs input {
+  min-height: 44px;
+  font-variant-numeric: tabular-nums;
+}
+.grid-inputs input[aria-invalid="true"] {
+  border-color: var(--red);
+}
+.toolbox-page .grid-field-error {
+  color: var(--red);
+}
+.grid-density-help {
+  margin-top: 16px;
+  font-size: 13px;
+  line-height: 1.7;
+}
+.grid-shared-metrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 24px;
+  margin: 20px 0 0;
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
+}
+.grid-shared-metrics dt,
+.grid-result-metrics dt {
+  color: var(--muted);
+  font-size: 13px;
+}
+.grid-shared-metrics dd,
+.grid-result-metrics dd {
+  margin: 5px 0;
+  font-size: 26px;
+  font-weight: 600;
+  line-height: 1.4;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.grid-shared-metrics dd span,
+.grid-result-metrics dd span {
+  font-size: 14px;
+  font-weight: 400;
+  color: var(--muted);
+}
+.grid-shared-metrics small,
+.grid-result-metrics small {
+  color: var(--muted);
+  font-size: 12px;
+}
+.grid-comparison {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 20px;
+}
+.toolbox-page .grid-result {
+  margin: 0;
+  padding: 24px;
+  min-width: 0;
+}
+.grid-result-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.grid-result-heading h3 {
+  font-size: 17px;
+}
+.grid-result-heading p {
+  margin-top: 4px;
+  font-size: 13px;
+}
+.grid-result-heading .badge {
+  white-space: nowrap;
+}
+.grid-result-metrics {
+  display: grid;
+  grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.15fr);
+  gap: 16px;
+  margin: 24px 0 16px;
+}
+.grid-result-metrics .grid-count dd {
+  font-size: 34px;
+}
+.grid-result-metrics .grid-spacing {
+  font-size: 14px;
+  font-weight: 400;
+  line-height: 1.8;
+}
+.grid-spacing strong {
+  display: block;
+  font-size: 22px;
+}
+.grid-buy-rule {
+  font-size: 13px;
+  line-height: 1.7;
+}
+.grid-capital {
+  margin-top: 20px;
+  padding: 18px;
+  border-radius: var(--radius-control);
+  background: var(--soft-green);
+  color: var(--green);
+}
+.grid-capital > span {
+  font-size: 13px;
+}
+.grid-capital > strong {
+  display: block;
+  font-size: 30px;
+  line-height: 1.5;
+  margin: 4px 0;
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+.grid-capital strong small {
+  font-size: 14px;
+  font-weight: 400;
+}
+.grid-capital p {
+  color: inherit;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.grid-capital-note {
+  margin: 16px 0 20px;
+  font-size: 13px;
+  line-height: 1.8;
+}
+.toolbox-page .grid-formulas {
+  margin: 0;
+  padding: 0 20px;
+}
+.grid-formulas summary {
+  cursor: pointer;
+  padding: 14px 0;
+  min-height: 44px;
+  font-weight: 500;
+}
+.grid-formulas > div {
+  display: grid;
+  gap: 8px;
+  padding: 4px 0 20px;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.grid-empty-result {
+  padding: 36px 20px;
+  color: var(--muted);
+  text-align: center;
+}
+@media (max-width: 1100px) {
+  .toolbox-page .grid-result {
+    padding: 20px;
+  }
+  .grid-result-metrics {
+    grid-template-columns: 1fr;
+  }
+}
+@media (max-width: 640px) {
+  .grid-inputs,
+  .grid-comparison {
+    grid-template-columns: 1fr;
+  }
+  .grid-inputs {
+    gap: 16px;
+  }
+  .grid-inputs input {
+    font-size: 16px;
+  }
+  .grid-result-metrics {
+    grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
+  }
+  .grid-shared-metrics {
+    gap: 16px;
+  }
+  .grid-shared-metrics dd {
+    font-size: 22px;
+  }
+  .grid-spacing strong {
+    font-size: 20px;
+  }
+  .toolbox-page .panel-heading {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+}

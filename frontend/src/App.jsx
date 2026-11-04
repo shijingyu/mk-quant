@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useMemo, useRef, useId } from "react";
 import { createPortal } from "react-dom";
+import Toolbox from "./Toolbox.jsx";
 import {
   formatBeijing,
   beijingInputToISO,
@@ -60,6 +61,7 @@ import {
   Trash2,
   Upload,
   Wallet,
+  Wrench,
   X,
   XCircle,
 } from "lucide-react";
@@ -193,6 +195,7 @@ const navs = [
   {
     group: "系统",
     items: [
+      ["toolbox", "工具箱", Wrench],
       ["logs", "运行日志", Terminal],
       ["protocol", "策略接入协议", BookOpen],
       ["todo", "to-do", ClipboardList],
@@ -962,6 +965,7 @@ export default function App() {
               {page === "logs" && (
                 <Logs logs={data.logs || []} strategies={strategies} />
               )}
+              {page === "toolbox" && <Toolbox />}
               {page === "protocol" && <Protocol notify={notify} />}
               {page === "todo" && <Todo />}
             </>
