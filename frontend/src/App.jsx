@@ -1,3 +1,5 @@
+import {VersionSnapshot, ExperimentRecords} from "./ReportViews.jsx";
+import {preferredMetric, splitMetrics} from "./reportMetrics.js";
 import React, { useEffect, useState, useMemo, useRef, useId } from "react";
 import { createPortal } from "react-dom";
 import Toolbox from "./Toolbox.jsx";
@@ -3929,7 +3931,7 @@ function MetricComparison({ train = {}, validation = {} }) {
             <th>指标</th>
             <th className="numeric">回测集</th>
             <th className="numeric">验证集</th>
-            <th className="numeric">差异</th>
+            <th className="numeric">差异（验证 − 回测）</th>
           </tr>
         </thead>
         <tbody>
@@ -3942,14 +3944,15 @@ function MetricComparison({ train = {}, validation = {} }) {
                   : unit === "int"
                     ? v
                     : money(v) + (unit === "U" ? " U" : "");
+            const best = preferredMetric(key, train[key], validation[key]);
             return (
               <tr key={key}>
                 <td>{label}</td>
-                <td className="numeric">{format(train[key])}</td>
-                <td className="numeric">{format(validation[key])}</td>
+                <td className={`numeric ${best === "train" ? "metric-better" : ""}`}>{best === "train" && <span className="metric-better-label">较优</span>}{format(train[key])}</td>
+                <td className={`numeric ${best === "validation" ? "metric-better" : ""}`}>{best === "validation" && <span className="metric-better-label">较优</span>}{format(validation[key])}</td>
                 <td className="numeric dim">
                   {train[key] != null && validation[key] != null
-                    ? format(validation[key] - train[key])
+                    ? unit === "%" ? `${((validation[key] - train[key]) * 100).toFixed(2)} 个百分点` : format(validation[key] - train[key])
                     : "—"}
                 </td>
               </tr>
@@ -4028,10 +4031,10 @@ function ExperimentScope({ experiment, value, onChange }) {
     </div>
   );
 }
-function ResultMetrics({ metrics }) {
+function ResultMetrics({ metrics, split = "train" }) {
   return (
     <>
-      <p className="result-metrics-caption">回测集核心指标</p>
+      <p className="result-metrics-caption">{split === "validation" ? "验证集" : "回测集"}核心指标</p>
       <div className="result-metrics">
         {[
           ["最终权益", metrics?.final_equity, "U"],
@@ -4776,7 +4779,7 @@ function Backtest({ data, mutate, notify, go }) {
               value={resultScope}
               onChange={setResultScope}
             />
-            <ResultMetrics metrics={finalResult?.metrics} />
+            <ResultMetrics metrics={splitMetrics(finalResult, curveSplit)} split={curveSplit} />
             {job && job.status !== "completed" && (
               <p className="result-incomplete">
                 {["queued", "running"].includes(job.status)
@@ -5413,7 +5416,7 @@ function Experiments({ data, mutate, notify, go }) {
                 value={detailScope}
                 onChange={setDetailScope}
               />
-              <ResultMetrics metrics={finalDetailResult?.metrics} />
+              <ResultMetrics metrics={splitMetrics(finalDetailResult, detailCurveSplit)} split={detailCurveSplit} />
               {detail.status !== "completed" && (
                 <p className="result-incomplete">
                   实验未完成，曲线仅显示已处理数据，最终统计尚不可用。
@@ -5449,16 +5452,7 @@ function Experiments({ data, mutate, notify, go }) {
             </div>
           )}
           {tab === "provenance" && (
-            <pre className="code-block">
-              {JSON.stringify(
-                displayBeijingTimes({
-                  provenance: detail.provenance,
-                  assumptions: detail.assumptions,
-                }),
-                null,
-                2,
-              )}
-            </pre>
+            <VersionSnapshot detail={detail} />
           )}
           {["orders", "decisions"].includes(tab) && (
             <div className="experiment-records">
@@ -5510,13 +5504,7 @@ function Experiments({ data, mutate, notify, go }) {
                     第 {recordData.offset + 1}–
                     {recordData.offset + recordData.rows.length} 条
                   </p>
-                  <pre className="code-block">
-                    {JSON.stringify(
-                      displayBeijingTimes(recordData.rows),
-                      null,
-                      2,
-                    )}
-                  </pre>
+                  <ExperimentRecords rows={recordData.rows} kind={tab} />
                 </>
               ) : !recordError ? (
                 <Empty

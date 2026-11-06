@@ -1,0 +1,84 @@
+.metric-better {
+  color: var(--green) !important;
+  background: color-mix(in srgb, var(--green) 9%, transparent);
+  font-weight: 600;
+}
+.metric-better-label {
+  font-size: 12px;
+  display: inline-block;
+  margin-right: 8px;
+  border: 1px solid currentColor;
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+.report-sections {
+  display: grid;
+  gap: 24px;
+}
+.report-sections h3 {
+  margin-bottom: 12px;
+}
+.report-table th {
+  min-width: 140px;
+  vertical-align: top;
+}
+.report-table td {
+  vertical-align: top;
+}
+.report-value {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.report-expand > button,
+.report-detail-button {
+  color: var(--green);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  padding: 8px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+  min-height: 40px;
+}
+.report-expanded {
+  margin-top: 12px;
+  min-width: 240px;
+  max-width: 100%;
+  white-space: normal;
+}
+.report-records td {
+  vertical-align: top;
+}
+.report-records td:last-child {
+  min-width: 180px;
+}
+
+.report-records table {
+  font-size: 14px;
+}
+.report-records .report-table table {
+  font-size: 13px;
+}
+@media (max-width: 600px) {
+  .report-sections {
+    gap: 18px;
+  }
+  .report-table th {
+    min-width: 110px;
+  }
+  .report-records td {
+    padding: 12px;
+  }
+}
+
+.report-row-detail {
+  padding: 16px;
+  background: var(--panel-alt);
+  max-width: 100%;
+}
+.report-row-detail h3 {
+  margin: 0 0 14px;
+}
+.report-records td:last-child {
+  min-width: 100px;
+}
