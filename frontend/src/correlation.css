@@ -261,3 +261,67 @@
   color: var(--green);
   background: color-mix(in srgb, var(--green) 10%, var(--panel));
 }
+
+.correlation-ranking tbody tr {
+  cursor: pointer;
+}
+.correlation-ranking tbody tr:hover td {
+  background: color-mix(
+    in srgb,
+    var(--correlation-selected-border) 8%,
+    var(--panel)
+  );
+}
+.correlation-ranking tbody tr.correlation-row-selected td,
+.correlation-ranking tbody tr.correlation-row-selected:hover td {
+  background: color-mix(
+    in srgb,
+    var(--correlation-selected-border) 15%,
+    var(--panel)
+  );
+}
+.correlation-ranking .correlation-row-selected td:first-child {
+  box-shadow: inset 3px 0 var(--correlation-selected-border);
+}
+.correlation-pair-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+  padding: 0;
+  color: inherit;
+  font-weight: 600;
+  background: transparent;
+  border: 0;
+  text-align: left;
+}
+.correlation-pair-button:focus-visible {
+  outline: 2px solid var(--correlation-selected-border);
+  outline-offset: 4px;
+  border-radius: 2px;
+}
+.correlation-row-marker {
+  font-size: 11px;
+  color: var(--correlation-selected-text);
+  background: var(--correlation-selected-bg);
+  padding: 1px 5px;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+.correlation-z {
+  font-variant-numeric: tabular-nums;
+}
+.correlation-z.high {
+  color: var(--red);
+  font-weight: 700;
+}
+.correlation-z.away {
+  color: var(--amber);
+  font-weight: 700;
+}
+.correlation-z.neutral {
+  color: var(--text);
+}
+.correlation-pair {
+  scroll-margin-top: 72px;
+}

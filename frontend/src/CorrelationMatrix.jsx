@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { formatBeijing } from "./time.js";
 import "./correlation.css";
 const windows = [
@@ -14,13 +14,40 @@ const statusTone = (status) =>
 const PairStatus = ({ status }) => (
   <span className={`correlation-state ${statusTone(status)}`}>{status}</span>
 );
+const samePair = (pair, a, b) =>
+  pair && ((pair.a === a && pair.b === b) || (pair.a === b && pair.b === a));
+const ZValue = ({ value }) => {
+  const magnitude = value == null ? null : Math.abs(value);
+  const tone = magnitude >= 2 ? "high" : magnitude >= 1 ? "away" : "neutral";
+  return (
+    <span
+      className={`correlation-z ${tone}`}
+      title={
+        value == null
+          ? "价差数据不足"
+          : "按绝对值分色：|Z| ≥ 2 红色；1 ≤ |Z| < 2 琥珀色；|Z| < 1 中性"
+      }
+    >
+      {value > 0 ? "+" : ""}
+      {num(value)}
+    </span>
+  );
+};
 export default function CorrelationMatrix() {
   const [data, setData] = useState(null),
     [error, setError] = useState(""),
     [window, setWindow] = useState("7d"),
     [ten, setTen] = useState(false),
-    [pair, setPair] = useState(null),
+    [pairSelection, setPair] = useState(null),
     [revision, setRevision] = useState(0);
+  const detailRef = useRef(null);
+  useEffect(() => {
+    if (pairSelection?.source === "ranking")
+      detailRef.current?.scrollIntoView({
+        block: "nearest",
+        behavior: "instant",
+      });
+  }, [pairSelection]);
   useEffect(() => {
     let active = true,
       timer,
@@ -59,12 +86,15 @@ export default function CorrelationMatrix() {
   const selected = data?.windows?.[window],
     seven = data?.windows?.["7d"],
     symbols = (selected?.symbols || []).slice(0, ten ? 10 : 20);
-  const choose = (a, b) =>
-    setPair(
-      selected?.pairs.find(
-        (p) => (p.a === a && p.b === b) || (p.a === b && p.b === a),
-      ) || null,
-    );
+  const pair =
+    selected?.pairs.find((p) => samePair(pairSelection, p.a, p.b)) || null;
+  const choose = (a, b) => setPair({ a, b });
+  const chooseRanking = (p) => {
+    setWindow("7d");
+    if (ten && ![p.a, p.b].every((s) => seven.symbols.slice(0, 10).includes(s)))
+      setTen(false);
+    setPair({ a: p.a, b: p.b, source: "ranking" });
+  };
   return (
     <section id="correlation-matrix" className="panel correlation-panel">
       <header className="panel-heading">
@@ -148,10 +178,7 @@ export default function CorrelationMatrix() {
                       <th scope="row">{short(a)}</th>
                       {symbols.map((b, j) => {
                         const v = selected.matrix[i][j];
-                        const isPair =
-                          pair &&
-                          ((pair.a === a && pair.b === b) ||
-                            (pair.a === b && pair.b === a));
+                        const isPair = samePair(pair, a, b);
                         return (
                           <td key={b}>
                             <button
@@ -230,7 +257,11 @@ export default function CorrelationMatrix() {
           </div>
         )}
         {pair && (
-          <section className="correlation-pair">
+          <section
+            className="correlation-pair"
+            ref={detailRef}
+            aria-label="已选配对详情"
+          >
             <h3>
               {pair.a} / {pair.b} · {selected.label}
             </h3>
@@ -238,7 +269,7 @@ export default function CorrelationMatrix() {
               {[
                 ["相关系数", num(pair.correlation)],
                 ["对冲比率 β", num(pair.beta, 4)],
-                ["价差 Z 值", num(pair.zscore)],
+                ["价差 Z 值", <ZValue value={pair.zscore} />],
                 [
                   "半衰期",
                   pair.half_life == null
@@ -260,7 +291,8 @@ export default function CorrelationMatrix() {
         )}
         <h3 className="correlation-ranking-title">相关性最高的配对 — 7 天</h3>
         <p className="dim">
-          固定使用 7 天、1h K 线，按正相关系数降序，排除自配对与重复配对。
+          固定使用 7 天、1h K 线，按正相关系数降序。点击行可切换至 7
+          天矩阵并查看配对详情。
         </p>
         <div className="table-wrap">
           <table className="correlation-ranking">
@@ -284,14 +316,39 @@ export default function CorrelationMatrix() {
                 .filter((p) => p.correlation != null && p.correlation > 0)
                 .slice(0, 12)
                 .map((p, i) => (
-                  <tr key={p.a + p.b}>
+                  <tr
+                    key={p.a + p.b}
+                    className={
+                      window === "7d" && samePair(pair, p.a, p.b)
+                        ? "correlation-row-selected"
+                        : ""
+                    }
+                    onClick={() => chooseRanking(p)}
+                  >
                     <td>{i + 1}</td>
                     <td>
-                      {short(p.a)} / {short(p.b)}
+                      <button
+                        type="button"
+                        className="correlation-pair-button"
+                        aria-pressed={
+                          window === "7d" && Boolean(samePair(pair, p.a, p.b))
+                        }
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          chooseRanking(p);
+                        }}
+                      >
+                        {short(p.a)} / {short(p.b)}
+                        {window === "7d" && samePair(pair, p.a, p.b) && (
+                          <span className="correlation-row-marker">已选</span>
+                        )}
+                      </button>
                     </td>
                     <td className="positive">{num(p.correlation)}</td>
                     <td>{num(p.beta, 4)}</td>
-                    <td>{num(p.zscore)}</td>
+                    <td>
+                      <ZValue value={p.zscore} />
+                    </td>
                     <td
                       title={
                         p.half_life == null
