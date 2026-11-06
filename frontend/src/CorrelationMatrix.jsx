@@ -126,7 +126,7 @@ export default function CorrelationMatrix() {
         {selected ? (
           <>
             <div className="table-wrap correlation-heatmap">
-              <table>
+              <table style={{minWidth: `${symbols.length * 50 + 60}px`}}>
                 <thead>
                   <tr>
                     <th>{selected.label}</th>

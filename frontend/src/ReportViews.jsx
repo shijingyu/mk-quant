@@ -327,7 +327,7 @@ function RecordRow({ row, columns, decisions }) {
             {k === "trade_direction" ? (
               <span
                 className={
-                  row.direction === "long" ? "trade-long" : "trade-short"
+                  row.direction === "long" ? "trade-long" : row.direction === "short" ? "trade-short" : ""
                 }
               >
                 {cell(row.side)} · {cell(row.direction)}

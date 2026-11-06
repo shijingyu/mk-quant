@@ -5498,8 +5498,8 @@ function Experiments({ data, mutate, notify, go }) {
           {["orders", "decisions"].includes(tab) && (
             <div className="experiment-records">
               <div className="report-filters">
-                <label>数据区间<select value={recordSplit} onChange={e=>{setRecordSplit(e.target.value);setRecordOffset(0);}}><option value="">全部区间</option><option value="train">回测集</option><option value="validation">验证集</option></select></label>
-                <label>交易对<select value={recordSymbol} onChange={e=>{setRecordSymbol(e.target.value);setRecordOffset(0);}}><option value="">全部交易对</option>{(detail.symbols||[]).map(s=><option key={s} value={s}>{s}</option>)}</select></label>
+                <label>数据区间<select aria-label="数据区间" value={recordSplit} onChange={e=>{setRecordSplit(e.target.value);setRecordOffset(0);}}><option value="">全部区间</option><option value="train">回测集</option><option value="validation">验证集</option></select></label>
+                <label>交易对<select aria-label="交易对" value={recordSymbol} onChange={e=>{setRecordSymbol(e.target.value);setRecordOffset(0);}}><option value="">全部交易对</option>{(detail.symbols||[]).map(s=><option key={s} value={s}>{s}</option>)}</select></label>
               </div>
               {tab === "decisions" && recordSymbol && <p className="dim">包含 {recordSymbol} 行情或交易意图的组合决策；保留组合上下文，避免割裂配对逻辑。</p>}
 

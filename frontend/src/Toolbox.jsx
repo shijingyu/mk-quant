@@ -93,7 +93,7 @@ export default function Toolbox() {
       <div className="page-heading">
         <div>
           <h1>工具箱</h1>
-          <p>测算网格参数与资金需求。</p>
+          <p>测算网格参数、资金需求与永续合约相关性。</p>
         </div>
       </div>
       <nav className="toolbox-categories" aria-label="工具栏目">
