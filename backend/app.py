@@ -905,14 +905,18 @@ def experiment_detail(experiment_id:str,view:str="full",current=Depends(admin)):
     return StreamingResponse(storage.stream_report_json(experiment_data(row,preview=False)),media_type="application/json")
 
 
+@app.get("/api/tools/correlation")
+def correlation_matrix(current=Depends(admin)):
+    from .correlation import snapshot
+    return snapshot()
+
+
 @app.get("/api/experiments/{experiment_id}/records/{kind}")
 def experiment_records(experiment_id:str,kind:str,offset:int=Query(0,ge=0),limit:int=Query(50,ge=1,le=100),symbol:str=None,split:str=None,current=Depends(admin)):
     if kind not in {"orders","decisions"}:
         raise HTTPException(422,"明细类型仅支持 orders 或 decisions")
     if split not in {None,"train","validation"}:
         raise HTTPException(422,"明细区间仅支持 train 或 validation")
-    if symbol is not None and kind!="orders":
-        raise HTTPException(422,"策略决策包含全部交易对，请按训练或验证区间筛选")
     row=experiment_row(experiment_id)
     result=db.parse(row["result"],{})
     if symbol is not None and symbol not in db.parse(row["config"],{}).get("symbols",[]):
@@ -922,7 +926,7 @@ def experiment_records(experiment_id:str,kind:str,offset:int=Query(0,ge=0),limit
         total=storage.count_records(manifest,symbol=symbol,split=split)
         rows=storage.read_records(manifest,offset=offset,limit=limit,symbol=symbol,split=split)
     else:
-        matches=[item for item in result.get(kind,[]) if (symbol is None or item.get("symbol")==symbol) and (split is None or item.get("split")==split)]
+        matches=[item for item in result.get(kind,[]) if (symbol is None or storage.record_has_symbol(item,symbol)) and (split is None or item.get("split")==split)]
         total=len(matches)
         rows=matches[offset:offset+limit]
     return {"kind":kind,"rows":rows,"total":total,"offset":offset,"limit":limit,"has_more":offset+len(rows)<total}

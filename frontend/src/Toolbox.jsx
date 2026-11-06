@@ -1,3 +1,4 @@
+import CorrelationMatrix from "./CorrelationMatrix.jsx";
 import React, { useId, useState } from "react";
 import { Calculator, RotateCcw } from "lucide-react";
 import { calculateGrid } from "./gridCalculator.js";
@@ -100,6 +101,7 @@ export default function Toolbox() {
           <Calculator size={17} aria-hidden="true" />
           网格计算器
         </a>
+        <button type="button" onClick={()=>document.getElementById("correlation-matrix")?.scrollIntoView({behavior:"smooth"})}>相关性矩阵</button>
       </nav>
 
       <section
@@ -221,6 +223,7 @@ export default function Toolbox() {
           </p>
         </div>
       </details>
+      <CorrelationMatrix />
     </div>
   );
 }

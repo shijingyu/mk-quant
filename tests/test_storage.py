@@ -270,3 +270,14 @@ def test_minute_validation_preserves_rejections(artifact_root, problem):
     manifest = storage.write_candles(data)
     with pytest.raises(ValueError):
         storage.validate_minute_windows(manifest, ['BTCUSDT', 'ETHUSDT'], [(start, start + 240000)])
+
+
+def test_decisions_symbol_and_split_filter(tmp_path,monkeypatch):
+    monkeypatch.setenv('MK_ARTIFACT_ROOT',str(tmp_path))
+    rows=[{'timestamp':i,'split':'train' if i<2 else 'validation','inputs':{'BTCUSDT':{}},'intents':[]} for i in range(3)]
+    rows.append({'timestamp':4,'split':'validation','inputs':{'ETHUSDT':{}},'intents':[]})
+    manifest=storage.write_records('decisions',rows)
+    assert storage.count_records(manifest,symbol='BTCUSDT',split='validation')==1
+    assert storage.read_records(manifest,symbol='BTCUSDT',split='validation')==[rows[2]]
+    assert storage.read_records(manifest,symbol='BTCUSDT',offset=1,limit=1)==[rows[1]]
+    assert storage.count_records(manifest,symbol='SOLUSDT')==0

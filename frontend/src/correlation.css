@@ -1,0 +1,159 @@
+.correlation-panel {
+  margin-top: 24px;
+  scroll-margin-top: 72px;
+}
+.correlation-status {
+  font-size: 13px;
+  margin-bottom: 16px;
+}
+.correlation-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.correlation-toolbar small {
+  display: block;
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 3px;
+}
+.correlation-toolbar label {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 13px;
+}
+.correlation-toolbar input {
+  width: auto;
+  min-height: 0;
+}
+.correlation-panel .dim {
+  font-size: 13px;
+  line-height: 1.7;
+  margin: 16px 0;
+}
+.correlation-heatmap table {
+  min-width: 1060px;
+  font-size: 12px;
+  border-collapse: separate;
+  border-spacing: 2px;
+}
+.correlation-heatmap th,
+.correlation-heatmap td {
+  padding: 0;
+  text-align: center;
+  border: 0;
+  min-width: 44px;
+}
+.correlation-heatmap th {
+  font-size: 11px;
+  padding: 10px 2px;
+}
+.correlation-heatmap th:first-child {
+  position: sticky;
+  left: 0;
+  background: var(--panel);
+  z-index: 1;
+}
+.correlation-heatmap button {
+  width: 100%;
+  height: 36px;
+  border: 0;
+  border-radius: 4px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+.correlation-heatmap button:disabled {
+  opacity: 1;
+  cursor: default;
+}
+.correlation-heatmap button:focus-visible {
+  outline: 2px solid var(--green);
+  outline-offset: -2px;
+}
+.correlation-legend {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  margin: 12px 0;
+  color: var(--muted);
+  border-bottom: 5px solid transparent;
+  border-image: linear-gradient(
+      90deg,
+      var(--red),
+      var(--panel-alt),
+      var(--green)
+    )
+    1;
+  padding-bottom: 6px;
+}
+.correlation-pair {
+  padding: 20px;
+  background: var(--panel-alt);
+  border-radius: 10px;
+}
+.correlation-pair dl {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 16px;
+}
+.correlation-pair dt {
+  font-size: 12px;
+  color: var(--muted);
+}
+.correlation-pair dd {
+  margin: 8px 0;
+  font-size: 20px;
+  font-variant-numeric: tabular-nums;
+}
+.correlation-pair p {
+  font-size: 13px;
+}
+.correlation-ranking-title {
+  margin-top: 28px;
+}
+.correlation-ranking td,
+.correlation-ranking th {
+  padding: 12px;
+  font-size: 13px;
+}
+.correlation-ranking td:nth-child(n + 3):nth-child(-n + 6) {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.correlation-ranking th:nth-child(n + 3):nth-child(-n + 6) {
+  text-align: right;
+}
+.correlation-method {
+  margin-top: 20px;
+  font-size: 13px;
+  line-height: 1.8;
+}
+.correlation-method summary {
+  cursor: pointer;
+  color: var(--green);
+}
+.correlation-empty {
+  padding: 60px 20px;
+  text-align: center;
+  color: var(--muted);
+}
+@media (max-width: 700px) {
+  .correlation-pair dl {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .correlation-toolbar .segmented {
+    width: 100%;
+    flex-wrap: wrap;
+  }
+  .correlation-toolbar .segmented button {
+    flex: 1;
+    min-width: 100px;
+  }
+  .correlation-ranking {
+    min-width: 650px;
+  }
+}

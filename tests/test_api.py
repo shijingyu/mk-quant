@@ -152,7 +152,7 @@ def test_split_backtest_job_results_and_export(client):
     subset=[item for item in result["orders"] if item["symbol"]=="BTCUSDT" and item["split"]=="train"]
     page=client.get(f"/api/experiments/{id}/records/orders?symbol=BTCUSDT&split=train&offset=1&limit=2").json()
     assert page["rows"]==subset[1:3] and page["total"]==len(subset)
-    assert client.get(f"/api/experiments/{id}/records/decisions?symbol=BTCUSDT").status_code==422
+    assert client.get(f"/api/experiments/{id}/records/decisions?symbol=BTCUSDT&split=validation").json()["total"] > 0
     assert client.get(f"/api/experiments/{id}/records/orders?limit=101").status_code==422
     assert client.get(f"/api/experiments/{id}/records/orders?offset=-1").status_code==422
     assert client.get(f"/api/experiments/{id}/export?format=json").json()==result
@@ -402,3 +402,17 @@ def test_backtest_memory_failure_has_actionable_result(client, monkeypatch):
     assert report['status'] == 'failed'
     assert '单任务内存预算' in report['error']
     assert client.get('/healthz').status_code == 200
+
+
+def test_correlation_admin_snapshot(client,monkeypatch):
+    from backend import correlation
+    monkeypatch.setattr(correlation,'snapshot',lambda:{'windows':{},'refreshing':True,'updated_at':None,'stale':True})
+    response=client.get('/api/tools/correlation')
+    assert response.status_code==200 and response.json()['refreshing']
+
+
+def test_decision_symbol_outside_experiment_is_rejected(client):
+    response=client.post('/api/experiments',json=experiment_body())
+    assert response.status_code==202
+    result=client.get('/api/experiments/'+response.json()['id']+'/records/decisions?symbol=INVALIDUSDT')
+    assert result.status_code==422

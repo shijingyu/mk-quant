@@ -82,3 +82,7 @@
 .report-records td:last-child {
   min-width: 100px;
 }
+.report-filters{display:flex;gap:16px;flex-wrap:wrap;margin:16px 0}.report-filters label{display:grid;gap:6px;min-width:160px}.report-filters select{min-height:40px}
+.trade-long{color:var(--green);font-weight:600}.trade-short{color:var(--red);font-weight:600}.trade-time{display:grid;gap:3px;font-size:12px}
+.report-records>table{width:100%;table-layout:fixed;min-width:0!important}.report-records>table>thead>tr>th,.report-records>table>tbody>tr>td{padding:12px 7px;min-width:0;white-space:normal;overflow-wrap:anywhere}.report-records>table>thead th:first-child{width:115px}.report-records>table>thead th:last-child{width:76px}.report-records .report-detail-button{padding:5px;font-size:12px;white-space:normal}
+@media(max-width:700px){.report-records>table{min-width:720px!important}}

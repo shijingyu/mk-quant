@@ -4919,6 +4919,8 @@ function Experiments({ data, mutate, notify, go }) {
     [detailLoading, setDetailLoading] = useState(null),
     [detailRefreshError, setDetailRefreshError] = useState(""),
     [recordOffset, setRecordOffset] = useState(0),
+    [recordSplit, setRecordSplit] = useState(""),
+    [recordSymbol, setRecordSymbol] = useState(""),
     [recordRevision, setRecordRevision] = useState(0),
     [recordData, setRecordData] = useState(null),
     [recordLoading, setRecordLoading] = useState(false),
@@ -4953,6 +4955,7 @@ function Experiments({ data, mutate, notify, go }) {
       );
       if (detailRequest.current !== controller) return;
       setDetail(next);
+      setRecordSplit(""); setRecordSymbol("");
       setDetailScope("all");
       setDetailCurveSplit("train");
       setDetailRefreshError("");
@@ -5037,7 +5040,7 @@ function Experiments({ data, mutate, notify, go }) {
     setRecordData(null);
     setRecordError("");
     api(
-      `/experiments/${detail.id}/records/${tab}?offset=${recordOffset}&limit=${recordPageSize}`,
+      `/experiments/${detail.id}/records/${tab}?offset=${recordOffset}&limit=${recordPageSize}${recordSplit ? `&split=${recordSplit}` : ""}${recordSymbol ? `&symbol=${encodeURIComponent(recordSymbol)}` : ""}`,
       undefined,
       undefined,
       { signal: controller.signal },
@@ -5058,7 +5061,7 @@ function Experiments({ data, mutate, notify, go }) {
       clearTimeout(timeout);
       controller.abort();
     };
-  }, [detail?.id, detail?.status, tab, recordOffset, recordRevision]);
+  }, [detail?.id, detail?.status, tab, recordOffset, recordRevision, recordSplit, recordSymbol]);
   const compared = list.filter((e) => chosen.includes(e.id));
   return (
     <>
@@ -5494,9 +5497,15 @@ function Experiments({ data, mutate, notify, go }) {
           )}
           {["orders", "decisions"].includes(tab) && (
             <div className="experiment-records">
+              <div className="report-filters">
+                <label>数据区间<select value={recordSplit} onChange={e=>{setRecordSplit(e.target.value);setRecordOffset(0);}}><option value="">全部区间</option><option value="train">回测集</option><option value="validation">验证集</option></select></label>
+                <label>交易对<select value={recordSymbol} onChange={e=>{setRecordSymbol(e.target.value);setRecordOffset(0);}}><option value="">全部交易对</option>{(detail.symbols||[]).map(s=><option key={s} value={s}>{s}</option>)}</select></label>
+              </div>
+              {tab === "decisions" && recordSymbol && <p className="dim">包含 {recordSymbol} 行情或交易意图的组合决策；保留组合上下文，避免割裂配对逻辑。</p>}
+
               <div className="experiment-record-toolbar">
                 <span>
-                  {tab === "orders" ? "全部交易对成交记录" : "完整策略决策"} ·
+                  {tab === "orders" ? "筛选后的成交记录" : "筛选后的策略决策"} ·
                   每页 {recordPageSize} 条
                   {recordData
                     ? ` · 共 ${recordData.total.toLocaleString("en-US")} 条`

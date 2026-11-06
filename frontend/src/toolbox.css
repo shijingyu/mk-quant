@@ -220,3 +220,4 @@
     flex-wrap: wrap;
   }
 }
+.toolbox-categories button{border:0;background:transparent;color:var(--green);font-weight:600;font-size:14px;padding:8px 16px;min-height:44px;cursor:pointer}

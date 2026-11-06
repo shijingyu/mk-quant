@@ -582,6 +582,12 @@ def write_records(kind, rows, heartbeat=None):
         Path(temporary).unlink(missing_ok=True)
 
 
+def record_has_symbol(row, symbol):
+    if row.get("symbol")==symbol:return True
+    if any(symbol in (row.get(k) or {}) for k in ("inputs","execution_inputs")):return True
+    return any(isinstance(v,dict) and v.get("symbol")==symbol for k in ("intents","risk","events") for v in (row.get(k) or []))
+
+
 def _iter_payloads(path, *, offset=0, limit=None, symbol=None, split=None):
     """Read bounded batches; a slow/aborted HTTP reader never retains a report."""
     _, pq = _arrow()
@@ -591,10 +597,11 @@ def _iter_payloads(path, *, offset=0, limit=None, symbol=None, split=None):
     with pq.ParquetFile(path) as parquet:
         for batch in parquet.iter_batches(batch_size=32, columns=["symbol", "split", "payload"], use_threads=False):
             for row in batch.to_pylist():
-                if symbol is not None and row["symbol"] != symbol:
-                    continue
                 if split is not None and row["split"] != split:
                     continue
+                if symbol is not None and row["symbol"] != symbol:
+                    if row["symbol"] or not record_has_symbol(json.loads(row["payload"]),symbol):
+                        continue
                 if skipped < offset:
                     skipped += 1
                     continue
@@ -620,6 +627,8 @@ def count_records(manifest, *, symbol=None, split=None):
     path = _resolve(manifest)
     if symbol is None and split is None:
         return int(manifest["count"])
+    if symbol is not None and (manifest.get("kind")=="decisions" or path.parent.name=="decisions"):
+        return _decision_count(str(path),path.stat().st_mtime_ns,symbol,split)
     _, pq = _arrow()
     count = 0
     # Counts and filters use compact typed columns, never large decision JSON.
@@ -628,6 +637,14 @@ def count_records(manifest, *, symbol=None, split=None):
             count += sum((symbol is None or row["symbol"] == symbol) and
                          (split is None or row["split"] == split) for row in batch.to_pylist())
     return count
+
+
+from functools import lru_cache
+
+
+@lru_cache(maxsize=128)
+def _decision_count(path, stamp, symbol, split):
+    return sum(1 for _ in _iter_payloads(Path(path),symbol=symbol,split=split))
 
 
 def _chunk_text(parts, budget=65536):

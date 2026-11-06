@@ -274,8 +274,7 @@ export function ExperimentRecords({ rows, kind }) {
         ["timestamp", "成交时间 · 北京时间"],
         ["split", "区间"],
         ["symbol", "交易对"],
-        ["side", "买卖"],
-        ["direction", "方向"],
+        ["trade_direction", "操作 / 方向"],
         ["quantity", "数量"],
         ["price", "成交价"],
         ["fee", "手续费（U）"],
@@ -325,9 +324,27 @@ function RecordRow({ row, columns, decisions }) {
             key={k}
             className={`${["quantity", "price", "fee", "closed_trade_pnl"].includes(k) ? "numeric" : ""} ${k === "closed_trade_pnl" && row[k] != null ? (row[k] > 0 ? "positive" : row[k] < 0 ? "negative" : "") : ""}`}
           >
-            {cell(
-              row[k] ?? (k === "decision_time" ? row.timestamp : undefined),
-              k,
+            {k === "trade_direction" ? (
+              <span
+                className={
+                  row.direction === "long" ? "trade-long" : "trade-short"
+                }
+              >
+                {cell(row.side)} · {cell(row.direction)}
+              </span>
+            ) : k === "timestamp" ? (
+              <span className="trade-time">
+                {formatBeijing(row.timestamp, { second: "2-digit" })
+                  .split(" ")
+                  .map((v, i) => (
+                    <span key={i}>{v}</span>
+                  ))}
+              </span>
+            ) : (
+              cell(
+                row[k] ?? (k === "decision_time" ? row.timestamp : undefined),
+                k,
+              )
             )}
           </td>
         ))}
