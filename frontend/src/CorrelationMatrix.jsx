@@ -9,6 +9,11 @@ const windows = [
 ];
 const num = (v, d = 2) => (v == null ? "—" : Number(v).toFixed(d));
 const short = (s) => s.replace(/USDT$/, "");
+const statusTone = (status) =>
+  ({ 显著偏离: "high", 偏离: "away", 接近均值: "near" })[status] || "unknown";
+const PairStatus = ({ status }) => (
+  <span className={`correlation-state ${statusTone(status)}`}>{status}</span>
+);
 export default function CorrelationMatrix() {
   const [data, setData] = useState(null),
     [error, setError] = useState(""),
@@ -126,12 +131,14 @@ export default function CorrelationMatrix() {
         {selected ? (
           <>
             <div className="table-wrap correlation-heatmap">
-              <table style={{minWidth: `${symbols.length * 50 + 60}px`}}>
+              <table style={{ minWidth: `${symbols.length * 50 + 60}px` }}>
                 <thead>
                   <tr>
                     <th>{selected.label}</th>
                     {symbols.map((s) => (
-                      <th key={s}>{short(s)}</th>
+                      <th scope="col" key={s}>
+                        {short(s)}
+                      </th>
                     ))}
                   </tr>
                 </thead>
@@ -141,13 +148,34 @@ export default function CorrelationMatrix() {
                       <th scope="row">{short(a)}</th>
                       {symbols.map((b, j) => {
                         const v = selected.matrix[i][j];
+                        const isPair =
+                          pair &&
+                          ((pair.a === a && pair.b === b) ||
+                            (pair.a === b && pair.b === a));
                         return (
                           <td key={b}>
                             <button
                               disabled={i === j || v == null}
+                              className={
+                                i === j
+                                  ? "correlation-self"
+                                  : isPair
+                                    ? "correlation-selected"
+                                    : ""
+                              }
+                              aria-pressed={
+                                i === j ? undefined : Boolean(isPair)
+                              }
+                              title={
+                                i === j
+                                  ? "同一币种：自身相关系数恒为 1.00"
+                                  : isPair
+                                    ? "已选配对"
+                                    : "查看配对统计"
+                              }
                               aria-label={`${a} / ${b} 相关系数 ${num(v)}`}
                               style={{
-                                background:
+                                "--cell-background":
                                   v == null
                                     ? "var(--panel-alt)"
                                     : `color-mix(in srgb, ${v >= 0 ? "var(--green)" : "var(--red)"} ${Math.abs(v) * 38}%, var(--panel))`,
@@ -163,6 +191,18 @@ export default function CorrelationMatrix() {
                   ))}
                 </tbody>
               </table>
+            </div>
+            <div className="correlation-key">
+              <span>
+                <i className="self" />
+                对角线：自身相关 1.00
+              </span>
+              <span>
+                <i className="selected" />
+                {pair
+                  ? `已选：${short(pair.a)} / ${short(pair.b)}`
+                  : "蓝色边框：已选配对"}
+              </span>
             </div>
             <div className="correlation-legend">
               <span>−1 负相关</span>
@@ -214,7 +254,7 @@ export default function CorrelationMatrix() {
             </dl>
             <p>
               回归方向：ln({pair.a}) = α + β × ln({pair.b}) + 残差。
-              {pair.status}
+              <PairStatus status={pair.status} />
             </p>
           </section>
         )}
@@ -261,7 +301,9 @@ export default function CorrelationMatrix() {
                     >
                       {num(p.half_life, 1)}
                     </td>
-                    <td>{p.status}</td>
+                    <td>
+                      <PairStatus status={p.status} />
+                    </td>
                   </tr>
                 ))}
             </tbody>

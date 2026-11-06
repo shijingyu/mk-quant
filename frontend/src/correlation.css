@@ -1,5 +1,5 @@
 .correlation-panel {
-  margin-top: 24px;
+  margin-top: 0;
   scroll-margin-top: 72px;
 }
 .correlation-status {
@@ -48,16 +48,21 @@
   min-width: 44px;
 }
 .correlation-heatmap th {
-  font-size: 11px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--correlation-header-text);
+  background: var(--correlation-header-bg);
+  border-radius: 4px;
   padding: 10px 2px;
 }
 .correlation-heatmap th:first-child {
   position: sticky;
   left: 0;
-  background: var(--panel);
+  background: var(--correlation-header-bg);
   z-index: 1;
 }
 .correlation-heatmap button {
+  background: var(--cell-background);
   width: 100%;
   height: 36px;
   border: 0;
@@ -156,4 +161,103 @@
   .correlation-ranking {
     min-width: 650px;
   }
+}
+
+/* Semantic table colors, independent of correlation-value heat scale. */
+.correlation-panel {
+  --correlation-header-bg: #303f50;
+  --correlation-header-text: #eef4fc;
+  --correlation-self-bg: #384258;
+  --correlation-self-text: #dce4f8;
+  --correlation-selected-bg: #304c79;
+  --correlation-selected-text: #ffffff;
+  --correlation-selected-border: #a5c7ff;
+}
+:root[data-theme="light"] .correlation-panel {
+  --correlation-header-bg: #dce6ef;
+  --correlation-header-text: #253b53;
+  --correlation-self-bg: #e7e7f3;
+  --correlation-self-text: #535477;
+  --correlation-selected-bg: #dbeafe;
+  --correlation-selected-text: #173e78;
+  --correlation-selected-border: #2563b4;
+}
+.correlation-heatmap button.correlation-self {
+  background: var(--correlation-self-bg);
+  color: var(--correlation-self-text);
+  font-weight: 600;
+}
+.correlation-heatmap button.correlation-selected {
+  background: var(--correlation-selected-bg);
+  color: var(--correlation-selected-text);
+  box-shadow: inset 0 0 0 2px var(--correlation-selected-border);
+  font-weight: 700;
+}
+.correlation-heatmap button:not(:disabled):hover {
+  box-shadow: inset 0 0 0 2px var(--correlation-selected-border);
+}
+.correlation-key {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin: 14px 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+.correlation-key span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.correlation-key i {
+  width: 16px;
+  height: 16px;
+  border-radius: 3px;
+}
+.correlation-key .self {
+  background: var(--correlation-self-bg);
+}
+.correlation-key .selected {
+  background: var(--correlation-selected-bg);
+  border: 2px solid var(--correlation-selected-border);
+}
+.correlation-ranking thead th {
+  background: var(--correlation-header-bg);
+  color: var(--correlation-header-text);
+  font-weight: 700;
+}
+.correlation-ranking td:nth-child(2) {
+  color: var(--correlation-header-text);
+  font-weight: 600;
+}
+.correlation-state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px;
+  border-radius: 6px;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  background: var(--panel-alt);
+}
+.correlation-state::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.correlation-state.high {
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 10%, var(--panel));
+}
+.correlation-state.away {
+  color: var(--amber);
+  background: color-mix(in srgb, var(--amber) 10%, var(--panel));
+}
+.correlation-state.near {
+  color: var(--green);
+  background: color-mix(in srgb, var(--green) 10%, var(--panel));
 }

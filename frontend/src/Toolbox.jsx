@@ -1,6 +1,6 @@
 import CorrelationMatrix from "./CorrelationMatrix.jsx";
 import React, { useId, useState } from "react";
-import { Calculator, RotateCcw } from "lucide-react";
+import { Calculator, Grid3X3, RotateCcw } from "lucide-react";
 import { calculateGrid } from "./gridCalculator.js";
 import "./toolbox.css";
 
@@ -70,7 +70,7 @@ function GridResult({ type, result }) {
   );
 }
 
-export default function Toolbox() {
+export default function Toolbox({ section = "grid" }) {
   const [input, setInput] = useState(EXAMPLE);
   const id = useId();
   const { errors, result } = calculateGrid(input);
@@ -97,133 +97,150 @@ export default function Toolbox() {
         </div>
       </div>
       <nav className="toolbox-categories" aria-label="工具栏目">
-        <a href="#toolbox" aria-current="page">
+        <a
+          href="#toolbox"
+          aria-current={section === "grid" ? "page" : undefined}
+        >
           <Calculator size={17} aria-hidden="true" />
           网格计算器
         </a>
-        <button type="button" onClick={()=>document.getElementById("correlation-matrix")?.scrollIntoView({behavior:"smooth"})}>相关性矩阵</button>
+        <a
+          href="#toolbox/correlation"
+          aria-current={section === "correlation" ? "page" : undefined}
+        >
+          <Grid3X3 size={17} aria-hidden="true" />
+          相关性矩阵
+        </a>
       </nav>
 
-      <section
-        className="panel grid-input-panel"
-        aria-labelledby={`${id}-title`}
-      >
-        <div className="panel-heading">
-          <div>
-            <h2 id={`${id}-title`}>网格计算器</h2>
-            <p>输入价格区间与密度，自动比较等差和等比方案。</p>
-          </div>
-          <button
-            className="btn"
-            type="button"
-            onClick={() => setInput({ ...EXAMPLE })}
+      {section === "correlation" ? (
+        <CorrelationMatrix />
+      ) : (
+        <>
+          <section
+            className="panel grid-input-panel"
+            aria-labelledby={`${id}-title`}
           >
-            <RotateCcw size={15} aria-hidden="true" />
-            重置示例
-          </button>
-        </div>
-        <div className="panel-body">
-          <div className="grid-inputs">
-            {fields.map(({ name, label, hint }) => (
-              <div className="field" key={name}>
-                <label htmlFor={`${id}-${name}`}>{label}</label>
-                <input
-                  id={`${id}-${name}`}
-                  name={name}
-                  type="number"
-                  inputMode="decimal"
-                  min="0"
-                  step="any"
-                  required
-                  value={input[name]}
-                  onChange={(event) =>
-                    setInput({ ...input, [name]: event.target.value })
-                  }
-                  aria-invalid={Boolean(errors[name])}
-                  aria-describedby={`${id}-${name}-hint`}
-                />
-                <small
-                  id={`${id}-${name}-hint`}
-                  className={errors[name] ? "grid-field-error" : ""}
-                >
-                  {errors[name] || hint}
-                </small>
+            <div className="panel-heading">
+              <div>
+                <h2 id={`${id}-title`}>网格计算器</h2>
+                <p>输入价格区间与密度，自动比较等差和等比方案。</p>
               </div>
-            ))}
-          </div>
-          <p className="grid-density-help">
-            等差：均价 × 密度换算目标价差。等比：密度表示相邻网格的向上涨幅。
-            网格数向上取整后重新均分区间，使两端对齐；下方显示实际间距。
-          </p>
-          {errors.general && (
-            <p className="grid-field-error" role="alert">
-              {errors.general}
-            </p>
-          )}
-          <dl className="grid-shared-metrics">
-            <div>
-              <dt>估算股价 · 区间均价</dt>
-              <dd>
-                {result ? format(result.midpointPrice, 6) : "—"} <span>元</span>
-              </dd>
+              <button
+                className="btn"
+                type="button"
+                onClick={() => setInput({ ...EXAMPLE })}
+              >
+                <RotateCcw size={15} aria-hidden="true" />
+                重置示例
+              </button>
             </div>
-            <div>
-              <dt>买入 100 股所需资金</dt>
-              <dd>
-                {result ? money(result.costPerGrid) : "—"} <span>元</span>
-              </dd>
+            <div className="panel-body">
+              <div className="grid-inputs">
+                {fields.map(({ name, label, hint }) => (
+                  <div className="field" key={name}>
+                    <label htmlFor={`${id}-${name}`}>{label}</label>
+                    <input
+                      id={`${id}-${name}`}
+                      name={name}
+                      type="number"
+                      inputMode="decimal"
+                      min="0"
+                      step="any"
+                      required
+                      value={input[name]}
+                      onChange={(event) =>
+                        setInput({ ...input, [name]: event.target.value })
+                      }
+                      aria-invalid={Boolean(errors[name])}
+                      aria-describedby={`${id}-${name}-hint`}
+                    />
+                    <small
+                      id={`${id}-${name}-hint`}
+                      className={errors[name] ? "grid-field-error" : ""}
+                    >
+                      {errors[name] || hint}
+                    </small>
+                  </div>
+                ))}
+              </div>
+              <p className="grid-density-help">
+                等差：均价 ×
+                密度换算目标价差。等比：密度表示相邻网格的向上涨幅。
+                网格数向上取整后重新均分区间，使两端对齐；下方显示实际间距。
+              </p>
+              {errors.general && (
+                <p className="grid-field-error" role="alert">
+                  {errors.general}
+                </p>
+              )}
+              <dl className="grid-shared-metrics">
+                <div>
+                  <dt>估算股价 · 区间均价</dt>
+                  <dd>
+                    {result ? format(result.midpointPrice, 6) : "—"}{" "}
+                    <span>元</span>
+                  </dd>
+                </div>
+                <div>
+                  <dt>买入 100 股所需资金</dt>
+                  <dd>
+                    {result ? money(result.costPerGrid) : "—"} <span>元</span>
+                  </dd>
+                </div>
+              </dl>
             </div>
-          </dl>
-        </div>
-      </section>
+          </section>
 
-      <div aria-live="polite" aria-atomic="true">
-        {result ? (
-          <div className="grid-comparison">
-            <GridResult type="arithmetic" result={result} />
-            <GridResult type="geometric" result={result} />
+          <div aria-live="polite" aria-atomic="true">
+            {result ? (
+              <div className="grid-comparison">
+                <GridResult type="arithmetic" result={result} />
+                <GridResult type="geometric" result={result} />
+              </div>
+            ) : (
+              <div className="panel grid-empty-result">
+                请输入有效的价格区间与网格密度后查看计算结果。
+              </div>
+            )}
           </div>
-        ) : (
-          <div className="panel grid-empty-result">
-            请输入有效的价格区间与网格密度后查看计算结果。
-          </div>
-        )}
-      </div>
 
-      <p className="grid-capital-note">
-        资金口径：总资金 = 各格买入价格之和 × 100 股。
-        从上限向下跨一格开始计入，直至下限，共计与网格数相同的买入档数；不计上限处底仓和手续费。
-        “买入 100 股所需资金”仍按区间均价计算。逐格价格按未舍入值求和。
-      </p>
-      <details className="panel grid-formulas">
-        <summary>查看计算公式</summary>
-        <div>
-          <p>
-            设下限为 L，上限为 U，密度为 d（输入 2 即 0.02），均价 M = (U + L) ÷
-            2。
+          <p className="grid-capital-note">
+            资金口径：总资金 = 各格买入价格之和 × 100 股。
+            从上限向下跨一格开始计入，直至下限，共计与网格数相同的买入档数；不计上限处底仓和手续费。
+            “买入 100 股所需资金”仍按区间均价计算。逐格价格按未舍入值求和。
           </p>
-          <p>
-            等差：理论格数 = (U − L) ÷ (M × d)；向上取整为 N；实际价差 = (U − L)
-            ÷ N。
-          </p>
-          <p>
-            等比：理论格数 = ln(U ÷ L) ÷ ln(1 + d)；向上取整为 N；相邻价格倍率 r
-            = (U ÷ L)^(1 ÷ N)。
-          </p>
-          <p>
-            等比向上格距 = (r − 1) × 100%；向下加仓跌幅 = (1 − 1 ÷ r) × 100%。
-          </p>
-          <p>
-            买入档位 i = 1…N：等差价格 Pᵢ = U − i × 实际价差；等比价格 Pᵢ = U ÷
-            r^i。 上限不计入，下限计入。
-          </p>
-          <p>
-            每格固定买入 100 股，总资金 = (P₁ + P₂ + … + Pₙ) × 100； 单独的“买入
-            100 股所需资金” = M × 100。
-          </p>
-        </div>
-      </details>
-      <CorrelationMatrix />
+          <details className="panel grid-formulas">
+            <summary>查看计算公式</summary>
+            <div>
+              <p>
+                设下限为 L，上限为 U，密度为 d（输入 2 即 0.02），均价 M = (U +
+                L) ÷ 2。
+              </p>
+              <p>
+                等差：理论格数 = (U − L) ÷ (M × d)；向上取整为 N；实际价差 = (U
+                − L) ÷ N。
+              </p>
+              <p>
+                等比：理论格数 = ln(U ÷ L) ÷ ln(1 + d)；向上取整为
+                N；相邻价格倍率 r = (U ÷ L)^(1 ÷ N)。
+              </p>
+              <p>
+                等比向上格距 = (r − 1) × 100%；向下加仓跌幅 = (1 − 1 ÷ r) ×
+                100%。
+              </p>
+              <p>
+                买入档位 i = 1…N：等差价格 Pᵢ = U − i × 实际价差；等比价格 Pᵢ =
+                U ÷ r^i。 上限不计入，下限计入。
+              </p>
+              <p>
+                每格固定买入 100 股，总资金 = (P₁ + P₂ + … + Pₙ) × 100；
+                单独的“买入 100 股所需资金” = M × 100。
+              </p>
+            </div>
+          </details>
+        </>
+      )}
     </div>
   );
 }

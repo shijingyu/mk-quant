@@ -214,6 +214,7 @@ const navs = [
 const titles = Object.fromEntries(
   navs.flatMap((g) => g.items.map(([id, label]) => [id, label])),
 );
+titles["toolbox/correlation"] = "工具箱 · 相关性矩阵";
 let csrfToken = "";
 function normalizeMetrics(m = {}) {
   return {
@@ -838,7 +839,7 @@ export default function App() {
               {g.items.map(([id, label, Icon]) => (
                 <button
                   key={id}
-                  className={`nav-item ${page === id ? "active" : ""}`}
+                  className={`nav-item ${(page === id || (id === "toolbox" && page.startsWith("toolbox/"))) ? "active" : ""}`}
                   onClick={() => go(id)}
                 >
                   <Icon size={18} />
@@ -974,7 +975,7 @@ export default function App() {
               {page === "logs" && (
                 <Logs logs={data.logs || []} strategies={strategies} />
               )}
-              {page === "toolbox" && <Toolbox />}
+              {["toolbox", "toolbox/correlation"].includes(page) && <Toolbox section={page === "toolbox/correlation" ? "correlation" : "grid"} />}
               {page === "protocol" && <Protocol notify={notify} />}
               {page === "todo" && <Todo />}
             </>

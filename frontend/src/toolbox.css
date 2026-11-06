@@ -12,9 +12,10 @@
   gap: 8px;
   min-height: 44px;
   padding: 8px 16px;
-  color: var(--green);
-  border-bottom: 2px solid var(--green);
+  color: var(--muted);
+  border-bottom: 2px solid transparent;
   font-weight: 600;
+  text-decoration: none;
 }
 .toolbox-page .grid-input-panel {
   margin-bottom: 20px;
@@ -220,4 +221,26 @@
     flex-wrap: wrap;
   }
 }
-.toolbox-categories button{border:0;background:transparent;color:var(--green);font-weight:600;font-size:14px;padding:8px 16px;min-height:44px;cursor:pointer}
+.toolbox-categories button {
+  border: 0;
+  background: transparent;
+  color: var(--green);
+  font-weight: 600;
+  font-size: 14px;
+  padding: 8px 16px;
+  min-height: 44px;
+  cursor: pointer;
+}
+
+.toolbox-categories a[aria-current="page"] {
+  color: var(--green);
+  border-bottom-color: var(--green);
+  background: var(--soft-green);
+}
+.toolbox-categories a:hover {
+  color: var(--text);
+}
+.toolbox-categories a:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: -2px;
+}
