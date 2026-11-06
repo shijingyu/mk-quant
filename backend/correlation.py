@@ -46,12 +46,12 @@ def closed_prices(rows,end,step,count):
     return [indexed[t] for t in expected]
 
 
-def build_window(client,key,server_ms,tradable):
+def build_window(client,key,server_ms,tradable,quote="USDT"):
     label,interval,step,count=WINDOWS[key];end=server_ms//step*step
-    prices={};missing={};symbols=[a+'USDT' for a in ASSETS]
+    prices={};missing={};symbols=[a+quote for a in ASSETS if quote=='USDT' or a+quote in tradable]
     for symbol in symbols:
         if symbol not in tradable:
-            missing[symbol]='当前非可交易 USDT 永续合约';continue
+            missing[symbol]=f'当前非可交易 {quote} 永续合约';continue
         time.sleep(.5)
         rows=client._request('GET','/fapi/v1/klines',{'symbol':symbol,'interval':interval,'startTime':end-count*step,'endTime':end-1,'limit':count})
         try:prices[symbol]=closed_prices(rows,end,step,count)
@@ -68,30 +68,81 @@ def build_window(client,key,server_ms,tradable):
             pairs.append({'a':a,'b':b,**result})
         matrix.append(line)
     pairs.sort(key=lambda p:p['correlation'] if p['correlation'] is not None else -2,reverse=True)
-    return {'label':label,'interval':interval,'bars':count,'returns':count-1,'start':end-count*step,'end':end,'symbols':symbols,'matrix':matrix,'pairs':pairs,'missing':missing}
+    return {'label':label,'interval':interval,'bars':count,'returns':count-1,'start':end-count*step,'end':end,'symbols':symbols,'matrix':matrix,'pairs':pairs,'missing':missing,'_prices':prices}
+
+
+def pair_series(window, a, b):
+    x, y = window['_prices'].get(a), window['_prices'].get(b)
+    if a == b or x is None or y is None:
+        raise ValueError('所选配对暂无完整行情')
+    metrics = pair_metrics(x, y)
+    beta = metrics['beta']
+    spread = [math.log(v)-beta*math.log(w) for v,w in zip(x,y)] if beta is not None else []
+    mean = fmean(spread) if spread else 0
+    sd = math.sqrt(covariance(spread,spread)/len(spread)) if spread else 0
+    step = (window['end']-window['start'])//window['bars']
+    points = [{'time':window['start']+i*step, 'a':v/x[0]*100, 'b':y[i]/y[0]*100,
+               'z':(spread[i]-mean)/sd if sd>1e-12 else None} for i,v in enumerate(x)]
+    roll = min(60, max(10, (len(x)-1)//3))
+    rolling = pair_metrics(x[-roll-1:], y[-roll-1:])['correlation']
+    return {'a':a,'b':b,'interval':window['interval'],'label':window['label'],
+            'points':points,'rolling_bars':roll,'rolling_correlation':rolling,**metrics}
+
+
+def funding_snapshot(client, symbols, server_ms):
+    result = {}
+    for symbol in symbols:
+        try:
+            time.sleep(.5)
+            rows = client._request('GET','/fapi/v1/fundingRate',{'symbol':symbol,'limit':2,'endTime':server_ms})
+            rows = sorted([r for r in rows if int(r['fundingTime'])<=server_ms],key=lambda r:int(r['fundingTime']))
+            last = rows[-1]
+            rate = float(last['fundingRate'])
+            if not math.isfinite(rate):raise ValueError('无效费率')
+            hours = (int(rows[-1]['fundingTime'])-int(rows[-2]['fundingTime']))/3600000 if len(rows)>1 else None
+            result[symbol] = {'rate':rate,'time':int(last['fundingTime']),'interval_hours':hours if hours and hours>0 else None}
+        except Exception:
+            result[symbol] = {'rate':None,'time':None,'interval_hours':None,'error':'资金费率暂不可用'}
+    return result
 
 
 _lock=threading.Lock()
-_state={'windows':{},'updated_at':None,'refreshing':False,'error':None,'next_refresh':0}
+_fetch_lock=threading.Lock()
+_states={q:{'windows':{},'funding':{},'updated_at':None,'refreshing':False,'error':None,'next_refresh':0} for q in ('USDT','USDC')}
 
 
-def _refresh():
+def _refresh(quote='USDT'):
     client=BinanceClient(market='futures',timeout=8,max_retries=1)
-    try:
-        server_ms=int(client._request('GET','/fapi/v1/time')['serverTime'])
-        exchange=client._request('GET','/fapi/v1/exchangeInfo')
-        tradable={s['symbol'] for s in exchange['symbols'] if s.get('contractType')=='PERPETUAL' and s.get('status')=='TRADING' and s.get('quoteAsset')=='USDT'}
-        windows={key:build_window(client,key,server_ms,tradable) for key in WINDOWS}
-        with _lock:_state.update(windows=windows,updated_at=int(time.time()*1000),error=None,next_refresh=time.time()+900)
-    except Exception as exc:
-        with _lock:_state.update(error='公开行情更新失败：'+str(exc)[:200],next_refresh=max(time.time()+60,getattr(client,'_cooldown_until',0)))
-    finally:
-        with _lock:_state['refreshing']=False
+    # Both pages share one serial exchange request lane, independent snapshots.
+    with _fetch_lock:
+        try:
+            server_ms=int(client._request('GET','/fapi/v1/time')['serverTime'])
+            exchange=client._request('GET','/fapi/v1/exchangeInfo')
+            tradable={s['symbol'] for s in exchange['symbols'] if s.get('contractType')=='PERPETUAL' and s.get('status')=='TRADING' and s.get('quoteAsset')==quote}
+            windows={key:build_window(client,key,server_ms,tradable,quote) for key in WINDOWS}
+            funding=funding_snapshot(client,[a+quote for a in ASSETS if a+quote in tradable],server_ms)
+            with _lock:_states[quote].update(windows=windows,funding=funding,updated_at=int(time.time()*1000),error=None,next_refresh=time.time()+900)
+        except Exception as exc:
+            with _lock:_states[quote].update(error='公开行情更新失败：'+str(exc)[:200],next_refresh=max(time.time()+60,getattr(client,'_cooldown_until',0)))
+        finally:
+            with _lock:_states[quote]['refreshing']=False
 
 
-def snapshot():
+def snapshot(quote='USDT'):
+    if quote not in _states:raise ValueError('不支持的计价币种')
     with _lock:
-        if not _state['refreshing'] and time.time()>=_state['next_refresh']:
-            _state['refreshing']=True
-            threading.Thread(target=_refresh,daemon=True,name='public-correlation').start()
-        return {**_state,'stale':bool(_state['error']) or not _state['updated_at'] or time.time()*1000-_state['updated_at']>1200000,'next_refresh':int(_state['next_refresh']*1000)}
+        state=_states[quote]
+        if not state['refreshing'] and time.time()>=state['next_refresh']:
+            state['refreshing']=True
+            threading.Thread(target=_refresh,args=(quote,),daemon=True,name='public-correlation-'+quote).start()
+        return {**state,'quote':quote,'windows':{k:{a:b for a,b in v.items() if a!='_prices'} for k,v in state['windows'].items()},
+                'stale':bool(state['error']) or not state['updated_at'] or time.time()*1000-state['updated_at']>1200000,'next_refresh':int(state['next_refresh']*1000)}
+
+
+def detail(quote, key, a, b):
+    with _lock:
+        state=_states[quote]
+        window=state['windows'].get(key)
+        updated=state['updated_at']
+    if not window:raise ValueError('行情快照尚未就绪')
+    return {**pair_series(window,a,b),'updated_at':updated,'quote':quote}

@@ -244,3 +244,16 @@
   outline: 2px solid var(--blue);
   outline-offset: -2px;
 }
+.toolbox-categories {
+  flex-wrap: wrap;
+}
+.toolbox-categories a {
+  white-space: nowrap;
+}
+.app-version {
+  display: inline-block;
+  font-size: 10px;
+  letter-spacing: 0;
+  color: inherit;
+  opacity: 0.85;
+}

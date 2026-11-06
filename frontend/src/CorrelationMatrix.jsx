@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { formatBeijing } from "./time.js";
 import "./correlation.css";
+import CorrelationPair from "./CorrelationPair.jsx";
 const windows = [
   ["24h", "24 小时", "15m · 96 根"],
   ["7d", "7 天", "1h · 168 根"],
@@ -8,7 +9,7 @@ const windows = [
   ["90d", "90 天", "1d · 90 根"],
 ];
 const num = (v, d = 2) => (v == null ? "—" : Number(v).toFixed(d));
-const short = (s) => s.replace(/USDT$/, "");
+const short = (s) => s.replace(/USDT$|USDC$/, "");
 const statusTone = (status) =>
   ({ 显著偏离: "high", 偏离: "away", 接近均值: "near" })[status] || "unknown";
 const PairStatus = ({ status }) => (
@@ -33,7 +34,7 @@ const ZValue = ({ value }) => {
     </span>
   );
 };
-export default function CorrelationMatrix() {
+export default function CorrelationMatrix({ quote = "USDT" }) {
   const [data, setData] = useState(null),
     [error, setError] = useState(""),
     [window, setWindow] = useState("7d"),
@@ -56,7 +57,7 @@ export default function CorrelationMatrix() {
       controller = new AbortController();
       let timeout = setTimeout(() => controller.abort(), 15000);
       try {
-        const r = await fetch("/api/tools/correlation", {
+        const r = await fetch(`/api/tools/correlation?quote=${quote}`, {
           credentials: "include",
           signal: controller.signal,
         });
@@ -82,16 +83,17 @@ export default function CorrelationMatrix() {
       clearTimeout(timer);
       controller?.abort();
     };
-  }, [revision]);
+  }, [revision, quote]);
   const selected = data?.windows?.[window],
-    seven = data?.windows?.["7d"],
     symbols = (selected?.symbols || []).slice(0, ten ? 10 : 20);
   const pair =
     selected?.pairs.find((p) => samePair(pairSelection, p.a, p.b)) || null;
   const choose = (a, b) => setPair({ a, b });
   const chooseRanking = (p) => {
-    setWindow("7d");
-    if (ten && ![p.a, p.b].every((s) => seven.symbols.slice(0, 10).includes(s)))
+    if (
+      ten &&
+      ![p.a, p.b].every((s) => selected.symbols.slice(0, 10).includes(s))
+    )
       setTen(false);
     setPair({ a: p.a, b: p.b, source: "ranking" });
   };
@@ -99,8 +101,14 @@ export default function CorrelationMatrix() {
     <section id="correlation-matrix" className="panel correlation-panel">
       <header className="panel-heading">
         <div>
-          <h2>实时相关性矩阵</h2>
-          <p>币安 USDT 本位永续合约 · 20 个品种 · 公开行情，每 15 分钟更新</p>
+          <h2>相关性矩阵 {quote}</h2>
+          <p>
+            币安 {quote} 本位永续合约 ·{" "}
+            {selected
+              ? `${selected.symbols.length} 个品种`
+              : "正在核验可交易品种"}{" "}
+            · 公开行情，每 15 分钟更新
+          </p>
         </div>
         <button
           className="btn"
@@ -137,7 +145,6 @@ export default function CorrelationMatrix() {
                 className={window === key ? "selected" : ""}
                 onClick={() => {
                   setWindow(key);
-                  setPair(null);
                 }}
               >
                 {label}
@@ -262,37 +269,24 @@ export default function CorrelationMatrix() {
             ref={detailRef}
             aria-label="已选配对详情"
           >
-            <h3>
-              {pair.a} / {pair.b} · {selected.label}
-            </h3>
-            <dl>
-              {[
-                ["相关系数", num(pair.correlation)],
-                ["对冲比率 β", num(pair.beta, 4)],
-                ["价差 Z 值", <ZValue value={pair.zscore} />],
-                [
-                  "半衰期",
-                  pair.half_life == null
-                    ? "未检出有效均值回归"
-                    : num(pair.half_life, 1) + " 根 K 线",
-                ],
-              ].map(([label, value]) => (
-                <div key={label}>
-                  <dt>{label}</dt>
-                  <dd>{value}</dd>
-                </div>
-              ))}
-            </dl>
-            <p>
-              回归方向：ln({pair.a}) = α + β × ln({pair.b}) + 残差。
-              <PairStatus status={pair.status} />
-            </p>
+            <CorrelationPair
+              key={`${quote}-${window}-${pair.a}-${pair.b}-${data.updated_at}`}
+              pair={pair}
+              data={data}
+              frame={window}
+              quote={quote}
+              onFrame={setWindow}
+              onClose={() => setPair(null)}
+              ZValue={ZValue}
+              PairStatus={PairStatus}
+            />
           </section>
         )}
-        <h3 className="correlation-ranking-title">相关性最高的配对 — 7 天</h3>
+        <h3 className="correlation-ranking-title">
+          相关性最高的配对 — {selected?.label || "7 天"}
+        </h3>
         <p className="dim">
-          固定使用 7 天、1h K 线，按正相关系数降序。点击行可切换至 7
-          天矩阵并查看配对详情。
+          使用当前所选时间窗口，按正相关系数降序。点击行可选中矩阵配对并查看详情。
         </p>
         <div className="table-wrap">
           <table className="correlation-ranking">
@@ -304,7 +298,7 @@ export default function CorrelationMatrix() {
                   "相关系数",
                   "对冲比率 β",
                   "价差 Z 值",
-                  "半衰期（1h K 线）",
+                  `半衰期（${selected?.interval || "—"} K 线）`,
                   "状态",
                 ].map((t) => (
                   <th key={t}>{t}</th>
@@ -312,16 +306,14 @@ export default function CorrelationMatrix() {
               </tr>
             </thead>
             <tbody>
-              {seven?.pairs
+              {selected?.pairs
                 .filter((p) => p.correlation != null && p.correlation > 0)
                 .slice(0, 12)
                 .map((p, i) => (
                   <tr
                     key={p.a + p.b}
                     className={
-                      window === "7d" && samePair(pair, p.a, p.b)
-                        ? "correlation-row-selected"
-                        : ""
+                      samePair(pair, p.a, p.b) ? "correlation-row-selected" : ""
                     }
                     onClick={() => chooseRanking(p)}
                   >
@@ -330,16 +322,14 @@ export default function CorrelationMatrix() {
                       <button
                         type="button"
                         className="correlation-pair-button"
-                        aria-pressed={
-                          window === "7d" && Boolean(samePair(pair, p.a, p.b))
-                        }
+                        aria-pressed={Boolean(samePair(pair, p.a, p.b))}
                         onClick={(event) => {
                           event.stopPropagation();
                           chooseRanking(p);
                         }}
                       >
                         {short(p.a)} / {short(p.b)}
-                        {window === "7d" && samePair(pair, p.a, p.b) && (
+                        {samePair(pair, p.a, p.b) && (
                           <span className="correlation-row-marker">已选</span>
                         )}
                       </button>

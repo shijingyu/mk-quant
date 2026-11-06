@@ -109,12 +109,22 @@ export default function Toolbox({ section = "grid" }) {
           aria-current={section === "correlation" ? "page" : undefined}
         >
           <Grid3X3 size={17} aria-hidden="true" />
-          相关性矩阵
+          相关性矩阵 USDT
+        </a>
+        <a
+          href="#toolbox/correlation-usdc"
+          aria-current={section === "correlation-usdc" ? "page" : undefined}
+        >
+          <Grid3X3 size={17} aria-hidden="true" />
+          相关性矩阵 USDC
         </a>
       </nav>
 
-      {section === "correlation" ? (
-        <CorrelationMatrix />
+      {section.startsWith("correlation") ? (
+        <CorrelationMatrix
+          key={section}
+          quote={section === "correlation-usdc" ? "USDC" : "USDT"}
+        />
       ) : (
         <>
           <section

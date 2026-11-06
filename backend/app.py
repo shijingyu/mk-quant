@@ -906,9 +906,16 @@ def experiment_detail(experiment_id:str,view:str="full",current=Depends(admin)):
 
 
 @app.get("/api/tools/correlation")
-def correlation_matrix(current=Depends(admin)):
+def correlation_matrix(quote:str=Query("USDT",pattern="^(USDT|USDC)$"),current=Depends(admin)):
     from .correlation import snapshot
-    return snapshot()
+    return snapshot(quote)
+
+
+@app.get("/api/tools/correlation/pair")
+def correlation_pair(a:str,b:str,quote:str=Query("USDT",pattern="^(USDT|USDC)$"),window:str=Query("7d",pattern="^(24h|7d|30d|90d)$"),current=Depends(admin)):
+    from .correlation import detail
+    try:return detail(quote,window,a,b)
+    except ValueError as exc:raise HTTPException(422,str(exc))
 
 
 @app.get("/api/experiments/{experiment_id}/records/{kind}")

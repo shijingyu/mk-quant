@@ -406,7 +406,7 @@ def test_backtest_memory_failure_has_actionable_result(client, monkeypatch):
 
 def test_correlation_admin_snapshot(client,monkeypatch):
     from backend import correlation
-    monkeypatch.setattr(correlation,'snapshot',lambda:{'windows':{},'refreshing':True,'updated_at':None,'stale':True})
+    monkeypatch.setattr(correlation,'snapshot',lambda quote='USDT':{'windows':{},'refreshing':True,'updated_at':None,'stale':True})
     response=client.get('/api/tools/correlation')
     assert response.status_code==200 and response.json()['refreshing']
 
@@ -416,3 +416,19 @@ def test_decision_symbol_outside_experiment_is_rejected(client):
     assert response.status_code==202
     result=client.get('/api/experiments/'+response.json()['id']+'/records/decisions?symbol=INVALIDUSDT')
     assert result.status_code==422
+
+
+def test_correlation_quote_and_detail_validation(client,monkeypatch):
+    from backend import correlation
+    monkeypatch.setattr(correlation,'snapshot',lambda quote='USDT':{'quote':quote,'windows':{}})
+    assert client.get('/api/tools/correlation?quote=USDC').json()['quote']=='USDC'
+    assert client.get('/api/tools/correlation?quote=USD').status_code==422
+    monkeypatch.setattr(correlation,'detail',lambda quote,window,a,b:dict(quote=quote,window=window,a=a,b=b))
+    response=client.get('/api/tools/correlation/pair?quote=USDC&window=90d&a=BTCUSDC&b=ETHUSDC')
+    assert response.status_code==200 and response.json()['window']=='90d'
+    assert client.get('/api/tools/correlation/pair?quote=USDC&window=invalid&a=BTCUSDC&b=ETHUSDC').status_code==422
+    def unavailable(*args):raise ValueError('所选配对暂无完整行情')
+    monkeypatch.setattr(correlation,'detail',unavailable)
+    assert client.get('/api/tools/correlation/pair?a=BTCUSDC&b=ETHUSDC').status_code==422
+    assert client.post('/api/logout').status_code==200
+    assert client.get('/api/tools/correlation?quote=USDC').status_code==401

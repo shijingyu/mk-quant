@@ -3,6 +3,7 @@ import {preferredMetric, splitMetrics} from "./reportMetrics.js";
 import React, { useEffect, useState, useMemo, useRef, useId } from "react";
 import { createPortal } from "react-dom";
 import Toolbox from "./Toolbox.jsx";
+import packageInfo from "../package.json";
 import {
   constrainLeverage,
   createBacktestPreset,
@@ -214,7 +215,8 @@ const navs = [
 const titles = Object.fromEntries(
   navs.flatMap((g) => g.items.map(([id, label]) => [id, label])),
 );
-titles["toolbox/correlation"] = "工具箱 · 相关性矩阵";
+titles["toolbox/correlation"] = "工具箱 · 相关性矩阵 USDT";
+titles["toolbox/correlation-usdc"] = "工具箱 · 相关性矩阵 USDC";
 let csrfToken = "";
 function normalizeMetrics(m = {}) {
   return {
@@ -821,7 +823,7 @@ export default function App() {
           </div>
           <div>
             MK <b>Quant</b>
-            <small>量化策略工作台</small>
+            <small>量化策略工作台 <span className="app-version">v{packageInfo.version}</span></small>
           </div>
         </a>
         <nav>
@@ -975,7 +977,7 @@ export default function App() {
               {page === "logs" && (
                 <Logs logs={data.logs || []} strategies={strategies} />
               )}
-              {["toolbox", "toolbox/correlation"].includes(page) && <Toolbox section={page === "toolbox/correlation" ? "correlation" : "grid"} />}
+              {["toolbox", "toolbox/correlation", "toolbox/correlation-usdc"].includes(page) && <Toolbox section={page === "toolbox/correlation-usdc" ? "correlation-usdc" : page === "toolbox/correlation" ? "correlation" : "grid"} />}
               {page === "protocol" && <Protocol notify={notify} />}
               {page === "todo" && <Todo />}
             </>
