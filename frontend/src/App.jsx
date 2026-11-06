@@ -4,6 +4,13 @@ import React, { useEffect, useState, useMemo, useRef, useId } from "react";
 import { createPortal } from "react-dom";
 import Toolbox from "./Toolbox.jsx";
 import {
+  constrainLeverage,
+  createBacktestPreset,
+  leverageBounds,
+  normalizeBacktestConfig,
+  restoreBacktestPreset,
+} from "./backtestPreset.js";
+import {
   formatBeijing,
   beijingInputToISO,
   toBeijingInput,
@@ -4132,7 +4139,7 @@ function Backtest({ data, mutate, notify, go }) {
       validation_start: "2026-10-01T00:00",
       validation_end: "2026-10-30T00:00",
       seed: 42,
-      leverage: 1,
+      leverage: leverageBounds(initialStrategy).min,
     }),
     [busy, setBusy] = useState(false),
     [active, setActive] = useState(null),
@@ -4162,6 +4169,7 @@ function Backtest({ data, mutate, notify, go }) {
       symbols: strategySymbols(selected).join(","),
       slippage_bps: isMakerStrategy(selected) ? 0 : 2,
       fee_rate: isMakerStrategy(selected) ? 0.0002 : 0.0004,
+      leverage: constrainLeverage(f.leverage, selected),
     }));
     setFeeSource("手动配置 / 默认估计");
   };
@@ -4227,15 +4235,16 @@ function Backtest({ data, mutate, notify, go }) {
   const savePreset = async () => {
     try {
       const title =
-        preset.trim() || `${s.name} 参数 ${strategyPresets.length + 1}`;
-      await mutate("/presets", {
-        name: title,
-        strategy_id: sid,
-        parameters: pvalues,
-      });
+        preset.trim() || `${s.name} 回测预设 ${strategyPresets.length + 1}`;
+      await mutate(
+        "/presets",
+        createBacktestPreset(title, sid, pvalues, form, manifest),
+      );
       setPresets(await api("/presets"));
-      notify("参数预设已保存到服务器");
-    } catch {}
+      notify("策略参数、初始资金、杠杆、手续费与滑点已保存到预设");
+    } catch (e) {
+      notify(e.message);
+    }
   };
   const readFee = async () => {
     setFeeBusy(true);
@@ -4335,6 +4344,13 @@ function Backtest({ data, mutate, notify, go }) {
                     `该策略仅允许：${strategySymbols(s).join(" / ")}`,
                   );
                 }
+                let executionConfig;
+                try {
+                  executionConfig = normalizeBacktestConfig(form, manifest);
+                } catch (e) {
+                  setConfigTab("execution");
+                  throw e;
+                }
                 const r = await mutate("/experiments", {
                   ...form,
                   ...intervals,
@@ -4344,11 +4360,8 @@ function Backtest({ data, mutate, notify, go }) {
                   params: pvalues,
                   symbols: form.symbols.split(/[,，\s]+/).filter(Boolean),
                   market: manifest.market || "futures",
-                  initial_capital: Number(form.initial_capital),
-                  fee_rate: Number(form.fee_rate),
-                  slippage_bps: maker ? 0 : Number(form.slippage_bps),
+                  ...executionConfig,
                   seed: Number(form.seed),
-                  leverage: Number(form.leverage),
                 });
                 setActive(r.id);
                 notify("回测已入队，独立进程开始后将推送进度");
@@ -4449,8 +4462,11 @@ function Backtest({ data, mutate, notify, go }) {
                     )}
                   </section>
                   <section>
-                    <h3 className="form-section-title">参数预设</h3>
-                    <Field label="参数预设名称">
+                    <h3 className="form-section-title">回测预设</h3>
+                    <p className="dim">
+                      保存策略参数、初始资金、杠杆、手续费与滑点。加载时保留当前数据和日期。
+                    </p>
+                    <Field label="回测预设名称">
                       <input
                         placeholder="输入名称后另存为"
                         value={preset}
@@ -4459,19 +4475,43 @@ function Backtest({ data, mutate, notify, go }) {
                     </Field>
                     <div className="preset-row">
                       <select
-                        aria-label="加载参数预设"
+                        aria-label="加载回测预设"
                         value={selectedPreset}
                         onChange={(e) => {
                           const p = strategyPresets.find(
                             (item) => item.id === e.target.value,
                           );
-                          setSelectedPreset(e.target.value);
-                          if (!p) return;
-                          setParams(p.parameters);
-                          notify("预设已加载");
+                          if (!p) {
+                            setSelectedPreset("");
+                            return;
+                          }
+                          try {
+                            const restored = restoreBacktestPreset(
+                              form,
+                              p,
+                              manifest,
+                            );
+                            setForm(restored);
+                            setParams(p.parameters);
+                            setSelectedPreset(p.id);
+                            const config = p.backtest_config || {};
+                            if (
+                              Object.hasOwn(config, "fee_rate") ||
+                              Object.hasOwn(config, "slippage_bps")
+                            ) {
+                              setFeeSource(`回测预设：${p.name}`);
+                            }
+                            notify(
+                              Object.keys(config).length
+                                ? "已加载策略参数及保存的资金与费用；数据和日期保持不变"
+                                : "已加载旧预设的策略参数；资金、杠杆与费用保持当前值",
+                            );
+                          } catch (error) {
+                            notify(error.message);
+                          }
                         }}
                       >
-                        <option value="">加载服务器参数预设</option>
+                        <option value="">加载服务器回测预设</option>
                         {strategyPresets.map((p) => (
                           <option key={p.id} value={p.id}>
                             {p.name}
@@ -4648,12 +4688,10 @@ function Backtest({ data, mutate, notify, go }) {
                       <Field label="杠杆">
                         <input
                           type="number"
-                          min="1"
-                          max={
-                            manifest.market === "spot"
-                              ? 1
-                              : manifest.account?.leverage_max || 1
-                          }
+                          min={leverageBounds(manifest).min}
+                          max={leverageBounds(manifest).max}
+                          step="1"
+                          required
                           value={form.leverage}
                           onChange={(e) => change("leverage", e.target.value)}
                         />

@@ -396,11 +396,24 @@ def market_loop(once=False):
         time.sleep(15)
 
 
+def _paper_execution_costs(manifest, metrics=None):
+    """Resolve market-paper costs; preserve legacy defaults and honor zero."""
+    from .strategy import validate_paper_costs
+    declared=manifest.get("execution",{})
+    if "paper_costs" in declared:
+        if declared.get("model")!="market_next_open_v1":
+            raise ValueError("paper_costs 仅适用于市价持续模拟模型")
+        return {**validate_paper_costs(declared["paper_costs"]),"fee_source":"strategy_manifest_paper_costs"}
+    previous=(metrics or {}).get("execution_model",{})
+    default_fee=.001 if manifest["market"]=="spot" else .0004
+    fee=previous.get("fee_rate",default_fee) if previous.get("model")!="maker_grid_v1" else default_fee
+    return {**validate_paper_costs({"fee_rate":fee,"slippage_bps":2}),"fee_source":"documented_simulation_assumption"}
+
+
 def _restore_ledger(account,manifest,snapshot):
     from .engine import Ledger,Position
     D=lambda x:Decimal(str(x))
-    execution=db.parse(account["metrics"],{}).get("execution_model",{})
-    fee=execution.get("fee_rate",.001 if manifest["market"]=="spot" else .0004) if execution.get("model")!="maker_grid_v1" else (.001 if manifest["market"]=="spot" else .0004)
+    fee=_paper_execution_costs(manifest,db.parse(account["metrics"],{}))["fee_rate"]
     ledger=Ledger(D(account["initial_equity"]),manifest["market"],D(manifest["account"]["leverage_min"]),D(fee))
     if snapshot:
         ledger.balance=D(snapshot["balance"])
@@ -740,6 +753,8 @@ def runtime_tick(account_id,owner):
         raise ValueError("当前模拟账本仅实现全仓模型，不能运行仅支持逐仓的策略")
     snapshot,archived=_convert_flat_snapshot(account,manifest,db.parse(saved["payload"],{}) if saved else {},"market_next_open_v1")
     ledger=_restore_ledger(account,manifest,snapshot)
+    paper_costs=_paper_execution_costs(manifest,db.parse(account["metrics"],{}))
+    paper_slippage=Decimal(str(paper_costs["slippage_bps"]))/Decimal("10000")
     revision={"strategy_id":account["strategy_id"],"source_hash":strategy["source_hash"],"config_revision":instance["config_revision"]}
     if snapshot.get("revision")!=revision:
         snapshot.update(pending=[],strategy_state={},bar_index=0,frames=None)
@@ -796,7 +811,7 @@ def runtime_tick(account_id,owner):
                 risk.append({"status":"rejected","reason":"账户已停止开仓"});continue
             if timestamp-last>60000:
                 risk.append({"status":"rejected","reason":"行情断档，过期交易意图作废"});continue
-            reason=ledger.execute(intent,timestamp,filters,Decimal(".0002"),last,execution_bar=bars.get(intent.get("symbol")))
+            reason=ledger.execute(intent,timestamp,filters,paper_slippage,last,execution_bar=bars.get(intent.get("symbol")))
             risk.append({"status":"rejected" if reason else "accepted","reason":reason or "模拟撮合通过"})
         # A primary-period signal is one-shot. Waiting for the next higher
         # candle must not replay it at every intervening minute.
@@ -805,7 +820,7 @@ def runtime_tick(account_id,owner):
     if mode=="stopped":
         for symbol,position in list(ledger.positions.items()):
             if position.quantity:
-                reason=ledger.execute({"symbol":symbol,"side":"sell" if position.quantity>0 else "buy","quantity":float(abs(position.quantity)),"reduce_only":True,"reason":"管理员平仓并停止"},timestamp,filters,Decimal(".0002"),timestamp,execution_bar=bars[symbol])
+                reason=ledger.execute({"symbol":symbol,"side":"sell" if position.quantity>0 else "buy","quantity":float(abs(position.quantity)),"reduce_only":True,"reason":"管理员平仓并停止"},timestamp,filters,paper_slippage,timestamp,execution_bar=bars[symbol])
                 if reason:
                     raise ValueError(f"模拟平仓失败：{reason}")
         pending=[]
@@ -844,7 +859,7 @@ def runtime_tick(account_id,owner):
     def period_pnl(start):
         baseline=next((p["equity"] for p in reversed(curve) if p["timestamp"]<start),account["initial_equity"])
         return float(ledger.equity())-baseline
-    metrics={"today_pnl":period_pnl(day_start),"month_pnl":period_pnl(month_start),"running_days":max(1,int((timestamp-curve[0]["timestamp"])/86400000)+1) if curve else 0,**ledger.account(),**stats,"return_pct":stats["total_return_pct"],"max_drawdown_u":stats["max_drawdown_amount"],"position_count":len(positions),"long_count":sum(p["quantity"]>0 for p in positions),"short_count":sum(p["quantity"]<0 for p in positions),"curve":curve,"positions":positions,"orders":ledger.orders,"display":display,"data_updated_at":db.now(),"risk":risk,"execution_model":{"fee_rate":float(ledger.fee_rate),"slippage_bps":2,"fee_source":"documented_simulation_assumption","interval":"1m","funding_included":False,"liquidation_simulated":False}}
+    metrics={"today_pnl":period_pnl(day_start),"month_pnl":period_pnl(month_start),"running_days":max(1,int((timestamp-curve[0]["timestamp"])/86400000)+1) if curve else 0,**ledger.account(),**stats,"return_pct":stats["total_return_pct"],"max_drawdown_u":stats["max_drawdown_amount"],"position_count":len(positions),"long_count":sum(p["quantity"]>0 for p in positions),"short_count":sum(p["quantity"]<0 for p in positions),"curve":curve,"positions":positions,"orders":ledger.orders,"display":display,"data_updated_at":db.now(),"risk":risk,"execution_model":{"model":"market_next_open_v1","fee_rate":float(ledger.fee_rate),"slippage_bps":paper_costs["slippage_bps"],"fee_source":paper_costs["fee_source"],"interval":"1m","funding_included":False,"liquidation_simulated":False}}
     metrics["execution_model"]["timeframes"]=manifest.get("timeframes",{"primary":"1m","additional":[]})
     snapshot={"model":"market_next_open_v1","balance":str(ledger.balance),"fees":str(ledger.fees),"positions":{s:{"quantity":str(p.quantity),"average_price":str(p.average_price),"entry_fees":str(p.entry_fees)} for s,p in ledger.positions.items()},"orders":ledger.orders,"closed_pnls":[str(v) for v in ledger.closed_pnls],"pending":pending,"strategy_state":strategy_state,"revision":revision,"last_timestamp":timestamp,"bar_index":snapshot.get("bar_index",0)+int(decision_called),"frames":frame_state,"curve":curve}
     with db.connect() as con:

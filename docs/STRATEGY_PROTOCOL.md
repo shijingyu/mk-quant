@@ -1,6 +1,6 @@
 # MK Quant 策略接入协议 v1.3
 
-协议与引擎版本：`1.3.0`。本文以 `backend/strategy.py`、`backend/engine.py`、`backend/worker.py` 的当前实现为准，适用于开发者及协助编写策略的 AI。未声明执行模型的已有策略继续使用单向市价模型；`maker_grid_v1` 增加双向限价订单簿与逐格保护，新的实验统一使用 1m 成交检查及完整高周期合成；旧实验保留原结果与引擎版本。
+协议版本：`1.3.0`；当前引擎版本：`1.4.0`。本文以 `backend/strategy.py`、`backend/engine.py`、`backend/worker.py` 的当前实现为准，适用于开发者及协助编写策略的 AI。未声明执行模型的已有策略继续使用单向市价模型；`maker_grid_v1` 增加双向限价订单簿与逐格保护，新的实验统一使用 1m 成交检查及完整高周期合成；旧实验保留原结果与引擎版本。
 
 策略负责根据已完成的行情生成交易意图。框架负责参数校验、行情对齐、数量及价格规则、资金检查、模拟成交、账本、指标、日志与任务状态。策略不读取 API Key，不连接交易所，不创建线程，也不自行下单。
 
@@ -127,6 +127,8 @@ class Strategy:
 现货还必须声明 `position_modes: ["one_way"]`，不能做空、借贷或加杠杆。`maker_grid_v1` 仅支持合约双向全仓模型；仅声明 `hedge` 而不选择该执行模型不能获得双向撮合。逐仓结算仍未实现，仅支持逐仓的策略不能运行。账户接入检查的真实钱包与保证金要求见 Binance 文档。
 
 `execution.model` 当前只接受 `market_next_open_v1` 和 `maker_grid_v1`。内置网格另声明 `fee_role: "maker"`、`time_in_force: "GTX"` 作为展示元数据；真正的成本解释和订单约束由模型及订单字段决定，这两个元数据字段不是任意切换成交规则的开关。
+
+市价策略可声明 `execution.paper_costs: {"fee_rate": 0.0, "slippage_bps": 0.0}` 指定持续模拟的费用假设。该对象必须且只能包含这两个有限数字字段：费率范围 0–0.1，滑点范围 0–1000 bps，零值有效。明确声明优先于账户中缓存的旧费用展示值，且同时应用于正常成交和管理员平仓；Maker 模型不接受此覆盖。未声明的策略保留原持续模拟成本逻辑（合约默认每次成交 0.0004、现货默认 0.001、滑点 2 bps）。运行指标的 `execution_model.fee_source` 记录来源。历史实验仍使用实验表单/配置中的 `fee_rate`、`slippage_bps`，不会被策略的 `paper_costs` 静默覆盖；创建零成本回测时需显式填写 0。
 
 参数结构示例见完整模板。当前支持 `integer`、`number`、`boolean`、`string`，每项必须有 `default`；支持 `minimum`、`maximum`、`enum`，`title` 用于界面标签。未提供的参数使用默认值，未知参数被拒绝；布尔值不作为数字接受，NaN/Infinity 被拒绝。复杂嵌套对象、数组、动态表单、JSON Schema 的其他关键字尚未实现。
 

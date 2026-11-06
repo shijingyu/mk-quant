@@ -56,6 +56,17 @@ def _number(value, label, minimum=None):
     return value
 
 
+def validate_paper_costs(value):
+    """Explicit simulation costs; zero is valid and never falls back to a fee."""
+    _require(isinstance(value, dict) and set(value) == {"fee_rate", "slippage_bps"},
+             "execution.paper_costs 必须且只能包含 fee_rate 和 slippage_bps")
+    fee = _number(value["fee_rate"], "paper_costs.fee_rate", 0)
+    slip = _number(value["slippage_bps"], "paper_costs.slippage_bps", 0)
+    _require(fee <= .1, "paper_costs.fee_rate 不能大于 0.1")
+    _require(slip <= 1000, "paper_costs.slippage_bps 不能大于 1000")
+    return {"fee_rate": float(fee), "slippage_bps": float(slip)}
+
+
 def validate_manifest(manifest: dict) -> dict:
     """Validate the declarative contract and return a detached normalized copy."""
     _require(isinstance(manifest, dict), "MANIFEST 必须是字典")
@@ -103,6 +114,9 @@ def validate_manifest(manifest: dict) -> dict:
     if execution is not None:
         _require(isinstance(execution, dict), "execution 必须为执行模型声明")
         _require(execution.get("model") in {"market_next_open_v1", "maker_grid_v1"}, "不支持的 execution.model")
+        if "paper_costs" in execution:
+            _require(execution["model"] == "market_next_open_v1", "paper_costs 仅适用于市价持续模拟模型")
+            execution["paper_costs"] = validate_paper_costs(execution["paper_costs"])
         if execution["model"] == "maker_grid_v1":
             _require(result["market"] == "futures", "Maker 网格模型仅支持合约")
             _require(account["position_modes"] == ["hedge"], "Maker 网格必须声明双向持仓 hedge")
@@ -251,7 +265,7 @@ def load_strategy(source: str):
 
 def builtin_strategies() -> list[dict]:
     strategies = []
-    for filename in ("momentum.py", "spot_dca.py", "usdc_hedge_grid.py"):
+    for filename in ("momentum.py", "spot_dca.py", "usdc_hedge_grid.py", "btc_eth_usdc_ratio.py"):
         source = (Path(__file__).parent / "strategies" / filename).read_text(encoding="utf-8")
         manifest = validate_strategy_source(source)
         manifest["source"] = source

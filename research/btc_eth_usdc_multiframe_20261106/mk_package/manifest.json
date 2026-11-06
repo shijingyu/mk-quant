@@ -1,0 +1,56 @@
+{
+  "strategies": [
+    {
+      "file": "btc_eth_usdc_ratio_1h.py",
+      "interval": "1h",
+      "lookback": 168,
+      "entry_z": 3,
+      "exit_z": 0.25,
+      "sha256": "9a6af8ea15759c8c1a267774357a9ca435d8a168592da6599da7455d3380b87c",
+      "manifest_id": "btc_eth_usdc_ratio_1h",
+      "version": "1.0.1"
+    },
+    {
+      "file": "btc_eth_usdc_ratio_15m.py",
+      "interval": "15m",
+      "lookback": 672,
+      "entry_z": 3,
+      "exit_z": 0.1,
+      "sha256": "71cce1cdb456f736726479575472bdd5ef657f4c2e3c63b872cdfc1a7555745e",
+      "manifest_id": "btc_eth_usdc_ratio_15m",
+      "version": "1.0.1"
+    },
+    {
+      "file": "btc_eth_usdc_ratio_4h.py",
+      "interval": "4h",
+      "lookback": 24,
+      "entry_z": 2,
+      "exit_z": 0.25,
+      "sha256": "773f76ed54a311482b100c73c302e66e2b46927f06622fd7cf8a02a061e9e691",
+      "manifest_id": "btc_eth_usdc_ratio_4h",
+      "version": "1.0.1"
+    },
+    {
+      "file": "btc_eth_usdc_ratio_1d.py",
+      "interval": "1d",
+      "lookback": 3,
+      "entry_z": 1,
+      "exit_z": 0.5,
+      "sha256": "d1b0ba54a943f56b032932de74d277d05abe8f9282329f1f4eecdf68db6ee003",
+      "manifest_id": "btc_eth_usdc_ratio_1d",
+      "version": "1.0.1"
+    }
+  ],
+  "funding_included": false,
+  "paper_fee_rate": 0,
+  "paper_slippage_bps": 0,
+  "target_gross_multiple": 1,
+  "account_leverage": 2,
+  "backtest_base_interval": "1m",
+  "note": "1h retains prior selected parameters; other periods selected retrospectively on both periods, not untouched validation.",
+  "account_leverage_range": [
+    2,
+    100
+  ],
+  "account_leverage_default": 2
+}

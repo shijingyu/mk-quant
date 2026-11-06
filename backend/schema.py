@@ -71,7 +71,7 @@ _TABLES = {
     """,
     "presets": """
         id VARCHAR(64) PRIMARY KEY, strategy_id VARCHAR(64) NOT NULL, name VARCHAR(255) NOT NULL,
-        parameters LONGTEXT NOT NULL, created_at VARCHAR(40) NOT NULL,
+        parameters LONGTEXT NOT NULL, created_at VARCHAR(40) NOT NULL, backtest_config LONGTEXT NULL,
         CONSTRAINT fk_preset_strategy FOREIGN KEY(strategy_id) REFERENCES strategies(id)
     """,
     "logs": """

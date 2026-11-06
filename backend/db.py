@@ -187,6 +187,10 @@ def init_schema():
                 if column not in columns:
                     con.execute(f"ALTER TABLE data_download_jobs ADD COLUMN `{column}` {definition}")
             con.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?) ON DUPLICATE KEY UPDATE version=VALUES(version)", ("mysql-003-download-waits", now()))
+            preset_columns = {row["COLUMN_NAME"] for row in con.execute("SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='presets'").fetchall()}
+            if "backtest_config" not in preset_columns:
+                con.execute("ALTER TABLE presets ADD COLUMN `backtest_config` LONGTEXT NULL")
+            con.execute("INSERT INTO schema_migrations(version,applied_at) VALUES(?,?) ON DUPLICATE KEY UPDATE version=VALUES(version)", ("mysql-004-presets-backtest-config", now()))
         finally:
             con.execute("SELECT RELEASE_LOCK(?)", (lock_name,))
 

@@ -541,17 +541,61 @@ def save_strategy(body:dict,current=Depends(admin)):
 @app.get("/api/presets")
 def presets(current=Depends(admin)):
     with db.connect() as con:
-        return [dict(r)|{"parameters":db.parse(r["parameters"],{})} for r in con.execute("SELECT * FROM presets ORDER BY created_at DESC").fetchall()]
+        return [dict(r)|{"parameters":db.parse(r["parameters"],{}),
+                         "backtest_config":db.parse(r.get("backtest_config"),{}) or {}}
+                for r in con.execute("SELECT * FROM presets ORDER BY created_at DESC").fetchall()]
+
+
+def validate_preset_backtest_config(manifest, value):
+    """Keep optional execution settings separate from strategy parameters."""
+    fields={"initial_capital","leverage","fee_rate","slippage_bps"}
+    if not isinstance(value,dict):
+        raise ValueError("backtest_config 必须为对象；旧预设可省略或使用空对象")
+    if not value:
+        return {}
+    if set(value)!=fields:
+        raise ValueError("backtest_config 必须且只能包含 initial_capital、leverage、fee_rate、slippage_bps")
+    if any(isinstance(item,bool) or not isinstance(item,(int,float)) for item in value.values()):
+        raise ValueError("回测资金、杠杆、费率和滑点必须为有限数字")
+    try:
+        numbers={key:float(item) for key,item in value.items()}
+    except OverflowError as exc:
+        raise ValueError("回测资金、杠杆、费率和滑点必须为有限数字") from exc
+    if not all(math.isfinite(item) for item in numbers.values()):
+        raise ValueError("回测资金、杠杆、费率和滑点必须为有限数字")
+    capital,leverage,fee,slip=(numbers[key] for key in ("initial_capital","leverage","fee_rate","slippage_bps"))
+    account=manifest["account"]
+    if capital<=0 or capital<account["min_capital"]:
+        raise ValueError("初始资金必须大于0且不低于策略最低资金要求")
+    if not float(leverage).is_integer() or not account["leverage_min"]<=leverage<=account["leverage_max"]:
+        raise ValueError("杠杆必须是策略允许范围内的整数，现货仅支持1倍")
+    if not 0<=fee<=.1 or not 0<=slip<=1000:
+        raise ValueError("费率范围0–0.1，滑点范围0–1000 bps")
+    if manifest.get("execution",{}).get("model")=="maker_grid_v1" and slip!=0:
+        raise ValueError("Maker 网格使用限价撮合，滑点须为0")
+    return {"initial_capital":float(capital),"leverage":int(leverage),
+            "fee_rate":float(fee),"slippage_bps":float(slip)}
 
 
 @app.post("/api/presets",status_code=201)
 def save_preset(body:dict,current=Depends(admin)):
-    strategy_row(body.get("strategy_id",""))
+    from .strategy import validate_parameters
+    strategy=strategy_row(body.get("strategy_id",""))
+    manifest=db.parse(strategy["manifest"],{})
+    try:
+        parameters=validate_parameters(manifest,body.get("parameters",{}))
+        backtest_config=validate_preset_backtest_config(manifest,body.get("backtest_config",{}))
+    except ValueError as exc:
+        raise HTTPException(422,str(exc)) from exc
     id=db.uid()
+    name=str(body.get("name","未命名预设"))
+    created_at=db.now()
     with db.connect() as con:
-        con.execute("INSERT INTO presets VALUES(?,?,?,?,?)",(id,body["strategy_id"],str(body.get("name","未命名预设")),db.dump(body.get("parameters",{})),db.now()))
+        con.execute("INSERT INTO presets(id,strategy_id,name,parameters,created_at,backtest_config) VALUES(?,?,?,?,?,?)",
+                    (id,strategy["id"],name,db.dump(parameters),created_at,db.dump(backtest_config)))
         db.audit(con,current["id"],"preset.create","preset",id,{"strategy_id":body["strategy_id"]})
-    return {"id":id,**body}
+    return {"id":id,"strategy_id":strategy["id"],"name":name,"parameters":parameters,
+            "backtest_config":backtest_config,"created_at":created_at}
 
 
 def timestamp(value):
