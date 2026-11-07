@@ -71,8 +71,9 @@ class PresetMemory:
     def fetchall(self):return self.rows
     def execute(self,sql,args=()):
         self.rows=[]
-        if sql.startswith("SELECT * FROM strategies"):
+        if sql.startswith(("SELECT * FROM strategies", "SELECT id FROM strategies")):
             self.rows=[self.strategies[args[0]]] if args[0] in self.strategies else []
+        elif sql.startswith("SELECT 1 FROM strategy_archives"):pass
         elif sql.startswith("SELECT * FROM presets"):self.rows=copy.deepcopy(self.presets)
         elif sql.startswith("INSERT INTO presets("):
             columns=sql.split("(",1)[1].split(")",1)[0].split(",")

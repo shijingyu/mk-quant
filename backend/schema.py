@@ -4,10 +4,19 @@ TABLES = (
     "users", "strategies", "strategy_versions", "sessions", "accounts", "instances",
     "commands", "datasets", "experiments", "presets", "logs", "ledger", "runtime_events",
     "services", "market_cache", "orders", "fills", "audit_records", "binance_order_intents",
-    "schema_migrations", "data_download_jobs",
+    "schema_migrations", "data_download_jobs", "strategy_archives", "account_execution_settings",
 )
 
 _TABLES = {
+    "strategy_archives": """
+        strategy_id VARCHAR(64) PRIMARY KEY, deleted_by VARCHAR(64) NOT NULL,
+        deleted_at VARCHAR(40) NOT NULL,
+        CONSTRAINT fk_archived_strategy FOREIGN KEY(strategy_id) REFERENCES strategies(id)
+    """,
+    "account_execution_settings": """
+        account_id VARCHAR(64) PRIMARY KEY, leverage INT NOT NULL, updated_at VARCHAR(40) NOT NULL,
+        CONSTRAINT fk_execution_settings_account FOREIGN KEY(account_id) REFERENCES accounts(id)
+    """,
     "users": """
         id VARCHAR(64) PRIMARY KEY, username VARCHAR(120) NOT NULL UNIQUE,
         name VARCHAR(255) NOT NULL, phone VARCHAR(40), password VARCHAR(255) NOT NULL,

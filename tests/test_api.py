@@ -432,3 +432,96 @@ def test_correlation_quote_and_detail_validation(client,monkeypatch):
     assert client.get('/api/tools/correlation/pair?a=BTCUSDC&b=ETHUSDC').status_code==422
     assert client.post('/api/logout').status_code==200
     assert client.get('/api/tools/correlation?quote=USDC').status_code==401
+
+
+def test_account_leverage_persists_and_enforces_strategy_limits(client):
+    account=new_paper(client)
+    path=f"/api/accounts/{account['id']}"
+    assert account['configured_leverage']==account['leverage']==1
+    for invalid in (0,6,1.5,True,'bad'):
+        assert client.patch(path,json={'leverage':invalid}).status_code==422
+    response=client.patch(path,json={'leverage':4})
+    assert response.status_code==200,response.text
+    assert response.json()['configured_leverage']==response.json()['leverage']==4
+    assert 'leverage' not in response.json()['config']
+    with db.connect() as con:
+        assert con.execute('SELECT config_revision FROM instances WHERE account_id=?',(account['id'],)).fetchone()[0]==2
+        con.execute('UPDATE accounts SET metrics=? WHERE id=?',(db.dump({'equity':1000,'positions':[{'symbol':'BTCUSDT'}]}),account['id']))
+    assert client.patch(path,json={'leverage':3}).status_code==409
+    with db.connect() as con:
+        con.execute('UPDATE accounts SET metrics=? WHERE id=?',(db.dump({'equity':1000,'open_orders':[{'symbol':'BTCUSDT'}]}),account['id']))
+    assert client.patch(path,json={'leverage':3}).status_code==409
+    with db.connect() as con:
+        con.execute('UPDATE accounts SET metrics=? WHERE id=?',(db.dump({'equity':1000}),account['id']))
+    client.post('/api/commands',json={'account_ids':[account['id']],'action':'resume'})
+    assert client.patch(path,json={'leverage':3}).status_code==409
+    assert next(a for a in client.get('/api/accounts').json() if a['id']==account['id'])['configured_leverage']==4
+
+
+def test_account_creation_leverage_and_spot_constraint(client):
+    body={'name':'Leverage test','phone':'13900000001','password':'test-password-123','mode':'paper','initial_equity':1000,'strategy_id':'momentum','symbols':['BTCUSDT'],'config':{},'leverage':3}
+    response=client.post('/api/accounts',json=body)
+    assert response.status_code==201,response.text
+    assert response.json()['configured_leverage']==3
+    spot=next(s for s in client.get('/api/strategies').json() if s['market']=='spot')
+    body.update(phone='13900000002',strategy_id=spot['id'],leverage=2)
+    assert client.post('/api/accounts',json=body).status_code==422
+    body['leverage']=1
+    assert client.post('/api/accounts',json=body).status_code==201
+
+
+def test_live_account_inspection_uses_selected_leverage(client,monkeypatch):
+    from cryptography.fernet import Fernet
+    from backend.binance import BinanceClient
+    monkeypatch.setenv('MK_MASTER_KEY',Fernet.generate_key().decode())
+    captures=[]
+    def inspect(self,manifest,symbols):
+        captures.append((manifest['account']['leverage_min'],manifest['account']['leverage_max'],symbols))
+        return {'ok':True,'checks':[],'adjustments':[]}
+    monkeypatch.setattr(BinanceClient,'inspect_account',inspect)
+    response=client.post('/api/accounts',json={'name':'Live check','phone':'13900000003','password':'test-password-123','mode':'live','initial_equity':1000,'strategy_id':'momentum','symbols':['BTCUSDT'],'config':{},'leverage':5,'api_key':'test-key','api_secret':'test-secret'})
+    assert response.status_code==201,response.text
+    result=client.post(f"/api/accounts/{response.json()['id']}/check",json={})
+    assert result.json()['ok'],result.text
+    assert captures==[(5,5,['BTCUSDT'])]
+
+
+def test_strategy_delete_blocks_bindings_and_preserves_history(client):
+    assert client.delete('/api/strategies/momentum').status_code==409
+    source=next(s['source'] for s in client.get('/api/strategies').json() if s['id']=='momentum')
+    strategy=client.post('/api/strategies',json={'source':source}).json()
+    sid=strategy['id']
+    preset=client.post('/api/presets',json={'strategy_id':sid,'name':'Archive test','parameters':{}})
+    assert preset.status_code==201,preset.text
+    body=experiment_body();body['strategy_id']=sid
+    response=client.post('/api/experiments',json=body)
+    assert response.status_code==202,response.text
+    experiment=response.json()
+    assert client.delete(f'/api/strategies/{sid}').status_code==409
+    run_experiment(experiment['id'])
+    before=client.get(f"/api/experiments/{experiment['id']}").json()
+    assert before['status']=='completed',before.get('error')
+    assert client.delete(f'/api/strategies/{sid}').status_code==200
+    assert client.delete(f'/api/strategies/{sid}').status_code==200
+    assert sid not in {s['id'] for s in client.get('/api/strategies').json()}
+    assert preset.json()['id'] not in {s['id'] for s in client.get('/api/presets').json()}
+    assert client.get(f"/api/experiments/{experiment['id']}").json()==before
+    assert client.post('/api/experiments',json=body).status_code==404
+    assert client.post('/api/presets',json={'strategy_id':sid,'parameters':{}}).status_code==404
+    with db.connect() as con:
+        assert con.execute('SELECT 1 FROM strategy_versions WHERE strategy_id=?',(sid,)).fetchone()
+        assert con.execute("SELECT COUNT(*) FROM audit_records WHERE action='strategy.delete' AND resource_id=?",(sid,)).fetchone()[0]==1
+    db.init_db()
+    assert sid not in {s['id'] for s in client.get('/api/strategies').json()}
+
+
+def test_deleted_builtin_does_not_reappear_after_restart(client):
+    sid=next(s['id'] for s in client.get('/api/strategies').json() if s['market']=='spot')
+    with db.connect() as con:
+        con.execute("UPDATE accounts SET strategy_id='momentum' WHERE strategy_id=?",(sid,))
+    assert client.delete(f'/api/strategies/{sid}').status_code==200
+    db.init_db()
+    assert sid not in {s['id'] for s in client.get('/api/strategies').json()}
+    login=client.post('/api/login',json={'username':'demo1','password':os.environ['MK_DEMO_PASSWORD']}).json()
+    client.headers['X-MK-CSRF']=login['csrf_token']
+    assert client.delete('/api/strategies/momentum').status_code==403

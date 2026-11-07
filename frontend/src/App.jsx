@@ -2138,6 +2138,7 @@ function AccountForm({
       mode: account?.mode || (defaultMode === "live" ? "live" : "paper"),
       initial_equity: account?.initial_equity || 10000,
       strategy_id: account?.strategy_id || strategies[0]?.id || "",
+      leverage: account?.configured_leverage ?? leverageBounds(strategies.find(s => s.id === account?.strategy_id) || strategies[0]).min,
       symbols: (account?.symbols || strategySymbols(strategies[0])).join(","),
       api_key: "",
       api_secret: "",
@@ -2181,6 +2182,7 @@ function AccountForm({
               ...form,
               symbols: form.symbols.split(/[,，\s]+/).filter(Boolean),
               initial_equity: Number(form.initial_equity),
+              leverage: Number(form.leverage),
             };
             if (!body.api_key) delete body.api_key;
             if (!body.api_secret) delete body.api_secret;
@@ -2242,6 +2244,8 @@ function AccountForm({
           </Field>
           <Field label="执行策略">
             <select
+              required
+              aria-label="执行策略"
               value={form.strategy_id}
               onChange={(e) => {
                 const selected = strategies.find(
@@ -2251,10 +2255,12 @@ function AccountForm({
                   ...f,
                   strategy_id: e.target.value,
                   config: {},
+                  leverage: constrainLeverage(f.leverage, selected),
                   symbols: strategySymbols(selected).join(","),
                 }));
               }}
             >
+              {!strategies.length && <option value="">请先添加策略</option>}
               {strategies.map((s) => (
                 <option key={s.id} value={s.id}>
                   {s.name} · {s.version}
@@ -2262,6 +2268,10 @@ function AccountForm({
               ))}
             </select>
           </Field>
+          <Field label="杠杆倍数" hint={`${leverageBounds(strategy).min}–${leverageBounds(strategy).max} 倍${(strategy?.manifest || strategy)?.market === "spot" ? " · 现货固定 1 倍" : " · 单个账户内各币种使用此配置"}`}>
+            <input aria-label="杠杆倍数" type="number" step="1" required min={leverageBounds(strategy).min} max={leverageBounds(strategy).max} disabled={leverageBounds(strategy).min === leverageBounds(strategy).max} value={form.leverage} onChange={e => change("leverage", e.target.value)} />
+          </Field>
+          {form.mode === "live" && <p className="dim">保存的是目标杠杆；交易所实际设置需通过账户接入检查和确认调整后生效。</p>}
           <Field
             label="交易对"
             hint={
@@ -2338,7 +2348,7 @@ function AccountForm({
           <Btn type="button" onClick={onClose}>
             取消
           </Btn>
-          <Btn kind="primary" disabled={busy} icon={busy ? Loader2 : Check}>
+          <Btn kind="primary" disabled={busy || !strategy} icon={busy ? Loader2 : Check}>
             保存账户
           </Btn>
         </div>
@@ -3556,7 +3566,9 @@ function Strategies({ strategies, mutate, notify, go }) {
     [source, setSource] = useState(""),
     [name, setName] = useState(""),
     [err, setErr] = useState(""),
-    [busy, setBusy] = useState(false);
+    [busy, setBusy] = useState(false),
+    [deleteTarget, setDeleteTarget] = useState(null),
+    [deleteBusy, setDeleteBusy] = useState(false);
   return (
     <>
       <Heading
@@ -3685,6 +3697,7 @@ function Strategies({ strategies, mutate, notify, go }) {
                 >
                   回测
                 </Btn>
+                <Btn kind="danger" icon={Trash2} onClick={() => { setErr(""); setDeleteTarget(s); }}>删除</Btn>
               </div>
             </section>
           );
@@ -3697,6 +3710,17 @@ function Strategies({ strategies, mutate, notify, go }) {
           接入文档 <ArrowRight size={14} />
         </button>
       </div>
+      {deleteTarget && <Modal title="删除策略" subtitle={deleteTarget.name} onClose={() => { if (!deleteBusy) setDeleteTarget(null); }}>
+        <p>确认删除「{deleteTarget.name}」？删除后不再用于新建账户和回测，历史实验与版本快照会保留。</p>
+        <p className="dim">仍有账户绑定或未结束回测时，需先解除关联。</p>
+        {err && <div className="inline-error" role="alert">{err}</div>}
+        <div className="modal-footer"><Btn disabled={deleteBusy} onClick={() => setDeleteTarget(null)}>取消</Btn><Btn kind="danger" disabled={deleteBusy} icon={deleteBusy ? Loader2 : Trash2} onClick={async () => {
+          if (deleteBusy) return;
+          setDeleteBusy(true); setErr("");
+          try { const result = await mutate(`/strategies/${deleteTarget.id}`, undefined, "DELETE"); if (sessionStorage.getItem("mk-strategy") === deleteTarget.id) sessionStorage.removeItem("mk-strategy"); setDeleteTarget(null); notify(result.message || "策略已删除"); }
+          catch (error) { setErr(error.message); } finally { setDeleteBusy(false); }
+        }}>确认删除</Btn></div>
+      </Modal>}
       {detail && (
         <Modal
           wide
@@ -4420,6 +4444,7 @@ function Backtest({ data, mutate, notify, go }) {
                   ["strategy", "策略与参数"],
                   ["data", "行情与区间"],
                   ["execution", "资金与费用"],
+                  ["presets", "回测预设"],
                 ].map(([key, label], index) => (
                   <button
                     type="button"
@@ -4464,6 +4489,10 @@ function Backtest({ data, mutate, notify, go }) {
                       <p className="dim">此策略没有需要调整的参数。</p>
                     )}
                   </section>
+
+                </div>
+              </fieldset>
+              <fieldset className="config-tab-panel" hidden={configTab !== "presets"} disabled={configTab !== "presets"}>
                   <section>
                     <h3 className="form-section-title">回测预设</h3>
                     <p className="dim">
@@ -4526,7 +4555,6 @@ function Backtest({ data, mutate, notify, go }) {
                       </Btn>
                     </div>
                   </section>
-                </div>
               </fieldset>
               <fieldset
                 className="config-tab-panel"

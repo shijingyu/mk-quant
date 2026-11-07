@@ -4,6 +4,7 @@ Web shutdown never owns the lifetime of these workers. The backtest coordinator
 forks a bounded subprocess per job; runtime isolates each account in a process.
 Live order submission is intentionally gated until production acceptance.
 """
+from .account_settings import configured_leverage
 import argparse
 import copy
 from decimal import Decimal
@@ -414,7 +415,7 @@ def _restore_ledger(account,manifest,snapshot):
     from .engine import Ledger,Position
     D=lambda x:Decimal(str(x))
     fee=_paper_execution_costs(manifest,db.parse(account["metrics"],{}))["fee_rate"]
-    ledger=Ledger(D(account["initial_equity"]),manifest["market"],D(manifest["account"]["leverage_min"]),D(fee))
+    ledger=Ledger(D(account["initial_equity"]),manifest["market"],D(configured_leverage(account,manifest)),D(fee))
     if snapshot:
         ledger.balance=D(snapshot["balance"])
         ledger.fees=D(snapshot["fees"])
@@ -450,7 +451,7 @@ def _convert_flat_snapshot(account,manifest,snapshot,target):
         financial={key:copy.deepcopy(snapshot[key]) for key in ("balance","fees","orders","closed_pnls")}
     common={"model":target,"curve":copy.deepcopy(snapshot.get("curve",[])),"last_timestamp":snapshot.get("last_timestamp",0),"strategy_state":{},"bar_index":0}
     if target=="maker_grid_v1":
-        ledger=Ledger(account["initial_equity"],"futures",manifest["account"]["leverage_min"],Decimal(".0002"),position_mode="hedge")
+        ledger=Ledger(account["initial_equity"],"futures",configured_leverage(account,manifest),Decimal(".0002"),position_mode="hedge")
         ledger.balance=Decimal(financial["balance"]);ledger.fees=Decimal(financial["fees"])
         ledger.orders=financial["orders"];ledger.closed_pnls=[Decimal(str(value)) for value in financial["closed_pnls"]]
         converted={**common,"book":MakerOrderBook(ledger).dump()}
@@ -551,7 +552,7 @@ def maker_runtime_tick(account, instance, commands, strategy, snapshot, fence, c
     if snapshot:
         book=MakerOrderBook.load(snapshot["book"])
     else:
-        book=MakerOrderBook(Ledger(account["initial_equity"],"futures",manifest["account"]["leverage_min"],Decimal(".0002"),position_mode="hedge"))
+        book=MakerOrderBook(Ledger(account["initial_equity"],"futures",configured_leverage(account,manifest),Decimal(".0002"),position_mode="hedge"))
     ledger=book.ledger
     previous_orders={key:db.dump(value) for key,value in book.orders.items()}
     fill_start=len(ledger.orders); event_start=len(book.events)
@@ -567,7 +568,7 @@ def maker_runtime_tick(account, instance, commands, strategy, snapshot, fence, c
         if snapshot and (book.has_open_positions() or book.open_orders()):
             raise ValueError("Maker 持仓或挂单未清空，不能用新配置覆盖运行状态")
         strategy_state={};strategy_error=None;strategy_cursor=len(book.events);bar_index=0;frame_state=None
-        ledger.leverage=Decimal(str(manifest["account"]["leverage_min"]))
+        ledger.leverage=Decimal(str(configured_leverage(account,manifest)))
         ledger.fee_rate=Decimal(".0002")
         if snapshot.get("revision"):
             archived=archived or snapshot
@@ -724,7 +725,7 @@ def runtime_tick(account_id,owner):
     if fence is None:
         return True
     with db.connect() as con:
-        account=con.execute("SELECT * FROM accounts WHERE id=?",(account_id,)).fetchone()
+        account=con.execute("SELECT a.*,e.leverage AS configured_leverage FROM accounts a LEFT JOIN account_execution_settings e ON e.account_id=a.id WHERE a.id=?",(account_id,)).fetchone()
         instance=con.execute("SELECT * FROM instances WHERE account_id=?",(account_id,)).fetchone()
         commands=con.execute("SELECT * FROM commands WHERE account_id=? AND status IN ('pending','running') ORDER BY created_at",(account_id,)).fetchall()
         strategy=con.execute("SELECT * FROM strategies WHERE id=?",(account["strategy_id"],)).fetchone()

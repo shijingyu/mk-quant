@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from . import db, storage, downloads, artifact_cleanup
+from .account_settings import validate_leverage
 from .security import decrypt_secret, encrypt_secret, hash_password, token_hash, verify_password
 
 
@@ -129,7 +130,7 @@ def me(current=Depends(user)):
 
 def strategy_row(strategy_id):
     with db.connect() as con:
-        row=con.execute("SELECT * FROM strategies WHERE id=?",(strategy_id,)).fetchone()
+        row=con.execute("SELECT * FROM strategies WHERE id=? AND NOT EXISTS (SELECT 1 FROM strategy_archives WHERE strategy_id=strategies.id)",(strategy_id,)).fetchone()
     if not row:
         raise HTTPException(404,"策略不存在")
     return dict(row)
@@ -137,7 +138,7 @@ def strategy_row(strategy_id):
 
 def list_strategy_data():
     with db.connect() as con:
-        rows=con.execute("SELECT * FROM strategies ORDER BY created_at").fetchall()
+        rows=con.execute("SELECT * FROM strategies WHERE NOT EXISTS (SELECT 1 FROM strategy_archives WHERE strategy_id=strategies.id) ORDER BY created_at").fetchall()
     return [{**db.parse(r["manifest"],{}),"id":r["id"],"source":r["source"],"source_hash":r["source_hash"],"trusted":bool(r["trusted"]),"review_status":"admin_trusted" if r["trusted"] else "disabled"} for r in rows]
 
 
@@ -152,7 +153,10 @@ def account_data(row, *, include_private=False):
     with db.connect() as con:
         instance=con.execute("SELECT * FROM instances WHERE account_id=?",(d["id"],)).fetchone()
         strategy=con.execute("SELECT manifest FROM strategies WHERE id=?",(d["strategy_id"],)).fetchone()
+        execution=con.execute("SELECT leverage FROM account_execution_settings WHERE account_id=?",(d["id"],)).fetchone()
     d.update(metrics)
+    d["configured_leverage"]=execution["leverage"] if execution else db.parse(strategy["manifest"],{}).get("account",{}).get("leverage_min",1) if strategy else 1
+    if d["mode"]=="paper":d["leverage"]=d["configured_leverage"]
     d["strategy_name"]=db.parse(strategy["manifest"],{}).get("name",d["strategy_id"]) if strategy else d["strategy_id"]
     d["strategy_version"]=db.parse(strategy["manifest"],{}).get("version","") if strategy else ""
     d["manifest_execution"]=db.parse(strategy["manifest"],{}).get("execution",{}) if strategy else {}
@@ -306,6 +310,8 @@ def create_account(body:dict,current=Depends(admin)):
     manifest=db.parse(strategy["manifest"],{})
     symbols=body.get("symbols",["BTCUSDT"])
     config=validate_config(manifest,body.get("config",{}),symbols)
+    try:leverage=validate_leverage(manifest,body.get("leverage"))
+    except ValueError as exc:raise HTTPException(422,str(exc))
     mode=body.get("mode","paper")
     if mode not in {"paper","live"}:
         raise HTTPException(422,"mode 必须为 paper 或 live")
@@ -332,10 +338,12 @@ def create_account(body:dict,current=Depends(admin)):
     user_id,account_id=db.uid(),db.uid()
     try:
         with db.connect() as con:
+            lock_available_strategy(con,strategy["id"])
             con.execute("INSERT INTO users VALUES(?,?,?,?,?,?,?)",(user_id,str(body.get("username",phone)),name,phone,password,"client",db.now()))
             con.execute("INSERT INTO accounts VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(account_id,user_id,name,mode,db.uid(),strategy["id"],db.dump(config),db.dump(symbols),initial,db.dump({"equity":initial,"curve":[],"positions":[],"orders":[]}),credentials,None,None,"local",db.now()))
             con.execute("INSERT INTO instances(account_id) VALUES(?)",(account_id,))
-            db.audit(con,current["id"],"account.create","account",account_id,{"strategy_id":strategy["id"],"mode":mode,"symbols":symbols})
+            con.execute("INSERT INTO account_execution_settings VALUES(?,?,?)",(account_id,leverage,db.now()))
+            db.audit(con,current["id"],"account.create","account",account_id,{"strategy_id":strategy["id"],"mode":mode,"symbols":symbols,"leverage":leverage})
     except db.IntegrityError as exc:
         raise HTTPException(409,"登录账号已存在") from exc
     db.log("debug","管理员创建账户",account_id=account_id,strategy_id=strategy["id"])
@@ -354,10 +362,16 @@ def update_account(account_id:str,body:dict,current=Depends(admin)):
     strategy=strategy_row(strategy_id)
     symbols=body.get("symbols",db.parse(row["symbols"],[]))
     config=validate_config(db.parse(strategy["manifest"],{}),body.get("config",db.parse(row["config"],{})),symbols)
+    with db.connect() as con:
+        saved_execution=con.execute("SELECT leverage FROM account_execution_settings WHERE account_id=?",(account_id,)).fetchone()
+    prior_manifest=db.parse(strategy_row(row["strategy_id"])["manifest"],{})
+    previous_leverage=saved_execution["leverage"] if saved_execution else prior_manifest["account"]["leverage_min"]
+    try:leverage=validate_leverage(db.parse(strategy["manifest"],{}),body.get("leverage",previous_leverage if strategy_id==row["strategy_id"] else None))
+    except ValueError as exc:raise HTTPException(422,str(exc))
     current_metrics=db.parse(row["metrics"],{})
-    changes_execution=(strategy_id!=row["strategy_id"] or symbols!=db.parse(row["symbols"],[]) or config!=db.parse(row["config"],{}))
+    changes_execution=(leverage!=previous_leverage) or (strategy_id!=row["strategy_id"] or symbols!=db.parse(row["symbols"],[]) or config!=db.parse(row["config"],{}))
     if changes_execution and (current_metrics.get("positions") or current_metrics.get("open_orders")):
-        raise HTTPException(409,"账户仍有持仓或挂单，完成平仓撤单后才能修改策略、币种或参数")
+        raise HTTPException(409,"账户仍有持仓或挂单，完成平仓撤单后才能修改策略、币种、参数或杠杆")
     if changes_execution and row["mode"]=="paper":
         equity=current_metrics.get("equity",row["initial_equity"])
         if body.get("initial_equity") is not None and body["initial_equity"]!=row["initial_equity"]:
@@ -398,12 +412,14 @@ def update_account(account_id:str,body:dict,current=Depends(admin)):
                 raise ValueError("更新实盘凭证需要同时填写 API Key 和 Secret")
             credentials=encrypt_secret(db.dump({"api_key":body["api_key"],"api_secret":body["api_secret"]}))
         with db.connect() as con:
+            lock_available_strategy(con,strategy_id)
             locked=db.lock_instance(con,account_id)
             if not locked or locked["observed_state"]!="stopped" or locked["desired_state"]!="stopped":
                 raise HTTPException(409,"账户状态已改变，请等待停止回执后再修改")
             if initial!=row["initial_equity"] and con.execute("SELECT 1 FROM ledger WHERE account_id=? LIMIT 1",(account_id,)).fetchone():
                 raise HTTPException(409,"账户已产生运行账本，不能修改初始资金")
             con.execute("UPDATE accounts SET name=?,strategy_id=?,config=?,symbols=?,credentials=?,initial_equity=?,metrics=?,check_result=NULL WHERE id=?",(name,strategy_id,db.dump(config),db.dump(symbols),credentials,initial,db.dump(metrics),account_id))
+            con.execute("INSERT INTO account_execution_settings VALUES(?,?,?) ON DUPLICATE KEY UPDATE leverage=VALUES(leverage),updated_at=VALUES(updated_at)",(account_id,leverage,db.now()))
             current_user=con.execute("SELECT * FROM users WHERE id=?",(row["user_id"],)).fetchone()
             phone=str(body.get("phone",current_user["phone"] or "")).strip()
             if not phone:
@@ -414,7 +430,7 @@ def update_account(account_id:str,body:dict,current=Depends(admin)):
                 con.execute("UPDATE instances SET config_revision=config_revision+1 WHERE account_id=?",(account_id,))
             if password or credentials!=row["credentials"]:
                 con.execute("DELETE FROM sessions WHERE user_id=?",(row["user_id"],))
-            db.audit(con,current["id"],"account.update","account",account_id,{"strategy_id":strategy_id,"symbols":symbols,"parameters":config,"password_changed":bool(password),"credentials_changed":credentials!=row["credentials"]})
+            db.audit(con,current["id"],"account.update","account",account_id,{"strategy_id":strategy_id,"symbols":symbols,"parameters":config,"leverage":leverage,"previous_leverage":previous_leverage,"password_changed":bool(password),"credentials_changed":credentials!=row["credentials"]})
     except ValueError as exc:
         raise HTTPException(422,str(exc)) from exc
     except db.IntegrityError as exc:
@@ -430,6 +446,10 @@ def check_account(account_id:str,body:dict=None,current=Depends(admin)):
         raise HTTPException(404,"账户不存在")
     strategy=strategy_row(account["strategy_id"])
     manifest=db.parse(strategy["manifest"],{})
+    with db.connect() as con:
+        execution=con.execute("SELECT leverage FROM account_execution_settings WHERE account_id=?",(account_id,)).fetchone()
+    leverage=validate_leverage(manifest,execution["leverage"] if execution else None)
+    manifest["account"]={**manifest["account"],"leverage_min":leverage,"leverage_max":leverage}
     if account["mode"]=="paper":
         result={"ok":True,"checks":[{"name":"模拟账户","status":"pass","message":"独立模拟账本，无交易所权限"}],"adjustments":[],"checked_at":db.now()}
     elif not account["credentials"]:
@@ -518,6 +538,28 @@ def client_account(route:str,current=Depends(user)):
     return account_data(account)
 
 
+def lock_available_strategy(con, strategy_id):
+    row=con.execute("SELECT id FROM strategies WHERE id=? FOR UPDATE",(strategy_id,)).fetchone()
+    if not row or con.execute("SELECT 1 FROM strategy_archives WHERE strategy_id=?",(strategy_id,)).fetchone():
+        raise HTTPException(409,"策略已删除，请重新选择策略")
+
+
+@app.delete("/api/strategies/{strategy_id}")
+def delete_strategy(strategy_id:str,current=Depends(admin)):
+    with db.connect() as con:
+        row=con.execute("SELECT * FROM strategies WHERE id=? FOR UPDATE",(strategy_id,)).fetchone()
+        if not row:raise HTTPException(404,"策略不存在")
+        if con.execute("SELECT 1 FROM strategy_archives WHERE strategy_id=?",(strategy_id,)).fetchone():
+            return {"id":strategy_id,"deleted":True}
+        if con.execute("SELECT 1 FROM accounts WHERE strategy_id=? LIMIT 1",(strategy_id,)).fetchone():
+            raise HTTPException(409,"该策略仍有账户绑定，请先在账户配置中更换策略")
+        if con.execute("SELECT 1 FROM experiments WHERE strategy_id=? AND status IN ('queued','running','cancelling') LIMIT 1",(strategy_id,)).fetchone():
+            raise HTTPException(409,"该策略仍有未结束回测，请等待完成或取消后再删除")
+        con.execute("INSERT INTO strategy_archives VALUES(?,?,?)",(strategy_id,current["id"],db.now()))
+        db.audit(con,current["id"],"strategy.delete","strategy",strategy_id,{"name":db.parse(row["manifest"],{}).get("name"),"source_hash":row["source_hash"]})
+    return {"id":strategy_id,"deleted":True,"message":"策略已删除，历史实验及版本快照已保留"}
+
+
 @app.get("/api/strategies")
 def strategies(current=Depends(admin)):
     return list_strategy_data()
@@ -548,7 +590,7 @@ def presets(current=Depends(admin)):
     with db.connect() as con:
         return [dict(r)|{"parameters":db.parse(r["parameters"],{}),
                          "backtest_config":db.parse(r.get("backtest_config"),{}) or {}}
-                for r in con.execute("SELECT * FROM presets ORDER BY created_at DESC").fetchall()]
+                for r in con.execute("SELECT * FROM presets WHERE NOT EXISTS (SELECT 1 FROM strategy_archives WHERE strategy_id=presets.strategy_id) ORDER BY created_at DESC").fetchall()]
 
 
 def validate_preset_backtest_config(manifest, value):
@@ -596,6 +638,7 @@ def save_preset(body:dict,current=Depends(admin)):
     name=str(body.get("name","未命名预设"))
     created_at=db.now()
     with db.connect() as con:
+        lock_available_strategy(con,strategy["id"])
         con.execute("INSERT INTO presets(id,strategy_id,name,parameters,created_at,backtest_config) VALUES(?,?,?,?,?,?)",
                     (id,strategy["id"],name,db.dump(parameters),created_at,db.dump(backtest_config)))
         db.audit(con,current["id"],"preset.create","preset",id,{"strategy_id":body["strategy_id"]})
@@ -843,6 +886,8 @@ def store_experiments(items,actor_id=None):
         for dataset_id in sorted({item["dataset_id"] for item in items}):
             if not con.execute("SELECT id FROM datasets WHERE id=? FOR UPDATE",(dataset_id,)).fetchone():
                 raise HTTPException(409,"所选数据集已删除，请重新选择数据集")
+        for strategy_id in sorted({item["strategy_id"] for item in items}):
+            lock_available_strategy(con,strategy_id)
         for item in items:
             snapshot=item["strategy_snapshot"]
             version_id=db.pin_strategy_version(con,item["strategy_id"],db.parse(snapshot["manifest"],{}),snapshot["source"],snapshot["source_hash"])

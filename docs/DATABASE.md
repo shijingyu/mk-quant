@@ -23,8 +23,8 @@
 | 数据 | 表与约束 |
 | --- | --- |
 | 用户及登录 | `users`、`sessions`；登录名唯一，会话关联用户，密码哈希持久化。 |
-| 账户与实例 | `accounts`、`instances`；账户一个实例、实际交易身份唯一、随机客户路由唯一。 |
-| 策略 | `strategies`、`strategy_versions`；按源码哈希固定不可变版本，实验携带版本及内容哈希。 |
+| 账户与实例 | `accounts`、`instances`、`account_execution_settings`（账户目标杠杆）；账户一个实例、实际交易身份唯一、随机客户路由唯一。 |
+| 策略 | `strategies`、`strategy_versions`、`strategy_archives`（删除标记与操作人）；按源码哈希固定不可变版本，实验携带版本及内容哈希。 |
 | 控制与状态 | `commands`、`services`、`runtime_events`；请求、回执、心跳及停止状态持久化。 |
 | 订单与成交 | `orders`、`fills`；账户范围幂等标识、外键，成交金额使用 DECIMAL。 |
 | 资金账本 | `ledger`；成交、估值和恢复快照持久化，引用键唯一。 |
@@ -98,3 +98,7 @@ python scripts/migrate_sqlite_to_mysql.py --source /private-backup/legacy.sqlite
 
 
 回测的 `.research-<pid>-*` 为非业务临时存储：压缩记录块和固定大小哈希索引，不使用 SQLite，不作为账本或审计的唯一保存位置。完成后仍发布同一 Parquet 清单协议；正在运行的图表是有限真实极值预览，最终统计按全部记录顺序计算。正式结果文件发布失败或取消时，通过持久清理任务回收无引用文件。
+
+### v1.6.0 增量表
+
+启动时创建 InnoDB 表 `account_execution_settings` 和 `strategy_archives`，不重写既有账户、账本或策略版本。杠杆设置与账户更新、配置修订号和审计在同一事务提交；缺少设置的既有账户沿用策略声明的最低杠杆。删除策略采用持久删除标记，保留实验外键和版本快照；新建账户、保存预设及创建实验与删除操作共用策略行锁，避免删除与引用并发竞争。

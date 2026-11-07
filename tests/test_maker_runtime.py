@@ -385,3 +385,23 @@ def test_maker_api_experiment_preserves_defaults_version_and_full_artifacts(make
         version=con.execute("SELECT source_hash FROM strategy_versions WHERE id=?",(db.parse(row["config"])["strategy_version_id"],)).fetchone()
         assert version["source_hash"]==hashlib.sha256(SOURCE.encode()).hexdigest()
         assert con.execute("SELECT COUNT(*) FROM fills WHERE account_id=?",(maker["id"],)).fetchone()[0]==0
+
+
+def test_account_selected_leverage_controls_margin_and_survives_restore(maker):
+    with db.connect() as con:
+        manifest=dict(MANIFEST,account={**MANIFEST['account'],'leverage_max':5})
+        con.execute('UPDATE strategies SET manifest=? WHERE id=?',(db.dump(manifest),MANIFEST['id']))
+        con.execute('INSERT INTO account_execution_settings VALUES(?,?,?)',(maker['id'],4,db.now()))
+    start(maker)
+    assert read(maker)['metrics']['pending_margin']==50
+    feed(maker,1,high=104,low=96)
+    runtime_tick(maker['id'],'maker-worker')
+    filled=read(maker)
+    assert filled['metrics']['margin_used']==50
+    assert filled['metrics']['leverage']==4
+    with db.connect() as con:
+        con.execute('UPDATE instances SET lease_until=0 WHERE account_id=?',(maker['id'],))
+    runtime_tick(maker['id'],'replacement-worker')
+    restored=read(maker)
+    assert restored['metrics']['margin_used']==50
+    assert len(restored['fills'])==2

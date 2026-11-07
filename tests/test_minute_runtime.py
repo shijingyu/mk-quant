@@ -1,6 +1,8 @@
 """Minute-derived strategy windows persist independently from execution ticks."""
 import hashlib
 
+import pytest
+
 from backend import db
 from backend.worker import _runtime_frames, runtime_tick
 from test_maker_runtime import maker, feed, command, read, MANIFEST, SOURCE
@@ -72,9 +74,10 @@ def test_maker_higher_period_decision_keeps_minute_fills_after_restart(maker):
     assert read(maker)["snapshot"]["bar_index"]==2
 
 
-def test_market_primary_signal_executes_once_on_next_minute(maker):
+@pytest.mark.parametrize("leverage", [1, 4])
+def test_market_primary_signal_executes_once_on_next_minute(maker, leverage):
     maker["start"]=(maker["start"]//180000)*180000
-    manifest={**MANIFEST,"account":{**MANIFEST["account"],"position_modes":["one_way"]},"timeframes":{"primary":"3m","additional":[]}}
+    manifest={**MANIFEST,"account":{**MANIFEST["account"],"position_modes":["one_way"],"leverage_max":5},"timeframes":{"primary":"3m","additional":[]}}
     manifest.pop("execution")
     source="MANIFEST = "+repr(manifest)+'''\nclass Strategy:
     def on_bar(self, context):
@@ -84,6 +87,8 @@ def test_market_primary_signal_executes_once_on_next_minute(maker):
 '''
     with db.connect() as con:
         con.execute("UPDATE strategies SET manifest=?,source=?,source_hash=? WHERE id=?",(db.dump(manifest),source,hashlib.sha256(source.encode()).hexdigest(),MANIFEST["id"]))
+    with db.connect() as con:
+        con.execute("INSERT INTO account_execution_settings VALUES(?,?,?)",(maker["id"],leverage,db.now()))
     command(maker,"resume")
     for minute in (0,1,2):
         feed(maker,minute,high=102,low=98)
@@ -97,3 +102,6 @@ def test_market_primary_signal_executes_once_on_next_minute(maker):
     assert state["fills"][0]["timestamp"]==maker["start"]+3*60000
     assert state["snapshot"]["bar_index"]==2
     assert state["snapshot"]["pending"]==[]
+
+    assert state["metrics"]["margin_used"]==100 / leverage
+    assert state["metrics"]["leverage"]==leverage
