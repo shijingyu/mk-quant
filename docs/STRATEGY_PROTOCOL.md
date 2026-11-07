@@ -1,6 +1,6 @@
-# MK Quant 策略接入协议 v1.3.1
+# MK Quant 策略接入协议 v1.4.0
 
-协议版本：`1.3.1`；当前引擎版本：`1.4.0`。本文以 `backend/strategy.py`、`backend/engine.py`、`backend/worker.py` 的当前实现为准，适用于开发者及协助编写策略的 AI。未声明执行模型的已有策略继续使用单向市价模型；`maker_grid_v1` 增加双向限价订单簿与逐格保护，新的实验统一使用 1m 成交检查及完整高周期合成；旧实验保留原结果与引擎版本。
+协议版本：`1.4.0`；当前引擎版本：`1.5.0`。本文以 `backend/strategy.py`、`backend/engine.py`、`backend/worker.py` 的当前实现为准，适用于开发者及协助编写策略的 AI。未声明执行模型的已有策略继续使用市价模型；市价与 Maker 都支持合约单向和双向持仓，`maker_grid_v1` 提供限价订单簿与逐笔保护，新的实验统一使用 1m 成交检查及完整高周期合成；旧实验保留原结果与引擎版本。
 
 策略负责根据已完成的行情生成交易意图。框架负责参数校验、行情对齐、数量及价格规则、资金检查、模拟成交、账本、指标、日志与任务状态。策略不读取 API Key，不连接交易所，不创建线程，也不自行下单。
 
@@ -25,7 +25,7 @@
 ```python
 # 中性协议骨架：不包含指标、信号、仓位算法或订单，不会自动交易。
 # 标注“占位”的值不是推荐交易配置，必须按实际策略需求修改。
-# 合约/双向/Maker 的合法组合与条件必填字段见下方完整协议。
+# 市场/持仓模式/执行模型 的合法组合与条件必填字段见下方完整协议。
 MANIFEST = {
     # 必填：均为非空字符串；每次逻辑变更更新 version。
     "name": "待实现策略",
@@ -42,6 +42,8 @@ MANIFEST = {
     # min_capital 以 U 计；以下为可通过校验的占位配置。
     "account": {
         "position_modes": ["one_way"],
+        # 可选，必须属于 position_modes；模拟账户使用此默认模式。
+        "default_position_mode": "one_way",
         "margin_modes": ["cash"],
         "leverage_min": 1,
         "leverage_max": 1,
@@ -49,7 +51,7 @@ MANIFEST = {
     },
 
     # 可选：省略时为 market_next_open_v1；这里显式写出默认模型。
-    # 不可只改模型名称：maker_grid_v1 同时要求 futures + hedge + cross，
+    # 市价和 Maker 均支持合约 one_way / hedge；Maker 仍要求 futures + cross，
     # 且订单需遵守 Maker 字段、关联保护和成交规则。
     "execution": {"model": "market_next_open_v1"},
     # 可选：各周期每币历史上限 1–10000，默认 1000；并非已完成预热。
@@ -107,7 +109,8 @@ class Strategy:
 
 | 字段 | 合法声明 | 当前可执行范围 |
 | --- | --- | --- |
-| `position_modes` | 非空列表，值为 `one_way` 或 `hedge` | 市价模型必须接受 `one_way`；Maker 模型必须严格为 `["hedge"]`。 |
+| `position_modes` | 非空列表，值为 `one_way` 或 `hedge` | 两种执行模型均接受 `one_way`、`hedge` 或两者；该列表表示允许的模式。 |
+| `default_position_mode` | 可选，必须属于 `position_modes` | 持续模拟使用此模式；未声明时保留旧默认：市价优先 one_way、Maker 优先 hedge；若列表不含该默认，则取列表第一项。回测可用独立 `position_mode` 配置覆盖。 |
 | `margin_modes` | 非空列表，值为 `cross`、`isolated` 或 `cash` | 市价合约模型必须接受 `cross`；Maker 模型必须严格为 `["cross"]`；现货必须为 `["cash"]`。 |
 | `leverage_min` | 大于等于 1 的整数 | 账户实际配置与回测所选杠杆必须在声明范围内；持续模拟优先使用账户保存的杠杆，未配置的旧账户才沿用声明最小值。 |
 | `leverage_max` | 大于等于最小杠杆的整数 | 现货最小及最大值都必须为 1。 |
@@ -115,7 +118,7 @@ class Strategy:
 
 账户保存的杠杆是独立执行设置，同一账户内各交易对共用；修改需执行端确认停止且无持仓挂单，实盘设置需经过接入检查和确认调整。策略读取 `context["account"]["leverage"]` 获取实际模型倍数，不能通过改写该字典改变杠杆。
 
-现货还必须声明 `position_modes: ["one_way"]`，不能做空、借贷或加杠杆。`maker_grid_v1` 仅支持合约双向全仓模型；仅声明 `hedge` 而不选择该执行模型不能获得双向撮合。逐仓结算仍未实现，仅支持逐仓的策略不能运行。账户接入检查的真实钱包与保证金要求见 Binance 文档。
+现货还必须声明 `position_modes: ["one_way"]`，不能做空、借贷或加杠杆。合约市价和 `maker_grid_v1` 都支持单向及双向全仓模型。单向按币种净额记账，双向分别记录多、空两腿；持仓模式不决定订单类型。持仓或挂单未清空时禁止切换执行模型或持仓模式，空仓切换保留资金和成交历史。逐仓结算仍未实现，仅支持逐仓的策略不能运行。账户接入检查的真实钱包与保证金要求见 Binance 文档。
 
 `execution.model` 当前只接受 `market_next_open_v1` 和 `maker_grid_v1`。内置网格另声明 `fee_role: "maker"`、`time_in_force: "GTX"` 作为展示元数据；真正的成本解释和订单约束由模型及订单字段决定，这两个元数据字段不是任意切换成交规则的开关。
 
@@ -153,7 +156,7 @@ class Strategy:
 | `execution_candles` | 当前基础 1m K 线，用于撮合；与主周期 candles 区别。 |
 | `base_interval` / `signal_interval` | 固定 `1m` / 策略声明的主周期。 |
 | `decision_time` | 当前分钟收盘边界的 UTC 毫秒时间；`timestamp` 保持执行分钟开盘时间。 |
-| `positions` | 当前非零持仓；市价模型键为 symbol，Maker 双向模型键为 `symbol:LONG` / `symbol:SHORT`，空仓键不一定存在。 |
+| `positions` | 当前非零持仓；单向模式键为 symbol，双向模式（市价与 Maker 均如此）键为 `symbol:LONG` / `symbol:SHORT`，空仓键不一定存在。 |
 | `account` | 统一模拟账户快照，结构见下表。 |
 | `open_orders` | 仅 Maker 模型提供：状态为 `NEW` / `PENDING_TRIGGER` 的委托快照；不等于成交列表。 |
 | `lots` | 仅 Maker 模型提供：剩余数量大于 0 的逐格仓位快照，包含关联入场单和保护状态。 |
@@ -179,7 +182,7 @@ Maker `lots` 包含 `id` / `lot_id`、`entry_order_id`、`symbol`、`position_si
 | `pending_margin` / `pending_fee_reserve` | Maker 未成交入场委托的保证金及 Maker 费用预留；退出保护单不重复预留开仓保证金。市价模型这两项为 0。 |
 | `realized_pnl` | `balance - initial_equity`，包含尚未平仓头寸已支付的开仓费。 |
 | `unrealized_pnl` | 各净持仓 `(mark_price - average_price) × quantity` 的和。 |
-| `leverage`、`market`、`position_mode`、`margin_mode` | 执行环境的实际模型设置；市价模型单向，Maker 模型双向；合约全仓或现货 cash。 |
+| `leverage`、`market`、`position_mode`、`margin_mode` | 执行环境的实际模型设置；两种模型都支持单向或双向；合约全仓或现货 cash。 |
 
 上下文是输入快照。不要通过修改 `context`、`positions` 或 `account` 来改变真实账本；输出交易意图才会触发执行器。策略必须自行处理预热不足，通常返回 `[]` 并输出未交易原因。
 
@@ -196,7 +199,8 @@ Maker `lots` 包含 `id` / `lot_id`、`entry_order_id`、`symbol`、`position_si
 | `symbol` | 是 | 本实例已选择且行情可用的交易对。 |
 | `side` | 是 | 小写 `buy` / `sell`。合约卖出可开空，也可减少多仓。 |
 | `quantity` | 是 | 大于 0 的有限数字，以基础资产数量计，不是 U 金额；例：BTC 数量。 |
-| `reduce_only` | 否 | 布尔值，默认 false；true 只能减少相反方向现有仓位，数量超出时裁到剩余持仓，不能反手。 |
+| `position_side` | 双向必填 | `LONG` / `SHORT` 指定持仓腿；buy+LONG 开多、sell+LONG 平多、sell+SHORT 开空、buy+SHORT 平空。单向可省略或为 BOTH；LONG/SHORT 仅为方向标记，不创建独立持仓腿。 |
+| `reduce_only` | 否 | 布尔值，默认 false；true 只能减仓不能反手。单向超量裁到剩余净仓；双向超量减仓拒绝，不能误开另一腿。 |
 | `reason` | 否 | 交易原因，保存到成交及决策记录。 |
 
 该模型不会因附加 `price`、`stop_price` 等字段而变成限价/止损执行器；明确声明的非市价订单类型会被拒绝。需要限价语义必须选择 Maker 模型并遵守其订单协议。也不要用返回 `None` 表示空闲。
@@ -209,7 +213,7 @@ Maker `lots` 包含 `id` / `lot_id`、`entry_order_id`、`symbol`、`position_si
 
 ### 4.2 Maker 模型 `maker_grid_v1`
 
-该模型使用 `futures`、`hedge`、`cross`。`fee_rate` 为每笔成交的 Maker 费率；`slippage_bps` 必须为 0。所有限价单相对当前参考价做 Post Only 检查；这是 OHLC 模拟，参考价不是实时买一/卖一，不能证明交易所真实 Maker 成交。
+该模型使用 `futures`、`cross`，持仓模式可为 `one_way` 或 `hedge`。`fee_rate` 为每笔成交的 Maker 费率；`slippage_bps` 必须为 0。所有限价单相对当前参考价做 Post Only 检查；这是 OHLC 模拟，参考价不是实时买一/卖一，不能证明交易所真实 Maker 成交。
 
 | 字段 | 必需 | 含义 |
 | --- | --- | --- |
@@ -229,6 +233,8 @@ Maker `lots` 包含 `id` / `lot_id`、`entry_order_id`、`symbol`、`position_si
 撤单示例为 `{"action": "cancel", "order_id": "稳定订单ID"}`；也可用 `client_order_id` 指定同一 ID。`{"action": "cancel_entries"}` 只撤未成交入场单，保留退出单。撤单不会生成成交记录。
 
 上表定义的是订单结构，不是交易建议；不提供固定币种、价格、仓位或网格信号样例。入场价格、数量及三项保护价格均须由开发者按照用户策略逻辑计算，不能从骨架占位值推导。
+
+单向 Maker 仍用 `LONG` / `SHORT` 标明委托目标方向和 lot 归属，但实际账本每币只有一个净仓。反向非 reduce_only 委托成交时按开仓先后 FIFO 减少原方向 lot；撤销已清空 lot 的保护单，并缩减部分减仓 lot 的保护数量。超过原仓的剩余数量才创建反向新 lot 和其保护单；费用按实际成交数量计。指定 lot 的 reduce_only 退出仍只能减少该 lot，不能反手。为保守控制风险，非 reduce_only 委托提交时仍按全部数量预留保证金并要求完整 bracket；纯减仓应使用 lot 退出单。反手各成交分段逐项风控，减仓后若剩余开仓未通过规则会记录拒绝及已成交数量，不撤销已发生的减仓。
 
 处理顺序为：已存在委托处理当前完整共同 1m K 线 → 按分钟收盘价估值 → 更新高周期合成 → 主周期完整收盘时调用 `on_bar` → 提交新意图。新单最早下一分钟有效；买卖单均须满足 `low <= limit <= high` 且该分钟 `volume > 0`，含边界触价，满足时按限价全量成交。跳空后整个分钟范围未触及限价时不成交。零成交量即使触价也不成交，但仍可观察到止损触发；没有盘口队列、按成交量分配或部分成交模拟。最后一根新单保留为未成交，不虚构终局平仓。
 

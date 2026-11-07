@@ -5,6 +5,7 @@ forks a bounded subprocess per job; runtime isolates each account in a process.
 Live order submission is intentionally gated until production acceptance.
 """
 from .account_settings import configured_leverage
+from .strategy import resolve_position_mode
 import argparse
 import copy
 from decimal import Decimal
@@ -114,7 +115,7 @@ def run_experiment(id):
                 preview=storage.result_preview(partial)
                 with db.connect() as con:
                     con.execute("UPDATE experiments SET progress=?,result=? WHERE id=? AND status='running'",(value,db.dump(preview),id))
-            output[split]=run_backtest(strategy["source"],config["parameters"],data,config["initial_capital"],config["fee_rate"],config["slippage_bps"],market=config["market"],leverage=config.get("leverage",manifest["account"]["leverage_min"]),symbol_filters=filters,progress=progress,cancelled=cancelled,base_interval="1m",research_space=space)
+            output[split]=run_backtest(strategy["source"],config["parameters"],data,config["initial_capital"],config["fee_rate"],config["slippage_bps"],market=config["market"],leverage=config.get("leverage",manifest["account"]["leverage_min"]),symbol_filters=filters,progress=progress,cancelled=cancelled,base_interval="1m",research_space=space,position_mode=config.get("position_mode"))
             data.close()
             data=None
             partial["metrics" if split=="train" else "validation_metrics"]=ui_metrics(output[split]["metrics"])
@@ -415,7 +416,7 @@ def _restore_ledger(account,manifest,snapshot):
     from .engine import Ledger,Position
     D=lambda x:Decimal(str(x))
     fee=_paper_execution_costs(manifest,db.parse(account["metrics"],{}))["fee_rate"]
-    ledger=Ledger(D(account["initial_equity"]),manifest["market"],D(configured_leverage(account,manifest)),D(fee))
+    ledger=Ledger(D(account["initial_equity"]),manifest["market"],D(configured_leverage(account,manifest)),D(fee),position_mode=resolve_position_mode(manifest))
     if snapshot:
         ledger.balance=D(snapshot["balance"])
         ledger.fees=D(snapshot["fees"])
@@ -437,7 +438,9 @@ def _convert_flat_snapshot(account,manifest,snapshot,target):
     """Move a flat financial ledger between executors without resetting money."""
     from .engine import Ledger, MakerOrderBook
     source=snapshot.get("model","market_next_open_v1") if snapshot else target
-    if not snapshot or source==target:
+    source_mode = snapshot.get("book",{}).get("ledger",{}).get("position_mode","hedge") if source=="maker_grid_v1" else snapshot.get("position_mode","one_way")
+    target_mode = resolve_position_mode(manifest)
+    if not snapshot or (source==target and source_mode==target_mode):
         return snapshot,None
     if source=="maker_grid_v1":
         book=MakerOrderBook.load(snapshot["book"])
@@ -449,9 +452,9 @@ def _convert_flat_snapshot(account,manifest,snapshot,target):
         if any(Decimal(str(position["quantity"])) for position in snapshot.get("positions",{}).values()) or snapshot.get("pending"):
             raise ValueError("原执行模型仍有持仓或待执行意图，拒绝切换执行模型")
         financial={key:copy.deepcopy(snapshot[key]) for key in ("balance","fees","orders","closed_pnls")}
-    common={"model":target,"curve":copy.deepcopy(snapshot.get("curve",[])),"last_timestamp":snapshot.get("last_timestamp",0),"strategy_state":{},"bar_index":0}
+    common={"model":target,"curve":copy.deepcopy(snapshot.get("curve",[])),"last_timestamp":snapshot.get("last_timestamp",0),"strategy_state":{},"bar_index":0,"position_mode":target_mode}
     if target=="maker_grid_v1":
-        ledger=Ledger(account["initial_equity"],"futures",configured_leverage(account,manifest),Decimal(".0002"),position_mode="hedge")
+        ledger=Ledger(account["initial_equity"],"futures",configured_leverage(account,manifest),Decimal(".0002"),position_mode=resolve_position_mode(manifest))
         ledger.balance=Decimal(financial["balance"]);ledger.fees=Decimal(financial["fees"])
         ledger.orders=financial["orders"];ledger.closed_pnls=[Decimal(str(value)) for value in financial["closed_pnls"]]
         converted={**common,"book":MakerOrderBook(ledger).dump()}
@@ -525,8 +528,8 @@ def maker_runtime_tick(account, instance, commands, strategy, snapshot, fence, c
     from .strategy import load_strategy, validate_parameters
     account_id=account["id"]
     manifest=db.parse(strategy["manifest"],{})
-    if not strategy["trusted"] or manifest["market"]!="futures" or "hedge" not in manifest["account"]["position_modes"] or "cross" not in manifest["account"]["margin_modes"]:
-        raise ValueError("Maker 模拟执行需要可信合约策略、hedge 双向持仓和全仓模型")
+    if not strategy["trusted"] or manifest["market"]!="futures" or "cross" not in manifest["account"]["margin_modes"]:
+        raise ValueError("Maker 模拟执行需要可信合约策略和全仓模型")
     snapshot,archived=_convert_flat_snapshot(account,manifest,snapshot,"maker_grid_v1")
     revision={"strategy_id":account["strategy_id"],"source_hash":strategy["source_hash"],"config_revision":instance["config_revision"]}
     command=commands[0] if commands else None
@@ -552,7 +555,7 @@ def maker_runtime_tick(account, instance, commands, strategy, snapshot, fence, c
     if snapshot:
         book=MakerOrderBook.load(snapshot["book"])
     else:
-        book=MakerOrderBook(Ledger(account["initial_equity"],"futures",configured_leverage(account,manifest),Decimal(".0002"),position_mode="hedge"))
+        book=MakerOrderBook(Ledger(account["initial_equity"],"futures",configured_leverage(account,manifest),Decimal(".0002"),position_mode=resolve_position_mode(manifest)))
     ledger=book.ledger
     previous_orders={key:db.dump(value) for key,value in book.orders.items()}
     fill_start=len(ledger.orders); event_start=len(book.events)
@@ -678,7 +681,7 @@ def maker_runtime_tick(account, instance, commands, strategy, snapshot, fence, c
              "execution_events":copy.deepcopy(book.events[-100:]),"display":display,"risk":risk,"strategy_error":strategy_error,
              "data_updated_at":db.now() if fresh else previous_metrics.get("data_updated_at"),
              "execution_model":{"model":"maker_grid_v1","fee_rate":float(book.maker_fee_rate),"maker_fee_rate":float(book.maker_fee_rate),
-                 "slippage_bps":0,"fee_source":"documented_simulation_assumption","interval":"1m","timeframes":manifest.get("timeframes",{"primary":"1m","additional":[]}),"position_mode":"hedge",
+                 "slippage_bps":0,"fee_source":"documented_simulation_assumption","interval":"1m","timeframes":manifest.get("timeframes",{"primary":"1m","additional":[]}),"position_mode":ledger.position_mode,
                  "funding_included":False,"liquidation_simulated":False,"liquidity":"simulated_maker","order_book_queue_simulated":False}}
     snapshot={"model":"maker_grid_v1","book":book.dump(),"strategy_state":strategy_state,"strategy_error":strategy_error,
               "strategy_event_cursor":strategy_cursor,"revision":revision,"last_timestamp":timestamp if new_bar else last,
@@ -748,8 +751,8 @@ def runtime_tick(account_id,owner):
     manifest=db.parse(strategy["manifest"],{})
     if manifest.get("execution",{}).get("model")=="maker_grid_v1":
         return maker_runtime_tick(account,instance,commands,strategy,db.parse(saved["payload"],{}) if saved else {},fence,current_lease)
-    if not strategy["trusted"] or "one_way" not in manifest["account"]["position_modes"]:
-        raise ValueError("运行策略未经审核或不支持单向账本")
+    if not strategy["trusted"]:
+        raise ValueError("运行策略未经审核")
     if manifest["market"]=="futures" and "cross" not in manifest["account"]["margin_modes"]:
         raise ValueError("当前模拟账本仅实现全仓模型，不能运行仅支持逐仓的策略")
     snapshot,archived=_convert_flat_snapshot(account,manifest,db.parse(saved["payload"],{}) if saved else {},"market_next_open_v1")
@@ -819,9 +822,10 @@ def runtime_tick(account_id,owner):
         pending=[]
     ledger.prices={s:Decimal(str(bar["close"])) for s,bar in bars.items()}
     if mode=="stopped":
-        for symbol,position in list(ledger.positions.items()):
+        for key,position in list(ledger.positions.items()):
+            symbol=key.split(":")[0]
             if position.quantity:
-                reason=ledger.execute({"symbol":symbol,"side":"sell" if position.quantity>0 else "buy","quantity":float(abs(position.quantity)),"reduce_only":True,"reason":"管理员平仓并停止"},timestamp,filters,paper_slippage,timestamp,execution_bar=bars[symbol])
+                reason=ledger.execute({"symbol":symbol,"position_side":"LONG" if position.quantity>0 else "SHORT","side":"sell" if position.quantity>0 else "buy","quantity":float(abs(position.quantity)),"reduce_only":True,"reason":"管理员平仓并停止"},timestamp,filters,paper_slippage,timestamp,execution_bar=bars[symbol])
                 if reason:
                     raise ValueError(f"模拟平仓失败：{reason}")
         pending=[]
@@ -855,14 +859,14 @@ def runtime_tick(account_id,owner):
     if timestamp>last or (mode=="stopped" and len(ledger.orders)>old_order_count):
         curve.append({"timestamp":timestamp,"equity":float(ledger.equity()),"margin_used":float(ledger.margin()),"unrealized_pnl":float(ledger.unrealized())})
     stats=ui_metrics(calculate_metrics(curve,ledger.orders,account["initial_equity"],closed_pnls=ledger.closed_pnls,account=ledger.account()))
-    positions=[dict(v,symbol=s,direction="long" if v["quantity"]>0 else "short") for s,v in ledger.position_snapshot().items()]
+    positions=[dict(v,direction="long" if v["quantity"]>0 else "short") for s,v in ledger.position_snapshot().items()]
     day_start,month_start=_period_starts(timestamp)
     def period_pnl(start):
         baseline=next((p["equity"] for p in reversed(curve) if p["timestamp"]<start),account["initial_equity"])
         return float(ledger.equity())-baseline
-    metrics={"today_pnl":period_pnl(day_start),"month_pnl":period_pnl(month_start),"running_days":max(1,int((timestamp-curve[0]["timestamp"])/86400000)+1) if curve else 0,**ledger.account(),**stats,"return_pct":stats["total_return_pct"],"max_drawdown_u":stats["max_drawdown_amount"],"position_count":len(positions),"long_count":sum(p["quantity"]>0 for p in positions),"short_count":sum(p["quantity"]<0 for p in positions),"curve":curve,"positions":positions,"orders":ledger.orders,"display":display,"data_updated_at":db.now(),"risk":risk,"execution_model":{"model":"market_next_open_v1","fee_rate":float(ledger.fee_rate),"slippage_bps":paper_costs["slippage_bps"],"fee_source":paper_costs["fee_source"],"interval":"1m","funding_included":False,"liquidation_simulated":False}}
+    metrics={"today_pnl":period_pnl(day_start),"month_pnl":period_pnl(month_start),"running_days":max(1,int((timestamp-curve[0]["timestamp"])/86400000)+1) if curve else 0,**ledger.account(),**stats,"return_pct":stats["total_return_pct"],"max_drawdown_u":stats["max_drawdown_amount"],"position_count":len(positions),"long_count":sum(p["quantity"]>0 for p in positions),"short_count":sum(p["quantity"]<0 for p in positions),"curve":curve,"positions":positions,"orders":ledger.orders,"display":display,"data_updated_at":db.now(),"risk":risk,"execution_model":{"model":"market_next_open_v1","position_mode":ledger.position_mode,"fee_rate":float(ledger.fee_rate),"slippage_bps":paper_costs["slippage_bps"],"fee_source":paper_costs["fee_source"],"interval":"1m","funding_included":False,"liquidation_simulated":False}}
     metrics["execution_model"]["timeframes"]=manifest.get("timeframes",{"primary":"1m","additional":[]})
-    snapshot={"model":"market_next_open_v1","balance":str(ledger.balance),"fees":str(ledger.fees),"positions":{s:{"quantity":str(p.quantity),"average_price":str(p.average_price),"entry_fees":str(p.entry_fees)} for s,p in ledger.positions.items()},"orders":ledger.orders,"closed_pnls":[str(v) for v in ledger.closed_pnls],"pending":pending,"strategy_state":strategy_state,"revision":revision,"last_timestamp":timestamp,"bar_index":snapshot.get("bar_index",0)+int(decision_called),"frames":frame_state,"curve":curve}
+    snapshot={"model":"market_next_open_v1","position_mode":ledger.position_mode,"balance":str(ledger.balance),"fees":str(ledger.fees),"positions":{s:{"quantity":str(p.quantity),"average_price":str(p.average_price),"entry_fees":str(p.entry_fees)} for s,p in ledger.positions.items()},"orders":ledger.orders,"closed_pnls":[str(v) for v in ledger.closed_pnls],"pending":pending,"strategy_state":strategy_state,"revision":revision,"last_timestamp":timestamp,"bar_index":snapshot.get("bar_index",0)+int(decision_called),"frames":frame_state,"curve":curve}
     with db.connect() as con:
         if not current_lease(con):
             return True

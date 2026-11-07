@@ -86,6 +86,12 @@ export function normalizeBacktestConfig(
       throw new Error("Maker限价撮合的滑点须为0");
     }
   }
+  if (Object.hasOwn(values, "position_mode")) {
+    const modes = manifest.account?.position_modes || ["one_way"];
+    const legacy = manifest.execution?.model === "maker_grid_v1" ? "hedge" : "one_way";
+    config.position_mode = values.position_mode || manifest.account?.default_position_mode || (modes.includes(legacy) ? legacy : modes[0]);
+    if (!modes.includes(config.position_mode)) throw new Error("持仓模式不符合策略声明");
+  }
   return config;
 }
 

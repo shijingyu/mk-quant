@@ -4182,6 +4182,7 @@ function Backtest({ data, mutate, notify, go }) {
       validation_start: "2026-10-01T00:00",
       validation_end: "2026-10-30T00:00",
       seed: 42,
+      position_mode: "",
       leverage: leverageBounds(initialStrategy).min,
     }),
     [busy, setBusy] = useState(false),
@@ -4210,6 +4211,7 @@ function Backtest({ data, mutate, notify, go }) {
     setForm((f) => ({
       ...f,
       symbols: strategySymbols(selected).join(","),
+      position_mode: "",
       slippage_bps: isMakerStrategy(selected) ? 0 : 2,
       fee_rate: isMakerStrategy(selected) ? 0.0002 : 0.0004,
       leverage: constrainLeverage(f.leverage, selected),
@@ -4404,6 +4406,7 @@ function Backtest({ data, mutate, notify, go }) {
                   symbols: form.symbols.split(/[,，\s]+/).filter(Boolean),
                   market: manifest.market || "futures",
                   ...executionConfig,
+                  position_mode: form.position_mode || undefined,
                   seed: Number(form.seed),
                 });
                 setActive(r.id);
@@ -4721,6 +4724,12 @@ function Backtest({ data, mutate, notify, go }) {
                   <section>
                     <h3 className="form-section-title">账户与实验环境</h3>
                     <div className="form-grid">
+                      <Field label="持仓模式">
+                        <select value={form.position_mode || ""} onChange={e => change("position_mode", e.target.value)}>
+                          <option value="">策略默认</option>
+                          {(manifest.account?.position_modes || ["one_way"]).map(mode => <option key={mode} value={mode}>{mode === "hedge" ? "双向持仓" : "单向持仓"}</option>)}
+                        </select>
+                      </Field>
                       <Field label="初始资金（U）">
                         <input
                           type="number"
@@ -5935,7 +5944,7 @@ function Protocol({ notify }) {
                     ],
                     [
                       "execution.model",
-                      "maker_grid_v1 使用 Maker 限价、条件限价与双向订单模型；其他策略沿用原执行器",
+                      "市价与 Maker 均支持合约单向/双向；Maker 使用限价和条件限价订单",
                     ],
                     [
                       "Strategy.on_bar(context)",
@@ -5964,8 +5973,7 @@ function Protocol({ notify }) {
                 <div>
                   <strong>执行边界</strong>
                   <span>
-                    市价策略沿用单向净持仓模型；maker_grid_v1 的 Maker
-                    限价、条件限价、订单关联与双向持仓已支持回测和模拟。OHLC
+                    合约市价和 Maker 均支持单向净仓与双向独立持仓，已支持回测和模拟。OHLC
                     无法还原盘口排队或保证实盘 Maker
                     成交；止损触发后仍可能拒单或未成交，无 Taker
                     后备。资金费与强平模型仍不完整，实盘执行继续受验收闸门保护。

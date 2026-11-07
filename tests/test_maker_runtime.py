@@ -3,6 +3,7 @@ import hashlib
 import json
 import time
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 import pytest
 
@@ -405,3 +406,52 @@ def test_account_selected_leverage_controls_margin_and_survives_restore(maker):
     restored=read(maker)
     assert restored['metrics']['margin_used']==50
     assert len(restored['fills'])==2
+
+@pytest.mark.parametrize('model,mode',[('market_next_open_v1','hedge'),('maker_grid_v1','one_way')])
+def test_new_mode_combination_persists_and_flattens(maker,model,mode):
+    import copy
+    manifest=copy.deepcopy(MANIFEST)
+    manifest['execution']['model']=model
+    manifest['account']['position_modes']=[mode]
+    code=SOURCE[SOURCE.index('\n\nclass Strategy:'):]
+    if model=='market_next_open_v1':
+        code='''
+class Strategy:
+    def on_bar(self, context):
+        if context['bar_index'] != 0: return []
+        return [{'symbol':'BTCUSDC','side':'buy','position_side':'LONG','quantity':2}, {'symbol':'BTCUSDC','side':'sell','position_side':'SHORT','quantity':1}]
+'''
+    else:
+        code=code.replace('"quantity":1, "price":99','"quantity":2, "price":99')
+    code='MANIFEST = '+repr(manifest)+code
+    with db.connect() as con:
+        con.execute('UPDATE strategies SET manifest=?,source=?,source_hash=? WHERE id=?',(db.dump(manifest),code,hashlib.sha256(code.encode()).hexdigest(),MANIFEST['id']))
+    fill_entries(maker)
+    state=read(maker)
+    assert state['metrics']['position_mode']==mode
+    assert state['metrics']['position_count']==(2 if mode=='hedge' else 1)
+    assert all(p['symbol']=='BTCUSDC' for p in state['metrics']['positions'])
+    feed(maker,2,high=102,low=98);runtime_tick(maker['id'],'maker-worker')
+    assert read(maker)['metrics']['position_mode']==mode
+    command(maker,'flatten');runtime_tick(maker['id'],'maker-worker')
+    if model=='maker_grid_v1':
+        feed(maker,3,high=102,low=98);runtime_tick(maker['id'],'maker-worker')
+    final=read(maker)
+    assert final['instance']['observed_state']=='stopped'
+    assert final['metrics']['position_count']==0
+
+
+def test_mode_change_requires_flat_ledger_and_preserves_balance():
+    import copy
+    from backend.worker import _convert_flat_snapshot
+    from backend.engine import Ledger,MakerOrderBook
+    manifest=copy.deepcopy(MANIFEST);manifest['account']['position_modes']=['one_way']
+    ledger=Ledger(1000,'futures',1,0,'hedge');ledger.balance=Decimal('1030')
+    snapshot={'model':'maker_grid_v1','book':MakerOrderBook(ledger).dump()}
+    account={'initial_equity':1000}
+    converted,old=_convert_flat_snapshot(account,manifest,snapshot,'maker_grid_v1')
+    assert old==snapshot
+    assert converted['book']['ledger']['position_mode']=='one_way'
+    assert Decimal(converted['book']['ledger']['balance'])==1030
+    snapshot['book']['ledger']['positions']={'BTCUSDC:LONG':{'quantity':'1','average_price':'100','entry_fees':'0'}}
+    with pytest.raises(ValueError,match='持仓'):_convert_flat_snapshot(account,manifest,snapshot,'maker_grid_v1')

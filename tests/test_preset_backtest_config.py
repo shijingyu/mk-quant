@@ -205,3 +205,11 @@ def test_schema_lock_timeout_prevents_column_change(monkeypatch):
     memory=schema_memory(monkeypatch,lock_result=0)
     with pytest.raises(RuntimeError,match="结构更新锁"):db.init_schema()
     assert memory.alters==[] and "mysql-004-presets-backtest-config" not in memory.versions
+
+
+def test_preset_retains_allowed_position_mode():
+    value=manifest()
+    value['account']['position_modes']=['one_way','hedge']
+    assert api.validate_preset_backtest_config(value,{**CONFIG,'position_mode':'hedge'})['position_mode']=='hedge'
+    with pytest.raises(ValueError,match='持仓模式'):
+        api.validate_preset_backtest_config(manifest(),{**CONFIG,'position_mode':'hedge'})

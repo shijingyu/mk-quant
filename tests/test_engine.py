@@ -64,7 +64,7 @@ class StrategyContractTests(unittest.TestCase):
             validate_manifest(bad)
 
     def test_unsupported_account_modes_fail_explicitly(self):
-        for key, value in (("position_modes", ["hedge"]), ("margin_modes", ["isolated"])):
+        for key, value in (("margin_modes", ["isolated"]),):
             manifest = copy.deepcopy(BASE)
             manifest["account"][key] = value
             with self.assertRaisesRegex(ValueError, "当前"):

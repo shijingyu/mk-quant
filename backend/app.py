@@ -633,6 +633,11 @@ def validate_preset_backtest_config(manifest, value):
         raise ValueError("backtest_config 必须为对象；旧预设可省略或使用空对象")
     if not value:
         return {}
+    position={}
+    if "position_mode" in value:
+        from .strategy import resolve_position_mode
+        position={"position_mode":resolve_position_mode(manifest,value["position_mode"])}
+        value={k:v for k,v in value.items() if k!="position_mode"}
     if set(value)!=fields:
         raise ValueError("backtest_config 必须且只能包含 initial_capital、leverage、fee_rate、slippage_bps")
     if any(isinstance(item,bool) or not isinstance(item,(int,float)) for item in value.values()):
@@ -654,7 +659,7 @@ def validate_preset_backtest_config(manifest, value):
     if manifest.get("execution",{}).get("model")=="maker_grid_v1" and slip!=0:
         raise ValueError("Maker 网格使用限价撮合，滑点须为0")
     return {"initial_capital":float(capital),"leverage":int(leverage),
-            "fee_rate":float(fee),"slippage_bps":float(slip)}
+            "fee_rate":float(fee),"slippage_bps":float(slip),**position}
 
 
 @app.post("/api/presets",status_code=201)
@@ -864,6 +869,11 @@ def enqueue_experiment(body, *, persist=True, rules_snapshot=None, actor_id=None
             raise
         raise HTTPException(422,str(exc)) from exc
     maker=manifest.get("execution",{}).get("model")=="maker_grid_v1"
+    from .strategy import resolve_position_mode
+    try:
+        position_mode=resolve_position_mode(manifest,body.get("position_mode"))
+    except ValueError as exc:
+        raise HTTPException(422,str(exc)) from exc
     try:
         capital=float(body.get("initial_capital",10000)); fee=float(body.get("fee_rate",.0002 if maker else .0004)); slip=float(body.get("slippage_bps",0 if maker else 2)); seed=int(body.get("seed",42))
         if not all(math.isfinite(x) for x in (capital,fee,slip)) or capital<=0 or not 0<=fee<=.1 or not 0<=slip<=1000:
@@ -900,12 +910,12 @@ def enqueue_experiment(body, *, persist=True, rules_snapshot=None, actor_id=None
     config={key:body[key] for key in ("name","strategy_id","dataset_id","train_start","train_end","validation_start","validation_end") if key in body}
     from .timeframes import normalize_timeframes
     timeframes=normalize_timeframes(manifest.get("timeframes"))
-    config.update(parameters=params,symbols=symbols,initial_capital=capital,fee_rate=fee,slippage_bps=slip,seed=seed,market=manifest.get("market","futures"),leverage=int(leverage),ranges_ms=ranges,symbol_filters=filters,base_interval="1m",timeframes=timeframes)
+    config.update(parameters=params,symbols=symbols,position_mode=position_mode,initial_capital=capital,fee_rate=fee,slippage_bps=slip,seed=seed,market=manifest.get("market","futures"),leverage=int(leverage),ranges_ms=ranges,symbol_filters=filters,base_interval="1m",timeframes=timeframes)
     provenance={"strategy_version":manifest.get("version"),"strategy_hash":strategy["source_hash"],"parameters_hash":hashlib.sha256(db.dump(params).encode()).hexdigest(),"data_version":dataset["id"],"data_hash":dataset["sha256"],"engine_version":db.ENGINE_VERSION,"fee_model":{"taker_rate":fee,"source":"manual"},"slippage_model":{"bps":slip,"type":"fixed_adverse"},"seed":seed,"intervals":dict(zip(("train_start","train_end","validation_start","validation_end"),ranges)),"environment":{"python":platform.python_version(),"platform":platform.system()},"source":"synthetic" if dataset["source"]=="synthetic" else "historical"}
     provenance["symbol_filters"]={"source":filters_source,"rules":filters}
-    provenance.update(base_interval="1m",timeframes=timeframes,fill_model="minute_ohlc_inclusive_range_v1",symbol_attribution="equal_initial_capital_shared_execution")
+    provenance.update(position_mode=position_mode,base_interval="1m",timeframes=timeframes,fill_model="minute_ohlc_inclusive_range_v1",symbol_attribution="equal_initial_capital_shared_execution")
     if maker:
-        provenance.update(execution_model="maker_grid_v1",position_mode="hedge",fee_model={"maker_rate":fee,"source":"manual"},slippage_model={"bps":0,"type":"post_only_limit_no_taker_fallback"})
+        provenance.update(execution_model="maker_grid_v1",position_mode=position_mode,fee_model={"maker_rate":fee,"source":"manual"},slippage_model={"bps":0,"type":"post_only_limit_no_taker_fallback"})
     prepared={"id":db.uid(),"name":str(body.get("name") or manifest.get("name","策略")+" · 参数实验"),"strategy_id":strategy["id"],"dataset_id":dataset["id"],"config":config,"provenance":provenance,"strategy_snapshot":strategy}
     if not persist:
         return prepared

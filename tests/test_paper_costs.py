@@ -102,7 +102,7 @@ class MemoryDB:
     def fetchall(self):return self.rows
     def execute(self,sql,args=()):
         self.rows=[]
-        if sql.startswith("SELECT * FROM accounts"):self.rows=[self.account]
+        if sql.startswith("SELECT a.*,e.leverage AS configured_leverage FROM accounts"):self.rows=[self.account]
         elif sql.startswith("SELECT * FROM instances"):self.rows=[self.instance]
         elif sql.startswith("SELECT * FROM commands"):self.rows=self.commands
         elif sql.startswith("SELECT * FROM strategies"):self.rows=[self.strategy]

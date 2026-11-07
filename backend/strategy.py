@@ -99,6 +99,8 @@ def validate_manifest(manifest: dict) -> dict:
         value = account.get(key)
         _require(isinstance(value, list) and value and all(item in allowed for item in value),
                  f"account.{key} 无效或未声明")
+    if "default_position_mode" in account:
+        _require(account["default_position_mode"] in account["position_modes"], "default_position_mode 必须属于 position_modes")
     low = _number(account.get("leverage_min"), "account.leverage_min", 1)
     high = _number(account.get("leverage_max"), "account.leverage_max", low)
     _require(float(low).is_integer() and float(high).is_integer(), "杠杆倍数必须为整数")
@@ -119,7 +121,6 @@ def validate_manifest(manifest: dict) -> dict:
             execution["paper_costs"] = validate_paper_costs(execution["paper_costs"])
         if execution["model"] == "maker_grid_v1":
             _require(result["market"] == "futures", "Maker 网格模型仅支持合约")
-            _require(account["position_modes"] == ["hedge"], "Maker 网格必须声明双向持仓 hedge")
             _require(account["margin_modes"] == ["cross"], "Maker 网格当前仅支持全仓权益模型 cross")
 
     schema = result.get("parameters")
@@ -281,3 +282,16 @@ def get_strategy(strategy_id: str) -> dict:
         if strategy["id"] == strategy_id:
             return strategy
     raise KeyError(f"未知策略：{strategy_id}")
+
+
+def resolve_position_mode(manifest, requested=None):
+    """Keep legacy defaults, while allowing either mode in either executor."""
+    account = manifest["account"]
+    modes = account["position_modes"]
+    legacy = "hedge" if manifest.get("execution", {}).get("model") == "maker_grid_v1" else "one_way"
+    mode = requested if requested is not None else account.get("default_position_mode", legacy if legacy in modes else modes[0])
+    if mode not in modes or mode not in {"one_way", "hedge"}:
+        raise ValueError("所选持仓模式不符合策略声明")
+    if manifest["market"] == "spot" and mode != "one_way":
+        raise ValueError("现货仅支持单向持仓")
+    return mode

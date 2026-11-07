@@ -244,3 +244,12 @@ test("Maker cost settings keep zero slippage and reject nonzero presets", () => 
     /Maker/,
   );
 });
+
+test('position mode survives preset save/load and follows the declared default', () => {
+  const strategy = {market:'futures',account:{position_modes:['one_way','hedge'],default_position_mode:'hedge',leverage_min:1,leverage_max:5,min_capital:1}};
+  const form={initial_capital:1000,leverage:1,fee_rate:0,slippage_bps:0,position_mode:''};
+  const preset=createBacktestPreset('mode','s',{},form,strategy);
+  assert.equal(preset.backtest_config.position_mode,'hedge');
+  assert.equal(restoreBacktestPreset({...form,position_mode:'one_way'},preset,strategy).position_mode,'hedge');
+  assert.throws(()=>normalizeBacktestConfig({...form,position_mode:'unknown'},strategy),/持仓模式/);
+});

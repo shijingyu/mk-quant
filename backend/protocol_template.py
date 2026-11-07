@@ -1,10 +1,10 @@
 """Neutral, annotated contract skeleton shared by the protocol API and docs."""
 
-PROTOCOL_VERSION = "1.3.1"
+PROTOCOL_VERSION = "1.4.0"
 
 PROTOCOL_TEMPLATE = '''# 中性协议骨架：不包含指标、信号、仓位算法或订单，不会自动交易。
 # 标注“占位”的值不是推荐交易配置，必须按实际策略需求修改。
-# 合约/双向/Maker 的合法组合与条件必填字段见下方完整协议。
+# 市场/持仓模式/执行模型 的合法组合与条件必填字段见下方完整协议。
 MANIFEST = {
     # 必填：均为非空字符串；每次逻辑变更更新 version。
     "name": "待实现策略",
@@ -21,6 +21,8 @@ MANIFEST = {
     # min_capital 以 U 计；以下为可通过校验的占位配置。
     "account": {
         "position_modes": ["one_way"],
+        # 可选，必须属于 position_modes；模拟账户使用此默认模式。
+        "default_position_mode": "one_way",
         "margin_modes": ["cash"],
         "leverage_min": 1,
         "leverage_max": 1,
@@ -28,7 +30,7 @@ MANIFEST = {
     },
 
     # 可选：省略时为 market_next_open_v1；这里显式写出默认模型。
-    # 不可只改模型名称：maker_grid_v1 同时要求 futures + hedge + cross，
+    # 市价和 Maker 均支持合约 one_way / hedge；Maker 仍要求 futures + cross，
     # 且订单需遵守 Maker 字段、关联保护和成交规则。
     "execution": {"model": "market_next_open_v1"},
     # 可选：各周期每币历史上限 1–10000，默认 1000；并非已完成预热。

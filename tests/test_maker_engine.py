@@ -308,7 +308,7 @@ def test_backtest_uses_same_book_contract_and_reports_assumptions_and_orders():
     assert result["order_book"]["orders"]["e:sl"]["status"] == "CANCELED"
     assert result["assumptions"]["execution"] == "maker_grid_v1"
     assert result["assumptions"]["real_bid_ask_queue_available"] is False
-    assert result["engine_version"] == "1.4.0"
+    assert result["engine_version"] == "1.5.0"
     assert [event for decision in result["decisions"] for event in decision["execution_events"]] == result["events"]
     assert any(event["type"] == "ORDER_ACCEPTED" for event in result["decisions"][0]["execution_events"])
     json.dumps(result, allow_nan=False)
@@ -359,3 +359,55 @@ def test_grid_mark_margin_budget_cancels_entries_preserves_lots_and_can_replenis
     b.process_bar({symbol: {"timestamp": 3, "open": 100, "high": 100, "low": 100, "close": 100, "volume": 0}})
     restored = strategy.on_bar(context(100))
     assert any(intent["action"] == "place" for intent in restored)
+
+@pytest.mark.parametrize('mode',['one_way','hedge'])
+@pytest.mark.parametrize('model',['market_next_open_v1','maker_grid_v1'])
+def test_position_mode_is_independent_of_execution_model(mode,model):
+    manifest=validate_strategy_source(source())
+    manifest['account']['position_modes']=[mode]
+    manifest['execution']['model']=model
+    intents=[entry('long',quantity=2),entry('short',side='SHORT')]
+    if model=='market_next_open_v1':
+        intents=[{k:o[k] for k in ('symbol','side','position_side','quantity')} for o in intents]
+    code='MANIFEST = '+repr(manifest)+'\nclass Strategy:\n    def on_bar(self, context):\n        return '+repr(intents)+' if context["bar_index"] == 0 else []\n'
+    candles={SYMBOL:[bar(1735689600000+i*60000)[SYMBOL] for i in range(3)]}
+    result=run_backtest(code,{},candles,1000,.0002,0,symbol_filters=RULES)
+    assert result['account']['position_mode']==mode
+    assert set(result['positions'])==({SYMBOL} if mode=='one_way' else {SYMBOL+':LONG',SYMBOL+':SHORT'})
+    assert sum(p['quantity'] for p in result['positions'].values())==1
+    assert result['account']['margin_used']==(100 if mode=='one_way' else 300)
+
+
+def test_one_way_maker_fifo_netting_updates_protection_fees_and_restore():
+    b=MakerOrderBook(Ledger(1000,'futures',1,.001,'one_way'),RULES)
+    b.ledger.prices={SYMBOL:Decimal(100)}
+    b.submit(entry('a',quantity=1),0);b.submit(entry('b',quantity=2),0)
+    b.process_bar(bar(60000))
+    b.submit(entry('opposite',side='SHORT',quantity=2),60000)
+    b.process_bar(bar(120000))
+    assert b.ledger.position_snapshot()[SYMBOL]['quantity']==1
+    assert b.lots['a']['remaining_quantity']=='0'
+    assert Decimal(b.lots['b']['remaining_quantity'])==1
+    assert len(b.open_orders())==2
+    assert all(o['lot_id']=='b' and o['quantity']==1 for o in b.open_orders())
+    assert b.ledger.balance==Decimal('1003.501') # gross +4, entry fee .297, exit fee .202
+    b=MakerOrderBook.load(json.loads(json.dumps(b.dump())))
+    b.submit(entry('reverse',side='SHORT',quantity=3),120000)
+    b.process_bar(bar(180000))
+    assert b.ledger.position_snapshot()[SYMBOL]['quantity']==-2
+    assert len(b.lot_snapshot())==1 and b.lot_snapshot()[0]['remaining_quantity']==2
+    assert all(o['lot_id']=='reverse' and o['quantity']==2 for o in b.open_orders())
+    assert b.ledger.balance==Decimal('1005.198')
+    assert MakerOrderBook.load(json.loads(json.dumps(b.dump()))).dump()==b.dump()
+
+
+def test_mode_default_and_explicit_override_are_validated():
+    from backend.strategy import resolve_position_mode,validate_manifest
+    manifest=validate_strategy_source(source())
+    manifest['account']['position_modes']=['one_way','hedge']
+    assert resolve_position_mode(manifest)=='hedge' # preserve old Maker default
+    manifest['account']['default_position_mode']='one_way'
+    assert resolve_position_mode(validate_manifest(manifest))=='one_way'
+    assert resolve_position_mode(manifest,'hedge')=='hedge'
+    manifest['account']['default_position_mode']='unknown'
+    with pytest.raises(ValueError,match='default_position_mode'):validate_manifest(manifest)

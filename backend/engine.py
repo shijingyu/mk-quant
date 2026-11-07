@@ -28,11 +28,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 
-from .strategy import load_strategy, validate_parameters, validate_strategy_source, validate_symbols
+from .strategy import load_strategy, validate_parameters, validate_strategy_source, validate_symbols, resolve_position_mode
 from .timeframes import MINUTE_MS, MinuteFrames
 
 
-ENGINE_VERSION = "1.4.0"
+ENGINE_VERSION = "1.5.0"
 ZERO = Decimal("0")
 ONE = Decimal("1")
 
@@ -287,7 +287,12 @@ class Ledger:
             if position_side not in {"LONG", "SHORT"}:
                 return "双向模式必须明确 position_side LONG 或 SHORT"
             key = f"{symbol}:{position_side}"
+        if self.position_mode == "one_way" and intent.get("position_side") not in {None, "BOTH", "LONG", "SHORT"}:
+            return "单向模式 position_side 必须为 BOTH、LONG 或 SHORT"
         position = self.positions.setdefault(key, Position())
+        if self.position_mode == "one_way" and intent.get("reduce_only") and intent.get("position_side") in {"LONG", "SHORT"}:
+            if (position.quantity > 0) != (intent["position_side"] == "LONG"):
+                return "只减仓方向与当前净持仓不匹配"
         old_quantity = position.quantity
         if self.position_mode == "hedge":
             opening_side = (position_side == "LONG" and side == "buy") or (position_side == "SHORT" and side == "sell")
@@ -387,8 +392,8 @@ class MakerOrderBook:
                "remaining_quantity", "entry_quantity", "entry_fee_remaining"}
 
     def __init__(self, ledger, symbol_filters=None, maker_fee_rate=None):
-        if ledger.market != "futures" or ledger.position_mode != "hedge":
-            raise ValueError("maker_grid_v1 需要合约 hedge 双向账本")
+        if ledger.market != "futures":
+            raise ValueError("maker_grid_v1 需要合约账本")
         self.ledger = ledger
         self.symbol_filters = copy.deepcopy(symbol_filters or {})
         self.maker_fee_rate = ledger.fee_rate if maker_fee_rate is None else _decimal(maker_fee_rate)
@@ -432,6 +437,9 @@ class MakerOrderBook:
 
     def _store_order(self, order):
         key = order["id"]
+        previous = self.orders.get(key)
+        if previous and previous.get("lot_id") != order.get("lot_id"):
+            self._orders_by_lot.get(previous.get("lot_id"), {}).pop(key, None)
         self.orders[key] = order
         lot_id = order.get("lot_id")
         if isinstance(lot_id, str):
@@ -687,6 +695,24 @@ class MakerOrderBook:
         if any(item["protection_status"] in {"unprotected", "stop_rejected"} for item in self.lot_snapshot()):
             self.cancel_entries(timestamp, "lot 保护单未能完整创建，停止继续开仓")
 
+    def _reduce_lot(self, lot, quantity, basis, order, timestamp):
+        remaining = _decimal(lot["remaining_quantity"])
+        remaining -= quantity
+        lot.update(remaining_quantity=str(remaining), quantity=str(remaining),
+                   entry_fee_remaining=str(_decimal(lot["entry_fee_remaining"]) - _decimal(basis["entry_fee"])))
+        if remaining == 0:
+            lot.update(status="CLOSED", protection_status="closed", closed_at=timestamp, exit_order_id=order["id"])
+            self._open_lot_ids.pop(lot["id"], None)
+            for sibling in self._lot_orders(lot["id"]):
+                if sibling["id"] != order["id"] and sibling["status"] in self.OPEN:
+                    self.cancel(sibling["id"], timestamp, "lot 已平仓，取消兄弟保护/手动退出单")
+            self.lots[lot["id"]]=lot
+            self._event("LOT_CLOSED", timestamp, order)
+        else:
+            for sibling in self._lot_orders(lot["id"]):
+                if sibling["status"] in self.OPEN:
+                    sibling["quantity"] = str(min(_decimal(sibling["quantity"]), remaining))
+
     def _fill(self, order, timestamp):
         quantity = _decimal(order["quantity"])
         basis = None
@@ -697,6 +723,32 @@ class MakerOrderBook:
                 self.cancel(order["id"], timestamp, "lot 已关闭，禁止重复退出"); return
             quantity = min(quantity, remaining)
             basis = {"entry_price": lot["entry_price"], "entry_fee": str(_decimal(lot["entry_fee_remaining"]) * quantity / remaining)}
+        if self.ledger.position_mode == "one_way" and not order["reduce_only"]:
+            original_quantity = quantity
+            for key in list(self._open_lot_ids):
+                lot = self.lots[key]
+                if lot["symbol"] != order["symbol"] or lot["position_side"] == order["position_side"]:
+                    continue
+                remaining = _decimal(lot["remaining_quantity"])
+                closing = min(quantity, remaining)
+                exit_order = dict(order, quantity=str(closing), reduce_only=True, lot_id=key,
+                                  position_side=lot["position_side"], role="netting", bracket=None)
+                self._fill(exit_order, timestamp)
+                if exit_order["status"] != "FILLED":
+                    self._reject(order, timestamp, exit_order.get("reason", "净仓减仓失败")); return
+                quantity -= closing
+                if not quantity:
+                    order.update(status="FILLED", filled_at=timestamp, filled_quantity=str(original_quantity))
+                    self._store_order(order); self._sync_reservations(); return
+            if quantity != original_quantity:
+                # The residual is a new lot; only this part receives protection.
+                residual = dict(order, quantity=str(quantity))
+                self._fill(residual, timestamp)
+                order.update(status=residual["status"], filled_at=timestamp,
+                             filled_quantity=str(original_quantity if residual["status"] == "FILLED" else original_quantity-quantity))
+                if residual["status"] != "FILLED":
+                    order["reason"] = residual.get("reason", "反手剩余开仓失败")
+                self._store_order(order); self._sync_reservations(); return
         self._sync_reservations(exclude=order["id"])
         intent = {"symbol": order["symbol"], "side": order["side"], "position_side": order["position_side"],
                   "quantity": str(quantity), "reduce_only": order["reduce_only"], "type": "MARKET", "reason": order["reason"]}
@@ -713,21 +765,7 @@ class MakerOrderBook:
         if not order["reduce_only"]:
             self._children(order, timestamp)
         else:
-            remaining -= quantity
-            lot.update(remaining_quantity=str(remaining), quantity=str(remaining),
-                       entry_fee_remaining=str(_decimal(lot["entry_fee_remaining"]) - _decimal(basis["entry_fee"])))
-            if remaining == 0:
-                lot.update(status="CLOSED", protection_status="closed", closed_at=timestamp, exit_order_id=order["id"])
-                self._open_lot_ids.pop(lot["id"], None)
-                for sibling in self._lot_orders(lot["id"]):
-                    if sibling["id"] != order["id"] and sibling["status"] in self.OPEN:
-                        self.cancel(sibling["id"], timestamp, "lot 已平仓，取消兄弟保护/手动退出单")
-                self.lots[lot["id"]]=lot
-                self._event("LOT_CLOSED", timestamp, order)
-            else:
-                for sibling in self._lot_orders(lot["id"]):
-                    if sibling["status"] in self.OPEN:
-                        sibling["quantity"] = str(min(_decimal(sibling["quantity"]), remaining))
+            self._reduce_lot(lot, quantity, basis, order, timestamp)
         self._sync_reservations()
 
     def process_bar(self, bars):
@@ -939,7 +977,7 @@ class SymbolAttribution:
 
 
 def run_backtest(strategy_source, params, candles, initial_capital, fee_rate, slippage_bps,
-                 market="futures", leverage=1, symbol_filters=None, progress=None, cancelled=None, *, base_interval="1m", research_space=None):
+                 market="futures", leverage=1, symbol_filters=None, progress=None, cancelled=None, *, base_interval="1m", research_space=None, position_mode=None):
     """Run a fresh deterministic strategy with optional batched progress callback.
 
     ``progress({processed,total,status,equity:[new points]})`` marks intermediate
@@ -953,8 +991,7 @@ def run_backtest(strategy_source, params, candles, initial_capital, fee_rate, sl
     maker = manifest.get("execution", {}).get("model") == "maker_grid_v1"
     if market != manifest["market"]:
         raise ValueError("所选市场与策略要求不一致")
-    if not maker and "one_way" not in manifest["account"]["position_modes"]:
-        raise ValueError("当前引擎只支持单向净持仓；不能运行仅支持双向持仓的策略")
+    position_mode = resolve_position_mode(manifest, position_mode)
     if market == "futures" and "cross" not in manifest["account"]["margin_modes"]:
         raise ValueError("当前历史引擎使用全仓权益模型，不能运行仅支持逐仓的策略")
     initial = _decimal(initial_capital, "initial_capital")
@@ -974,15 +1011,15 @@ def run_backtest(strategy_source, params, candles, initial_capital, fee_rate, sl
     symbols = sorted(prepared)
     validate_symbols(manifest, symbols)
     if maker:
-        if market != "futures" or manifest["account"]["position_modes"] != ["hedge"] or manifest["account"]["margin_modes"] != ["cross"]:
-            raise ValueError("maker_grid_v1 当前需要 futures、hedge-only 与 cross-only 账户声明")
+        if market != "futures" or manifest["account"]["margin_modes"] != ["cross"]:
+            raise ValueError("maker_grid_v1 当前需要 futures 与 cross-only 账户声明")
         if slippage != ZERO:
             raise ValueError("maker_grid_v1 使用限价成交模型，slippage_bps 必须为 0，不能套用市价滑点")
         return _run_maker_backtest(strategy_source, manifest, parameters, prepared, timestamps,
-                                  initial, fees, lev, symbol_filters, progress, cancelled, series_factory, research_space)
+                                  initial, fees, lev, symbol_filters, progress, cancelled, series_factory, research_space, position_mode)
     filters = {symbol: _filters_for(symbol, symbol_filters) for symbol in symbols}
     strategy = load_strategy(strategy_source)
-    ledger = Ledger(initial, market, lev, fees)
+    ledger = Ledger(initial, market, lev, fees, position_mode=position_mode)
     ledger.orders, ledger.closed_pnls = series_factory(), series_factory()
     frames = MinuteFrames(symbols, manifest["timeframes"], manifest["history_window"])
     attribution = SymbolAttribution(ledger, symbols, series_factory)
@@ -1052,7 +1089,7 @@ def run_backtest(strategy_source, params, candles, initial_capital, fee_rate, sl
             "symbol_results": attribution.result(),
             "engine_version": ENGINE_VERSION, "status": "completed", "parameters": parameters,
             "assumptions": {"execution": "closed_primary_signal_fill_next_1m_open_within_inclusive_high_low",
-                "base_interval":"1m", "timeframes":manifest["timeframes"],
+                "base_interval":"1m", "timeframes":manifest["timeframes"], "position_mode":position_mode,
                 "higher_timeframe_buckets":"UTC_aligned_complete_minutes_only",
                 "symbol_attribution":"equal_initial_capital_shared_execution_not_independent_reruns",
                 "fee_rate": float(fees), "slippage_bps": float(slippage_bps), "funding_included": False,
@@ -1068,8 +1105,8 @@ def run_backtest(strategy_source, params, candles, initial_capital, fee_rate, sl
 
 
 def _run_maker_backtest(source, manifest, parameters, prepared, timestamps,
-                       initial, fee, leverage, symbol_filters, progress, cancelled, series_factory=list, research_space=None):
-    ledger = Ledger(initial, "futures", leverage, fee, position_mode="hedge")
+                       initial, fee, leverage, symbol_filters, progress, cancelled, series_factory=list, research_space=None, position_mode="hedge"):
+    ledger = Ledger(initial, "futures", leverage, fee, position_mode=position_mode)
     ledger.orders, ledger.closed_pnls = series_factory(), series_factory()
     book = MakerOrderBook(ledger, symbol_filters, maker_fee_rate=fee)
     book.events = series_factory()
@@ -1147,11 +1184,11 @@ def _run_maker_backtest(source, manifest, parameters, prepared, timestamps,
             "lots": book.lot_snapshot(), "events": copy.deepcopy(book.events) if series_factory is list else book.events, "order_book": book.dump() if series_factory is list else None,
             "symbol_results":attribution.result(book),
             "engine_version": ENGINE_VERSION, "status": "completed", "parameters": parameters,
-            "assumptions": {"execution": "maker_grid_v1", "position_mode": "hedge", "fee_rate": _float(fee),
+            "assumptions": {"execution": "maker_grid_v1", "fee_rate": _float(fee),
                 "fee_kind": "maker", "slippage_bps": 0, "funding_included": False, "liquidation_simulated": False,
                 "order_book_simulated": False, "real_bid_ask_queue_available": False, "partial_fills_simulated": False,
                 "maker_fill_model": "next_1m_resting_inclusive_low_high_full_fill_at_limit_no_volume_queue_model",
-                "base_interval":"1m", "timeframes":manifest["timeframes"],
+                "base_interval":"1m", "timeframes":manifest["timeframes"], "position_mode":position_mode,
                 "higher_timeframe_buckets":"UTC_aligned_complete_minutes_only",
                 "symbol_attribution":"equal_initial_capital_shared_execution_not_independent_reruns",
                 "zero_volume_bars": "never_fill_orders_price_conditions_can_trigger_without_a_fill",
@@ -1160,7 +1197,7 @@ def _run_maker_backtest(source, manifest, parameters, prepared, timestamps,
                 "bracket_activation": "entry_fill_creates_siblings_immediately_but_neither_eligible_until_next_bar",
                 "stop_execution": "conditional_limit_gtx_only_no_same_trigger_bar_fill_no_taker_fallback_exit_not_guaranteed",
                 "ambiguous_ohlc_ordering": "stop_priority_suppress_same_lot_profit_exit_on_trigger_bar",
-                "margin_model": "cross_equity_sum_of_both_hedge_legs_plus_pending_entry_margin_and_fees",
+                "margin_model": "cross_equity_positions_plus_pending_entry_margin_and_fees",
                 "isolated_margin_simulated": False, "quote_currency_model": "shared_U_balance_USDT_and_USDC_assumed_at_par",
                 "final_positions_closed": False, "final_unfilled_orders_retained": True,
                 "dropped_unaligned_bars": {s: len(rows) - len(timestamps) for s, rows in prepared.items()},
@@ -1186,7 +1223,7 @@ def _hash(value):
 
 def run_split_backtest(strategy_source, params, candles, initial_capital, fee_rate, slippage_bps,
                        train_start, train_end, validation_start, validation_end, market="futures",
-                       leverage=1, symbol_filters=None, progress=None, cancelled=None, seed=42, *, base_interval="1m"):
+                       leverage=1, symbol_filters=None, progress=None, cancelled=None, seed=42, *, base_interval="1m", position_mode=None):
     """Independently evaluate [start, end) train/validation periods without leakage."""
     a, b, c, d = map(_timestamp, (train_start, train_end, validation_start, validation_end))
     if not a < b <= c < d:
@@ -1196,7 +1233,7 @@ def run_split_backtest(strategy_source, params, candles, initial_capital, fee_ra
         subset = {symbol: [row for row in rows if start <= _timestamp(row["timestamp"]) < end] for symbol, rows in candles.items()}
         callback = (lambda event, current=name: progress(dict(event, split=current))) if progress else None
         outputs[name] = run_backtest(strategy_source, params, subset, initial_capital, fee_rate,
-                                    slippage_bps, market, leverage, symbol_filters, callback, cancelled, base_interval=base_interval)
+                                    slippage_bps, market, leverage, symbol_filters, callback, cancelled, base_interval=base_interval, position_mode=position_mode)
     outputs["differences"] = {key: outputs["validation"]["metrics"][key] - value
         if type(value) in {float, int} and type(outputs["validation"]["metrics"].get(key)) in {float, int} else None
         for key, value in outputs["train"]["metrics"].items()}
@@ -1211,7 +1248,7 @@ def run_split_backtest(strategy_source, params, candles, initial_capital, fee_ra
         "strategy_version": validate_strategy_source(strategy_source)["version"],
         "parameter_hash": _hash(validate_parameters(validate_strategy_source(strategy_source), params)),
         "data_hash": _hash(candles), "engine_version": ENGINE_VERSION, "seed": seed,
-        "fee_rate": fee_rate, "slippage_bps": slippage_bps, "market": market, "leverage": leverage,
+        "fee_rate": fee_rate, "slippage_bps": slippage_bps, "market": market, "leverage": leverage, "position_mode":resolve_position_mode(validate_strategy_source(strategy_source), position_mode),
         "intervals": {"train": [a, b], "validation": [c, d]}, "interval_boundary": "[start,end)",
         "base_interval":"1m", "timeframes":validate_strategy_source(strategy_source)["timeframes"],
         "validation_state": "fresh_account_and_strategy"}

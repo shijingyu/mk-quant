@@ -18,7 +18,7 @@ import pymysql
 from pymysql.err import IntegrityError
 from .schema import SCHEMA, TABLES
 
-ENGINE_VERSION = "1.4.0"
+ENGINE_VERSION = "1.5.0"
 # Exact bundled predecessors only. Administrator-edited strategies must never
 # be replaced merely because they use a builtin id or an older version label.
 _MINUTE_PREDECESSOR_HASHES = {
