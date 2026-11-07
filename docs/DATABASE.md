@@ -102,3 +102,5 @@ python scripts/migrate_sqlite_to_mysql.py --source /private-backup/legacy.sqlite
 ### v1.6.0 增量表
 
 启动时创建 InnoDB 表 `account_execution_settings` 和 `strategy_archives`，不重写既有账户、账本或策略版本。杠杆设置与账户更新、配置修订号和审计在同一事务提交；缺少设置的既有账户沿用策略声明的最低杠杆。删除策略采用持久删除标记，保留实验外键和版本快照；新建账户、保存预设及创建实验与删除操作共用策略行锁，避免删除与引用并发竞争。
+
+v1.6.1 新增 InnoDB 表 `account_archives`，记录账户删除标记、操作人和时间。账户删除与凭证清除、会话撤销、执行租约失效及审计在同一事务提交，历史账本外键不变。

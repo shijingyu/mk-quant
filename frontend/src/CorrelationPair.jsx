@@ -39,7 +39,7 @@ function Funding({ symbol, value }) {
           ? "—"
           : `${value.rate > 0 ? "+" : ""}${fmt(value.rate * 100, 4)}%`}
       </strong>
-      {value?.interval_hours ? ` / ${value.interval_hours}h` : " / 间隔未知"}
+      {value?.interval_hours ? ` / ${Number(Number(value.interval_hours).toFixed(4))}h` : " / 间隔未知"}
       <small>
         {value?.time
           ? `${formatBeijing(value.time)} · 北京时间`

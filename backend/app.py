@@ -60,7 +60,7 @@ async def security_headers(request, call_next):
 def user(request: Request):
     token = request.cookies.get(COOKIE, "")
     with db.connect() as con:
-        row = con.execute("SELECT u.*,s.csrf FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires>?", (token_hash(token),time.time())).fetchone()
+        row = con.execute("SELECT u.*,s.csrf FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires>? AND NOT EXISTS (SELECT 1 FROM accounts a JOIN account_archives x ON x.account_id=a.id WHERE a.user_id=u.id)", (token_hash(token),time.time())).fetchone()
     if not row:
         raise HTTPException(401, "请先登录")
     if request.method not in {"GET","HEAD","OPTIONS"}:
@@ -82,7 +82,7 @@ def admin(current=Depends(user)):
 
 def public_user(current):
     with db.connect() as con:
-        account = con.execute("SELECT route FROM accounts WHERE user_id=?",(current["id"],)).fetchone()
+        account = con.execute("SELECT route FROM accounts WHERE user_id=? AND NOT EXISTS (SELECT 1 FROM account_archives WHERE account_id=accounts.id)",(current["id"],)).fetchone()
     return {k:current[k] for k in ("id","username","name","role")} | {"route":account["route"] if account else None}
 
 
@@ -99,7 +99,7 @@ def login(body: dict, response: Response, request: Request):
     username = str(body.get("username", ""))[:120]
     with db.connect() as con:
         recent = con.execute("SELECT COUNT(*) FROM logs WHERE level='auth_failure' AND details=? AND created_at>?", (db.dump({"username":username}),datetime.fromtimestamp(time.time()-300,timezone.utc).isoformat())).fetchone()[0]
-        row = con.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+        row = con.execute("SELECT * FROM users WHERE username=? AND NOT EXISTS (SELECT 1 FROM accounts a JOIN account_archives x ON x.account_id=a.id WHERE a.user_id=users.id)", (username,)).fetchone()
     if recent >= 10:
         raise HTTPException(429, "登录失败次数过多，请 5 分钟后重试")
     if not row or not verify_password(str(body.get("password", "")), row["password"]):
@@ -194,7 +194,7 @@ def account_data(row, *, include_private=False):
 
 def all_accounts(current):
     with db.connect() as con:
-        rows=con.execute("SELECT a.*,u.phone FROM accounts a JOIN users u ON u.id=a.user_id"+("" if current["role"]=="admin" else " WHERE a.user_id=?")+" ORDER BY a.created_at",() if current["role"]=="admin" else (current["id"],)).fetchall()
+        rows=con.execute("SELECT a.*,u.phone FROM accounts a JOIN users u ON u.id=a.user_id WHERE NOT EXISTS (SELECT 1 FROM account_archives WHERE account_id=a.id)"+("" if current["role"]=="admin" else " AND a.user_id=?")+" ORDER BY a.created_at",() if current["role"]=="admin" else (current["id"],)).fetchall()
     return [account_data(row) for row in rows]
 
 
@@ -350,10 +350,41 @@ def create_account(body:dict,current=Depends(admin)):
     return next(a for a in all_accounts(current) if a["id"]==account_id)
 
 
+@app.delete("/api/accounts/{account_id}")
+def delete_account(account_id:str,current=Depends(admin)):
+    with db.connect() as con:
+        state=db.lock_instance(con,account_id)
+        account=con.execute("SELECT * FROM accounts WHERE id=?",(account_id,)).fetchone()
+        if not account:raise HTTPException(404,"账户不存在")
+        if con.execute("SELECT 1 FROM account_archives WHERE account_id=?",(account_id,)).fetchone():
+            return {"id":account_id,"deleted":True}
+        if not state or state["desired_state"]!="stopped" or state["observed_state"]!="stopped":
+            raise HTTPException(409,"请先平仓并停止，等待执行端确认后再删除账户")
+        metrics=db.parse(account["metrics"],{})
+        if any(metrics.get(k) for k in ("positions","open_orders","position_count","open_order_count")):
+            raise HTTPException(409,"账户仍有持仓或挂单，不能删除")
+        if con.execute("SELECT 1 FROM commands WHERE account_id=? AND status IN ('pending','running') LIMIT 1",(account_id,)).fetchone():
+            raise HTTPException(409,"账户仍有待执行指令，请等待完成后再删除")
+        if account["mode"]=="live" and account["credentials"]:
+            checked=db.parse(account["check_result"],{})
+            checks={c.get("name"):c.get("status") for c in checked.get("checks",[])}
+            try:fresh=0<=time.time()-datetime.fromisoformat(checked["checked_at"].replace("Z","+00:00")).timestamp()<60
+            except (KeyError,ValueError,TypeError):fresh=False
+            if not fresh or "unknown" in checks.values() or any(checks.get(k)!="pass" for k in ("existing_positions","existing_orders")) or checked.get("positions") or checked.get("orders"):
+                raise HTTPException(409,"请先执行账户接入检查，确认交易所无持仓及普通/条件挂单后在一分钟内删除")
+        # Revoke execution and access, retain immutable financial history.
+        con.execute("INSERT INTO account_archives VALUES(?,?,?)",(account_id,current["id"],db.now()))
+        con.execute("UPDATE instances SET fence=fence+1,owner=NULL,lease_until=0 WHERE account_id=?",(account_id,))
+        con.execute("UPDATE accounts SET credentials=NULL,check_result=NULL WHERE id=?",(account_id,))
+        con.execute("DELETE FROM sessions WHERE user_id=?",(account["user_id"],))
+        db.audit(con,current["id"],"account.delete","account",account_id,{"name":account["name"],"mode":account["mode"],"history_retained":True})
+    return {"id":account_id,"deleted":True,"message":"账户已删除，历史成交、账本及审计记录已保留"}
+
+
 @app.patch("/api/accounts/{account_id}")
 def update_account(account_id:str,body:dict,current=Depends(admin)):
     with db.connect() as con:
-        row=con.execute("SELECT a.*,i.observed_state,i.desired_state FROM accounts a JOIN instances i ON i.account_id=a.id WHERE a.id=?",(account_id,)).fetchone()
+        row=con.execute("SELECT a.*,i.observed_state,i.desired_state FROM accounts a JOIN instances i ON i.account_id=a.id WHERE a.id=? AND NOT EXISTS (SELECT 1 FROM account_archives WHERE account_id=a.id)",(account_id,)).fetchone()
     if not row:
         raise HTTPException(404,"账户不存在")
     if row["observed_state"]!="stopped" or row["desired_state"]!="stopped":
@@ -414,6 +445,8 @@ def update_account(account_id:str,body:dict,current=Depends(admin)):
         with db.connect() as con:
             lock_available_strategy(con,strategy_id)
             locked=db.lock_instance(con,account_id)
+            if con.execute("SELECT 1 FROM account_archives WHERE account_id=?",(account_id,)).fetchone():
+                raise HTTPException(404,"账户已删除")
             if not locked or locked["observed_state"]!="stopped" or locked["desired_state"]!="stopped":
                 raise HTTPException(409,"账户状态已改变，请等待停止回执后再修改")
             if initial!=row["initial_equity"] and con.execute("SELECT 1 FROM ledger WHERE account_id=? LIMIT 1",(account_id,)).fetchone():
@@ -441,7 +474,7 @@ def update_account(account_id:str,body:dict,current=Depends(admin)):
 @app.post("/api/accounts/{account_id}/check")
 def check_account(account_id:str,body:dict=None,current=Depends(admin)):
     with db.connect() as con:
-        account=con.execute("SELECT * FROM accounts WHERE id=?",(account_id,)).fetchone()
+        account=con.execute("SELECT * FROM accounts WHERE id=? AND NOT EXISTS (SELECT 1 FROM account_archives WHERE account_id=accounts.id)",(account_id,)).fetchone()
     if not account:
         raise HTTPException(404,"账户不存在")
     strategy=strategy_row(account["strategy_id"])
@@ -484,7 +517,7 @@ def check_account(account_id:str,body:dict=None,current=Depends(admin)):
 @app.get("/api/accounts/{account_id}/commission")
 def account_commission(account_id:str,symbol:str="BTCUSDT",current=Depends(admin)):
     with db.connect() as con:
-        account=con.execute("SELECT * FROM accounts WHERE id=?",(account_id,)).fetchone()
+        account=con.execute("SELECT * FROM accounts WHERE id=? AND NOT EXISTS (SELECT 1 FROM account_archives WHERE account_id=accounts.id)",(account_id,)).fetchone()
     if not account or not account["credentials"]:
         raise HTTPException(422,"该账户尚未提供币安凭证；个人费率需要签名接口，不能从公开 K 线接口读取")
     if symbol not in db.parse(account["symbols"],[]):
@@ -513,7 +546,7 @@ def command(body:dict,current=Depends(admin)):
     with db.connect() as con:
         for account_id in ids:
             db.lock_instance(con,account_id)
-            account=con.execute("SELECT * FROM accounts WHERE id=?",(account_id,)).fetchone()
+            account=con.execute("SELECT * FROM accounts WHERE id=? AND NOT EXISTS (SELECT 1 FROM account_archives WHERE account_id=accounts.id)",(account_id,)).fetchone()
             if not account:
                 raise HTTPException(404,"账户不存在")
             if action=="resume" and account["source"]=="demo":
@@ -532,7 +565,7 @@ def command(body:dict,current=Depends(admin)):
 @app.get("/api/client/{route}")
 def client_account(route:str,current=Depends(user)):
     with db.connect() as con:
-        account=con.execute("SELECT * FROM accounts WHERE route=?",(route,)).fetchone()
+        account=con.execute("SELECT * FROM accounts WHERE route=? AND NOT EXISTS (SELECT 1 FROM account_archives WHERE account_id=accounts.id)",(route,)).fetchone()
     if not account or (current["role"]!="admin" and account["user_id"]!=current["id"]):
         raise HTTPException(404,"账户不存在")
     return account_data(account)
@@ -551,7 +584,7 @@ def delete_strategy(strategy_id:str,current=Depends(admin)):
         if not row:raise HTTPException(404,"策略不存在")
         if con.execute("SELECT 1 FROM strategy_archives WHERE strategy_id=?",(strategy_id,)).fetchone():
             return {"id":strategy_id,"deleted":True}
-        if con.execute("SELECT 1 FROM accounts WHERE strategy_id=? LIMIT 1",(strategy_id,)).fetchone():
+        if con.execute("SELECT 1 FROM accounts WHERE strategy_id=? AND NOT EXISTS (SELECT 1 FROM account_archives WHERE account_id=accounts.id) LIMIT 1",(strategy_id,)).fetchone():
             raise HTTPException(409,"该策略仍有账户绑定，请先在账户配置中更换策略")
         if con.execute("SELECT 1 FROM experiments WHERE strategy_id=? AND status IN ('queued','running','cancelling') LIMIT 1",(strategy_id,)).fetchone():
             raise HTTPException(409,"该策略仍有未结束回测，请等待完成或取消后再删除")
@@ -1035,7 +1068,8 @@ def commands(current=Depends(admin)):
 
 @app.get("/api/protocol")
 def protocol(current=Depends(admin)):
+    from .protocol_template import PROTOCOL_TEMPLATE
     from pathlib import Path
     path=Path(__file__).resolve().parent.parent/"docs"/"STRATEGY_PROTOCOL.md"
     content=path.read_text() if path.exists() else "策略必须包含 MANIFEST 与 Strategy.on_bar(context)。上传只执行静态语法及契约检查；自定义代码待安全审核。"
-    return {"version":"1.0","content":content,"example":list_strategy_data()[0]["source"] if list_strategy_data() else ""}
+    return {"version":"1.0","content":content,"example":PROTOCOL_TEMPLATE}

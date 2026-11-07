@@ -525,3 +525,62 @@ def test_deleted_builtin_does_not_reappear_after_restart(client):
     login=client.post('/api/login',json={'username':'demo1','password':os.environ['MK_DEMO_PASSWORD']}).json()
     client.headers['X-MK-CSRF']=login['csrf_token']
     assert client.delete('/api/strategies/momentum').status_code==403
+
+
+def test_account_delete_revokes_access_execution_and_keeps_history(client):
+    account=new_paper(client)
+    aid=account['id']
+    old_fence=db.acquire_lease(aid,'old-worker')
+    with db.connect() as con:
+        con.execute("INSERT INTO ledger(id,account_id,kind,payload,created_at) VALUES(?,?,?,?,?)",(db.uid(),aid,'test-audit','{}',db.now()))
+    result=client.delete(f'/api/accounts/{aid}')
+    assert result.status_code==200,result.text
+    assert aid not in {a['id'] for a in client.get('/api/accounts').json()}
+    assert client.get(f"/api/client/{account['route']}").status_code==404
+    assert client.patch(f'/api/accounts/{aid}',json={'name':'revive'}).status_code==404
+    assert client.post('/api/commands',json={'account_ids':[aid],'action':'resume'}).status_code==404
+    assert client.post(f'/api/accounts/{aid}/check',json={}).status_code==404
+    assert not db.execution_authorized(aid,'old-worker',old_fence)
+    assert db.acquire_lease(aid,'new-worker') is None
+    assert client.delete(f'/api/accounts/{aid}').status_code==200
+    with db.connect() as con:
+        assert con.execute('SELECT COUNT(*) FROM ledger WHERE account_id=?',(aid,)).fetchone()[0]==1
+        assert con.execute("SELECT 1 FROM audit_records WHERE action='account.delete' AND resource_id=?",(aid,)).fetchone()
+    login=client.post('/api/login',json={'username':'13900000000','password':'test-password-123'})
+    assert login.status_code==401
+
+
+def test_account_delete_refuses_positions_orders_and_pending_commands(client):
+    account=new_paper(client);aid=account['id']
+    for metrics in ({'positions':[{}]},{'open_orders':[{}]},{'position_count':1},{'open_order_count':1}):
+        with db.connect() as con:con.execute('UPDATE accounts SET metrics=? WHERE id=?',(db.dump(metrics),aid))
+        assert client.delete(f'/api/accounts/{aid}').status_code==409
+    with db.connect() as con:con.execute("UPDATE accounts SET metrics='{}' WHERE id=?",(aid,))
+    client.post('/api/commands',json={'account_ids':[aid],'action':'resume'})
+    assert client.delete(f'/api/accounts/{aid}').status_code==409
+    with db.connect() as con:con.execute("UPDATE instances SET desired_state='stopped',observed_state='stopped' WHERE account_id=?",(aid,))
+    assert client.delete(f'/api/accounts/{aid}').status_code==409
+
+
+def test_protocol_is_neutral_and_independent_of_strategy_catalog(client):
+    from backend.strategy import validate_strategy_source
+    from backend.protocol_template import PROTOCOL_TEMPLATE
+    result=client.get('/api/protocol').json()
+    assert result['example']==PROTOCOL_TEMPLATE
+    validate_strategy_source(PROTOCOL_TEMPLATE)
+    namespace={};exec(PROTOCOL_TEMPLATE,namespace)
+    assert namespace['Strategy']().on_bar({})==[]
+    assert '均线做多' not in result['content']
+    assert '"properties": {}' in result['example']
+
+
+def test_live_delete_requires_recent_exchange_flat_check(client,monkeypatch):
+    from cryptography.fernet import Fernet
+    monkeypatch.setenv('MK_MASTER_KEY',Fernet.generate_key().decode())
+    account=client.post('/api/accounts',json={'name':'Delete live','phone':'13900000004','password':'test-password-123','mode':'live','initial_equity':1000,'strategy_id':'momentum','symbols':['BTCUSDT'],'config':{},'api_key':'test-key','api_secret':'test-secret'}).json()
+    aid=account['id']
+    assert client.delete(f'/api/accounts/{aid}').status_code==409
+    checked={'checked_at':db.now(),'checks':[{'name':key,'status':'pass'} for key in ('existing_positions','existing_orders')],'positions':[],'orders':[]}
+    with db.connect() as con:con.execute('UPDATE accounts SET check_result=? WHERE id=?',(db.dump(checked),aid))
+    assert client.delete(f'/api/accounts/{aid}').status_code==200
+    with db.connect() as con:assert con.execute('SELECT credentials FROM accounts WHERE id=?',(aid,)).fetchone()[0] is None

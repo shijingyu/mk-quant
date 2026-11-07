@@ -1020,6 +1020,7 @@ export default function App() {
           </div>
         </Modal>
       )}
+      {modal?.type === "delete-account" && <DeleteAccount account={modal.account} mutate={mutate} notify={notify} onClose={() => setModal(null)} />}
       {modal?.type === "account" && (
         <AccountForm
           account={modal.account}
@@ -1746,6 +1747,7 @@ function AccountActions({ account: a, setModal, compact = false }) {
                 平仓并停止
               </button>
             </div>
+            <div className="menu-danger"><button role="menuitem" disabled={a.status !== "stopped"} title="已停止且无持仓挂单时可删除" onClick={() => { setOpen(false); setModal({type:"delete-account",account:a}); }}><Trash2 size={16} />删除账户</button></div>
             {(disabledReason || a.stale) && (
               <p className="menu-note">
                 {disabledReason || "数据已过期，控制指令将等待执行端确认。"}
@@ -2123,6 +2125,20 @@ function Accounts({
     </>
   );
 }
+function DeleteAccount({account, mutate, notify, onClose}) {
+  const [busy,setBusy]=useState(false), [error,setError]=useState("");
+  return <Modal title="删除账户" subtitle={account.name} onClose={() => {if(!busy) onClose();}}>
+    <p>确认删除「{account.name}」？账户将从列表移除，客户登录及链接失效，API 凭证会清除。历史成交、账本和审计记录保留。</p>
+    <p className="dim">仅支持已停止、无持仓挂单且无待执行指令的账户。</p>
+    {error && <div className="inline-error" role="alert">{error}</div>}
+    <div className="modal-footer"><Btn disabled={busy} onClick={onClose}>取消</Btn><Btn kind="danger" disabled={busy} icon={busy ? Loader2 : Trash2} onClick={async () => {
+      if(busy)return; setBusy(true); setError("");
+      try {const result=await mutate(`/accounts/${account.id}`,undefined,"DELETE"); notify(result.message); onClose();}
+      catch(e){setError(e.message);} finally {setBusy(false);}
+    }}>确认删除账户</Btn></div>
+  </Modal>;
+}
+
 function AccountForm({
   account,
   defaultMode = "paper",
@@ -5785,30 +5801,26 @@ function Logs({ logs, strategies }) {
     </>
   );
 }
-const protocolExample = `MANIFEST = {
-    "name": "My Strategy", "version": "1.0.0",
-    "description": "策略说明", "market": "spot",
+const protocolExample = `# 协议骨架：不包含交易逻辑，不会生成订单。
+# 以下市场、账户、周期是可校验的占位配置，接入时按实际策略要求修改。
+MANIFEST = {
+    "name": "待实现策略", "version": "1.0.0",
+    "description": "请填写策略目标、适用条件与风险约束",
+    "market": "spot",
     "symbols": {"mode": "any", "values": [], "min_count": 1},
-    "timeframes": {"primary": "1h", "additional": ["4h"]},
     "account": {
         "position_modes": ["one_way"], "margin_modes": ["cash"],
         "leverage_min": 1, "leverage_max": 1, "min_capital": 100
     },
-    "parameters": {"type": "object", "properties": {
-        "quantity": {"type": "number", "default": 0.001, "minimum": 0.0001}
-    }}
+    "history_window": 200,
+    "timeframes": {"primary": "1m", "additional": []},
+    "parameters": {"type": "object", "properties": {}}
 }
 
 class Strategy:
     def on_bar(self, context):
-        # 完整主周期收盘后回调；框架逐分钟检查成交
-        # history/candles 为主周期，其他周期见 timeframe_history/timeframe_candles
-        symbol = next(iter(context["candles"]))
-        context["log"]("debug", "等待入场条件")
+        # 在这里实现自己的策略；字段与返回结构见协议正文。
         return []
-        # return [{"symbol": symbol, "side": "buy",
-        #          "quantity": context["params"]["quantity"],
-        #          "reduce_only": False}]
 `;
 function Todo() {
   return (

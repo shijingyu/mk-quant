@@ -306,6 +306,8 @@ def acquire_lease(account_id, owner, ttl=30):
     """InnoDB row lock serializes owners; expired leases advance the fencing token."""
     with connect() as con:
         row = lock_instance(con, account_id)
+        if con.execute("SELECT 1 FROM account_archives WHERE account_id=?", (account_id,)).fetchone():
+            return None
         instant = time.time()
         if not row or (row["lease_until"] > instant and row["owner"] != owner):
             return None

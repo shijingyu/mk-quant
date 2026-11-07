@@ -1,0 +1,3 @@
+"""Strategy contract skeleton; deliberately contains no trading logic."""
+
+PROTOCOL_TEMPLATE = '# 协议骨架：不包含交易逻辑，不会生成订单。\n# 以下市场、账户、周期是可校验的占位配置，接入时按实际策略要求修改。\nMANIFEST = {\n    "name": "待实现策略", "version": "1.0.0",\n    "description": "请填写策略目标、适用条件与风险约束",\n    "market": "spot",\n    "symbols": {"mode": "any", "values": [], "min_count": 1},\n    "account": {\n        "position_modes": ["one_way"], "margin_modes": ["cash"],\n        "leverage_min": 1, "leverage_max": 1, "min_capital": 100\n    },\n    "history_window": 200,\n    "timeframes": {"primary": "1m", "additional": []},\n    "parameters": {"type": "object", "properties": {}}\n}\n\nclass Strategy:\n    def on_bar(self, context):\n        # 在这里实现自己的策略；字段与返回结构见协议正文。\n        return []\n'

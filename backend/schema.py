@@ -4,10 +4,15 @@ TABLES = (
     "users", "strategies", "strategy_versions", "sessions", "accounts", "instances",
     "commands", "datasets", "experiments", "presets", "logs", "ledger", "runtime_events",
     "services", "market_cache", "orders", "fills", "audit_records", "binance_order_intents",
-    "schema_migrations", "data_download_jobs", "strategy_archives", "account_execution_settings",
+    "schema_migrations", "data_download_jobs", "strategy_archives", "account_execution_settings", "account_archives",
 )
 
 _TABLES = {
+    "account_archives": """
+        account_id VARCHAR(64) PRIMARY KEY, deleted_by VARCHAR(64) NOT NULL,
+        deleted_at VARCHAR(40) NOT NULL,
+        CONSTRAINT fk_archived_account FOREIGN KEY(account_id) REFERENCES accounts(id)
+    """,
     "strategy_archives": """
         strategy_id VARCHAR(64) PRIMARY KEY, deleted_by VARCHAR(64) NOT NULL,
         deleted_at VARCHAR(40) NOT NULL,

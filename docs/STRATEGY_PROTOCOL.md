@@ -8,83 +8,30 @@
 
 ## 1. 最小可用策略文件
 
-下面的完整 Python 源码可通过当前静态检查。示例用于说明协议，不代表已经验证的盈利策略。它仅做多，在均线下方减仓；`self.calls` 示范可持久化的实例状态。
+以下模板仅提供协议结构，不包含具体策略、指标、仓位算法或交易信号。占位配置必须根据实际策略改写；`on_bar` 默认返回空列表，不下单。
 
 ```python
+# 协议骨架：不包含交易逻辑，不会生成订单。
+# 以下市场、账户、周期是可校验的占位配置，接入时按实际策略要求修改。
 MANIFEST = {
-    "id": "example_trend",
-    "name": "接入示例 · 均线做多",
-    "version": "1.0.0",
-    "description": "收盘价高于均线时做多，低于均线时平仓，下一根开盘撮合。",
-    "market": "futures",
-    "symbols": {"mode": "fixed", "values": ["BTCUSDT"], "min_count": 1},
+    "name": "待实现策略", "version": "1.0.0",
+    "description": "请填写策略目标、适用条件与风险约束",
+    "market": "spot",
+    "symbols": {"mode": "any", "values": [], "min_count": 1},
     "account": {
-        "position_modes": ["one_way"],
-        "margin_modes": ["cross"],
-        "leverage_min": 1,
-        "leverage_max": 1,
-        "min_capital": 100,
+        "position_modes": ["one_way"], "margin_modes": ["cash"],
+        "leverage_min": 1, "leverage_max": 1, "min_capital": 100
     },
     "history_window": 200,
-    "timeframes": {"primary": "1h", "additional": ["4h"]},
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "period": {
-                "type": "integer", "default": 20,
-                "minimum": 2, "maximum": 200, "title": "均线周期",
-            },
-            "allocation": {
-                "type": "number", "default": 0.2,
-                "minimum": 0.01, "maximum": 0.8, "title": "可用资金投入比例",
-            },
-        },
-        "required": ["period", "allocation"],
-    },
+    "timeframes": {"primary": "1m", "additional": []},
+    "parameters": {"type": "object", "properties": {}}
 }
 
-
 class Strategy:
-    def __init__(self):
-        self.calls = 0
-
     def on_bar(self, context):
-        self.calls += 1
-        symbol = "BTCUSDT"
-        bars = context["history"][symbol]
-        period = context["params"]["period"]
-        if len(bars) < period:
-            context["emit"](stage="预热", reason="历史 K 线不足")
-            return []
-
-        average = sum(bar["close"] for bar in bars[-period:]) / period
-        close = context["candles"][symbol]["close"]
-        position = context["positions"].get(symbol, {})
-        quantity = position.get("quantity", 0)
-        context["emit"](
-            stage="信号计算",
-            indicators={symbol: {"moving_average": average, "close": close}},
-            reason="检查均线方向及现有持仓",
-        )
-
-        if close < average and quantity > 0:
-            context["log"]("debug", "收盘价跌破均线，生成减仓意图", {"symbol": symbol})
-            return [{
-                "symbol": symbol, "side": "sell", "quantity": quantity,
-                "reduce_only": True, "reason": "跌破均线",
-            }]
-        if close > average and quantity == 0:
-            budget = context["account"]["available"] * context["params"]["allocation"]
-            if budget > 0:
-                return [{
-                    "symbol": symbol, "side": "buy", "quantity": budget / close,
-                    "reduce_only": False, "reason": "收盘价高于均线且当前空仓",
-                }]
-        context["emit"](reason="方向未变化或已有持仓，本根不交易")
+        # 在这里实现自己的策略；字段与返回结构见协议正文。
         return []
 ```
-
-当前内置示例还包括 `backend/strategies/momentum.py` 的双均线多空策略、`backend/strategies/spot_dca.py` 的现货定投，以及 `backend/strategies/usdc_hedge_grid.py` 的 USDC 双向 Maker 等比网格。网格参数与运行边界见 [网格策略说明](GRID_STRATEGY.md)。
 
 ## 2. MANIFEST 字段
 
