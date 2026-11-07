@@ -911,8 +911,41 @@ def account_loop(account_id,once=False):
         time.sleep(2)
 
 
+def account_heartbeat_expired(instance, started_at, *, now=None, monotonic_now=None):
+    """Require both stale heartbeat and expired lease, after startup grace."""
+    from datetime import datetime
+    now=time.time() if now is None else now
+    monotonic_now=time.monotonic() if monotonic_now is None else monotonic_now
+    if monotonic_now-started_at<45 or instance["lease_until"]>=now-15:
+        return False
+    if instance.get("last_heartbeat"):
+        try:
+            if now-datetime.fromisoformat(instance["last_heartbeat"]).timestamp()<=45:
+                return False
+        except (TypeError,ValueError):
+            pass
+    return True
+
+
+def stop_unresponsive_account(account_id, child, started_at):
+    # Serialize the timeout decision with executor renewal and warmup commit;
+    # an unlocked stale SELECT must never kill a freshly renewed executor.
+    with db.connect() as con:
+        instance=db.lock_instance(con,account_id)
+        if not instance or child.poll() is not None or not account_heartbeat_expired(instance,started_at):
+            return False
+        child.kill();child.wait(timeout=5)
+        message="策略心跳超时，执行进程已隔离停止，需人工检查后恢复"
+        con.execute("UPDATE instances SET desired_state='stopped',observed_state='error',owner=NULL,fence=fence+1,lease_until=0,error=? WHERE account_id=?",(message,account_id))
+        con.execute("UPDATE commands SET status='failed',completed_at=?,error='策略心跳超时' WHERE account_id=? AND status IN ('pending','running')",(db.now(),account_id))
+        details={"last_heartbeat":instance["last_heartbeat"],"lease_until":instance["lease_until"],"fence":instance["fence"]}
+        db.audit(con,None,"instance.heartbeat_timeout","account",account_id,details)
+        con.execute("INSERT INTO logs(level,account_id,message,details,source,created_at) VALUES('error',?,?,?,?,?)",(account_id,message,db.dump(details),"runtime",db.now()))
+    return True
+
+
 def runtime_loop(once=False):
-    owner=db.uid();children={}
+    owner=db.uid();children={};started_at={}
     ensure_market_cache()
     market=None if once else subprocess.Popen([sys.executable,"-m","backend.worker","market"])
     warmer=None if once else subprocess.Popen([sys.executable,"-m","backend.worker","warmup"],preexec_fn=_account_limits if os.name=="posix" else None)
@@ -921,18 +954,14 @@ def runtime_loop(once=False):
             service("runtime",owner)
             for account_id,child in list(children.items()):
                 if child.poll() is None:
-                    with db.connect() as con:
-                        heartbeat=con.execute("SELECT last_heartbeat,lease_until FROM instances WHERE account_id=?",(account_id,)).fetchone()
-                        if heartbeat and heartbeat["last_heartbeat"] and heartbeat["lease_until"]<time.time()-15:
-                            child.kill();child.wait()
-                            con.execute("UPDATE instances SET desired_state='stopped',observed_state='error',error='策略心跳超时，执行进程已隔离停止，需人工检查后恢复' WHERE account_id=?",(account_id,))
-                            con.execute("UPDATE commands SET status='failed',completed_at=?,error='策略心跳超时' WHERE account_id=? AND status IN ('pending','running')",(db.now(),account_id))
+                    stop_unresponsive_account(account_id,child,started_at[account_id])
             with db.connect() as con:
                 rows=con.execute("SELECT DISTINCT i.account_id FROM instances i JOIN accounts a ON a.id=i.account_id LEFT JOIN commands c ON c.account_id=i.account_id WHERE i.desired_state IN ('running','paused') OR i.observed_state='flattening' OR c.status IN ('pending','running') OR (JSON_UNQUOTE(JSON_EXTRACT(a.metrics,'$.execution_model.model'))='maker_grid_v1' AND (COALESCE(JSON_EXTRACT(a.metrics,'$.position_count'),0)>0 OR COALESCE(JSON_EXTRACT(a.metrics,'$.open_order_count'),0)>0))").fetchall()
             for row in rows:
                 id=row["account_id"]
                 if id not in children or children[id].poll() is not None:
                     children[id]=subprocess.Popen([sys.executable,"-m","backend.worker","account",id]+(["--once"] if once else []),preexec_fn=_account_limits if os.name=="posix" else None)
+                    started_at[id]=time.monotonic()
             if market and market.poll() is not None:
                 market=subprocess.Popen([sys.executable,"-m","backend.worker","market"])
             if warmer and warmer.poll() is not None:

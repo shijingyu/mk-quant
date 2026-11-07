@@ -38,7 +38,8 @@ def test_automatic_warmup_preserves_book_and_fences_old_ticks(maker,monkeypatch,
         con.execute('UPDATE strategies SET manifest=?,source=?,source_hash=? WHERE id=?',(db.dump(manifest),source,hashlib.sha256(source.encode()).hexdigest(),MANIFEST['id']))
     command(maker,'resume');feed(maker,0);runtime_tick(maker['id'],'actor')
     before=read(maker)['snapshot']
-    with db.connect() as con:fence=con.execute('SELECT fence FROM instances WHERE account_id=?',(maker['id'],)).fetchone()[0]
+    with db.connect() as con:lease_before=con.execute('SELECT * FROM instances WHERE account_id=?',(maker['id'],)).fetchone()
+    fence=lease_before['fence']
     monkeypatch.setattr(warmer,'BinanceClient',lambda **kwargs:PublicMinutes())
     warmer.run_pending()
     after=read(maker)['snapshot']
@@ -50,8 +51,18 @@ def test_automatic_warmup_preserves_book_and_fences_old_ticks(maker,monkeypatch,
         assert con.execute('SELECT fence FROM instances WHERE account_id=?',(maker['id'],)).fetchone()[0]==fence+1
         status=db.parse(con.execute("SELECT payload FROM ledger WHERE account_id=? AND kind='warmup'",(maker['id'],)).fetchone()[0])
     assert status['status']=='completed' and status['progress']==100
+    with db.connect() as con:lease_after=con.execute('SELECT * FROM instances WHERE account_id=?',(maker['id'],)).fetchone()
+    for key in ['owner','lease_until','last_heartbeat']:
+        assert lease_after[key]==lease_before[key],key
+    assert not db.execution_authorized(maker['id'],'actor',fence)
+    assert db.execution_authorized(maker['id'],'actor',fence+1)
+    from backend.worker import account_heartbeat_expired
+    assert not account_heartbeat_expired(lease_after,0,now=maker['clock']['now'],monotonic_now=100)
+
     warmer.run_pending()
     with db.connect() as con:assert con.execute('SELECT fence FROM instances WHERE account_id=?',(maker['id'],)).fetchone()[0]==fence+1
+    assert runtime_tick(maker['id'],'actor')
+    assert read(maker)['snapshot']['frames']==after['frames']
 
 @pytest.mark.parametrize('snapshot',[
     {'model':'market_next_open_v1','pending':[{}]},

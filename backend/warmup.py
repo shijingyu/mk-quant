@@ -74,11 +74,14 @@ def warmup(account_id,count=None,progress=None):
                 frames.history[interval][symbol]=[combined[t] for t in sorted(combined)][-manifest['history_window']:]
         available=min(len(frames.history[timeframes['primary']][s]) for s in symbols)
         if available<count:raise ValueError('已闭合历史不足，未修改状态')
+        if not current['owner'] or current['lease_until']<=time.time():
+            raise ValueError('执行租约已失效，预热未覆盖账户状态，等待执行端恢复')
         snapshot['frames']=frames.dump()
         con.execute('UPDATE ledger SET payload=?,created_at=? WHERE id=?',(db.dump(snapshot),db.now(),row['id']))
-        # Invalidate any tick that read the old snapshot. No old executor can
-        # commit after this transaction; its next tick acquires a new fence.
-        con.execute('UPDATE instances SET fence=fence+1,owner=NULL,lease_until=0 WHERE account_id=?',(account_id,))
+        # Fence any tick that read the old snapshot, but retain the active
+        # executor and its real lease/heartbeat. Revocation (lease=0) here made
+        # the watchdog mistake a healthy warmup handoff for an expired actor.
+        con.execute('UPDATE instances SET fence=fence+1 WHERE account_id=?',(account_id,))
         metrics=db.parse(latest['metrics'],{});metrics['display']={'stage':'历史预热完成','reason':'等待下一根完整主周期 K 线进行信号判断','warmup_available':available,'warmup_required':count}
         con.execute('UPDATE accounts SET metrics=? WHERE id=?',(db.dump(metrics),account_id))
         report={'primary':timeframes['primary'],'available':available,'requested':count,'orders_replayed':0}
