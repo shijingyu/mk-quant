@@ -249,6 +249,18 @@ def run(identity, owner):
         state.update(waiting_reason=None,retry_at=None)
         heartbeat(force=True)
         client = BinanceClient(market=config["market"])
+        # Validate the whole batch before fetching any candle or creating files.
+        # Use exact exchange symbols: multiplier contracts have different units.
+        catalog = client.exchange_info(historical=True, on_wait=waiting)
+        available = {item["symbol"] for item in catalog["symbols"]}
+        invalid = [symbol for symbol in config["symbols"] if symbol not in available]
+        if invalid:
+            details = []
+            for symbol in invalid:
+                candidates = [prefix + symbol for prefix in ("1000", "1000000") if prefix + symbol in available]
+                hint = f"；该市场存在 {' / '.join(candidates)}，请核对合约单位后重新选择" if candidates else "；请核对市场及交易对名称"
+                details.append(symbol + hint)
+            raise ValueError("下载前校验失败，币安当前交易对目录中不存在：" + "；".join(details) + "。尚未下载任何 K 线")
         with storage.CandleStreamWriter(config["symbols"],heartbeat=heartbeat,temporary_prefix=temporary_prefix(identity,owner)+str(os.getpid())+"-") as writer:
             for index, symbol in enumerate(config["symbols"]):
                 state.update(completed_symbols=index,current_symbol=symbol,fraction=0)

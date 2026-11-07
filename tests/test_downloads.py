@@ -18,7 +18,8 @@ from backend import worker
 
 
 @pytest.fixture
-def client(mysql_database):
+def client(mysql_database,monkeypatch):
+    monkeypatch.setattr(BinanceClient,"exchange_info",lambda *a,**k:{"symbols":[{"symbol":s} for s in ("BTCUSDC","BTCUSDT","ETHUSDC","ETHUSDT")]})
     password=secrets.token_urlsafe(24)
     with db.connect() as con:
         con.execute("INSERT INTO users VALUES(?,?,?,?,?,?,?)",("download-admin","download-admin","下载测试",None,hash_password(password),"admin",db.now()))
@@ -128,6 +129,7 @@ def fixture(self,symbol,interval,start,end,*,progress,on_wait):
         progress({"rows":first+len(rows),"cursor":rows[-1]["timestamp"]+60000,"end":end})
         yield rows
 BinanceClient.iter_klines=fixture
+BinanceClient.exchange_info=lambda *a,**k:{"symbols":[{"symbol":"BTCUSDC"}]}
 downloads.run(sys.argv[1],sys.argv[2])
 print(json.dumps({"peak_rss_kb":resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,"downloaded_bars":downloads.get_job(sys.argv[1])["downloaded_bars"]}))
 '''
@@ -402,3 +404,17 @@ def test_failed_download_task_delete_requires_auth_and_csrf(client):
     client.headers['X-MK-CSRF'] = csrf
     assert client.delete('/api/datasets/download-jobs/' + job['id']).status_code == 200
     assert client.delete('/api/datasets/download-jobs/' + job['id']).status_code == 404
+
+
+def test_invalid_symbol_fails_entire_batch_before_download(client,monkeypatch):
+    monkeypatch.setattr(BinanceClient,"exchange_info",lambda *a,**k:{"symbols":[{"symbol":s} for s in ("ADAUSDC","DOGEUSDC","1000SHIBUSDC")]})
+    monkeypatch.setattr(BinanceClient,"iter_klines",lambda *a,**k:pytest.fail("No candles before entire batch validates"))
+    job=enqueue(client,symbols=["ADAUSDC","DOGEUSDC","SHIBUSDC"])
+    claimed,_=downloads.claim("symbol-check")
+    downloads.run(job["id"],claimed["owner"])
+    result=downloads.get_job(job["id"])
+    assert result["status"]=="failed"
+    assert result["downloaded_bars"]==0 and result["completed_symbols"]==0
+    assert result["dataset_id"] is None
+    assert "1000SHIBUSDC" in result["error"] and "合约单位" in result["error"]
+    assert result["config"]["symbols"]==["ADAUSDC","DOGEUSDC","SHIBUSDC"]
