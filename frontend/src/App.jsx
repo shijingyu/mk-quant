@@ -2348,8 +2348,7 @@ function AccountForm({
             </>
           )}
         </div>
-        <WarmupStatus account={a} detail />
-      {maker && <MakerNotice />}
+        {maker && <MakerNotice />}
         <div className="section-divider" />
         <h3>策略参数</h3>
         <div className="form-grid">
