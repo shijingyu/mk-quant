@@ -5801,27 +5801,6 @@ function Logs({ logs, strategies }) {
     </>
   );
 }
-const protocolExample = `# 协议骨架：不包含交易逻辑，不会生成订单。
-# 以下市场、账户、周期是可校验的占位配置，接入时按实际策略要求修改。
-MANIFEST = {
-    "name": "待实现策略", "version": "1.0.0",
-    "description": "请填写策略目标、适用条件与风险约束",
-    "market": "spot",
-    "symbols": {"mode": "any", "values": [], "min_count": 1},
-    "account": {
-        "position_modes": ["one_way"], "margin_modes": ["cash"],
-        "leverage_min": 1, "leverage_max": 1, "min_capital": 100
-    },
-    "history_window": 200,
-    "timeframes": {"primary": "1m", "additional": []},
-    "parameters": {"type": "object", "properties": {}}
-}
-
-class Strategy:
-    def on_bar(self, context):
-        # 在这里实现自己的策略；字段与返回结构见协议正文。
-        return []
-`;
 function Todo() {
   return (
     <>
@@ -5855,13 +5834,22 @@ function Todo() {
   );
 }
 function Protocol({ notify }) {
-  const [protocol, setProtocol] = useState(null);
+  const [protocol, setProtocol] = useState(null),
+    [loadError, setLoadError] = useState(""),
+    [copying, setCopying] = useState(false),
+    [attempt, setAttempt] = useState(0);
   useEffect(() => {
+    let active = true;
+    setProtocol(null); setLoadError("");
     api("/protocol")
-      .then(setProtocol)
-      .catch(() => {});
-  }, []);
-  const source = protocol?.example || protocolExample;
+      .then(value => { if (active) {
+        if (!value?.content?.trim() || !value?.example?.trim()) throw new Error("完整接入说明尚未准备好");
+        setProtocol(value);
+      } })
+      .catch(error => { if (active) setLoadError(error.message); });
+    return () => { active = false; };
+  }, [attempt]);
+  const source = protocol?.example || "代码骨架加载中…";
   return (
     <>
       <Heading
@@ -5872,23 +5860,27 @@ function Protocol({ notify }) {
         <Btn
           icon={Copy}
           kind="primary"
+          disabled={!protocol || copying}
           onClick={async () => {
-            await copyText(
-              typeof source === "string" ? source : protocolExample,
-            );
-            notify("策略模板已复制");
+            setCopying(true);
+            try { await copyText(protocol.content); notify("完整接入说明与代码骨架已复制，可直接发送给开发者或 AI"); }
+            catch { notify("复制失败，请重试或展开完整说明后手动复制"); }
+            finally { setCopying(false); }
           }}
         >
-          复制接入模板
+          {copying ? "正在复制…" : "复制完整接入说明"}
         </Btn>
       </Heading>
+      {loadError && <div className="inline-error" role="alert">{loadError} <Btn onClick={() => setAttempt(n => n + 1)}>重新加载说明</Btn></div>}
+      <p className="dim" style={{marginBottom: 12}}>一次复制字段约束、上下文、订单语义、状态恢复、执行限制与中性代码骨架；不含具体策略逻辑。</p>
+      {protocol && <details className="panel panel-body" style={{marginBottom: 24}}><summary style={{cursor: "pointer"}}>查看将复制的完整内容 · 协议 v{protocol.version}</summary><pre className="code-block" style={{marginTop: 16, maxHeight: 560, overflow: "auto", whiteSpace: "pre-wrap", overflowWrap: "anywhere"}}>{protocol.content}</pre></details>}
       <div id="protocol-content">
         <div className="protocol-hero">
           <div className="protocol-icon">
             <Code2 size={34} />
           </div>
           <div>
-            <span className="tag mono">CONTRACT v1</span>
+            <span className="tag mono">协议 v{protocol?.version || "—"}</span>
             <h2>一个接口，贯穿研究与执行。</h2>
             <p>
               策略输出交易意图。框架校验约束、处理成交、记录决策，并计算统一指标。
@@ -5914,7 +5906,7 @@ function Protocol({ notify }) {
         <div className="split-layout protocol-layout">
           <section className="panel">
             <div className="panel-heading">
-              <h2>必须声明的字段</h2>
+              <h2>字段与接口速查</h2>
             </div>
             <div className="table-wrap">
               <table>
@@ -5990,7 +5982,7 @@ function Protocol({ notify }) {
               <span>PYTHON</span>
             </div>
             <pre className="code-block">
-              {typeof source === "string" ? source : protocolExample}
+              {loadError ? "完整接入说明未加载，请重试。" : source}
             </pre>
           </section>
         </div>

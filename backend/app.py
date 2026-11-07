@@ -1068,8 +1068,13 @@ def commands(current=Depends(admin)):
 
 @app.get("/api/protocol")
 def protocol(current=Depends(admin)):
-    from .protocol_template import PROTOCOL_TEMPLATE
+    from .protocol_template import PROTOCOL_TEMPLATE, PROTOCOL_VERSION
     from pathlib import Path
     path=Path(__file__).resolve().parent.parent/"docs"/"STRATEGY_PROTOCOL.md"
-    content=path.read_text() if path.exists() else "策略必须包含 MANIFEST 与 Strategy.on_bar(context)。上传只执行静态语法及契约检查；自定义代码待安全审核。"
-    return {"version":"1.0","content":content,"example":PROTOCOL_TEMPLATE}
+    try:
+        content=path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise HTTPException(503,"完整接入说明暂不可用，请稍后重试") from exc
+    if not content.strip() or PROTOCOL_TEMPLATE.strip() not in content:
+        raise HTTPException(503,"接入说明与代码骨架版本不一致，请联系管理员更新")
+    return {"version":PROTOCOL_VERSION,"content":content,"example":PROTOCOL_TEMPLATE}

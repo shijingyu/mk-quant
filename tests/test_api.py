@@ -584,3 +584,41 @@ def test_live_delete_requires_recent_exchange_flat_check(client,monkeypatch):
     with db.connect() as con:con.execute('UPDATE accounts SET check_result=? WHERE id=?',(db.dump(checked),aid))
     assert client.delete(f'/api/accounts/{aid}').status_code==200
     with db.connect() as con:assert con.execute('SELECT credentials FROM accounts WHERE id=?',(aid,)).fetchone()[0] is None
+
+
+def test_complete_protocol_includes_valid_neutral_skeleton_and_contract(client):
+    import re
+    from pathlib import Path
+    from backend.protocol_template import PROTOCOL_VERSION, PROTOCOL_TEMPLATE
+    from backend.strategy import load_strategy
+    response=client.get('/api/protocol')
+    assert response.status_code==200,response.text
+    payload=response.json()
+    doc=(Path(__file__).resolve().parent.parent/'docs'/'STRATEGY_PROTOCOL.md').read_text()
+    assert payload['version']==PROTOCOL_VERSION
+    assert payload['content']==doc
+    skeleton=re.search(r'```python\n(.*?)\n```',doc,re.S).group(1)
+    assert skeleton.strip()==PROTOCOL_TEMPLATE.strip()==payload['example'].strip()
+    assert load_strategy(skeleton).on_bar({})==[]
+    for contract in ('execution.model','market_next_open_v1','maker_grid_v1','minimum','default','timeframe_history','decision_time','execution_events','client_order_id','reduce_only','stop_limit_price','JSON','白名单','to-do'):
+        assert contract in doc
+    assert '持续模拟取声明的最小值' not in doc
+    assert '持续模拟优先使用账户保存的杠杆' in doc
+    assert 'grid-example-L-1-1' not in doc
+
+
+@pytest.mark.parametrize('failure',['missing','incomplete'])
+def test_protocol_never_returns_partial_copy_when_document_is_unavailable(client,monkeypatch,failure):
+    from pathlib import Path
+    original=Path.read_text
+    def damaged(path,*args,**kwargs):
+        if path.name=='STRATEGY_PROTOCOL.md':
+            if failure=='missing':raise FileNotFoundError('test missing protocol')
+            return '# Partial document'
+        return original(path,*args,**kwargs)
+    with monkeypatch.context() as scoped:
+        scoped.setattr(Path,'read_text',damaged)
+        response=client.get('/api/protocol')
+        assert response.status_code==503
+        assert 'example' not in response.json()
+    assert client.get('/api/protocol').status_code==200

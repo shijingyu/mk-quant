@@ -1,35 +1,77 @@
-# MK Quant 策略接入协议 v1.3
+# MK Quant 策略接入协议 v1.3.1
 
-协议版本：`1.3.0`；当前引擎版本：`1.4.0`。本文以 `backend/strategy.py`、`backend/engine.py`、`backend/worker.py` 的当前实现为准，适用于开发者及协助编写策略的 AI。未声明执行模型的已有策略继续使用单向市价模型；`maker_grid_v1` 增加双向限价订单簿与逐格保护，新的实验统一使用 1m 成交检查及完整高周期合成；旧实验保留原结果与引擎版本。
+协议版本：`1.3.1`；当前引擎版本：`1.4.0`。本文以 `backend/strategy.py`、`backend/engine.py`、`backend/worker.py` 的当前实现为准，适用于开发者及协助编写策略的 AI。未声明执行模型的已有策略继续使用单向市价模型；`maker_grid_v1` 增加双向限价订单簿与逐格保护，新的实验统一使用 1m 成交检查及完整高周期合成；旧实验保留原结果与引擎版本。
 
 策略负责根据已完成的行情生成交易意图。框架负责参数校验、行情对齐、数量及价格规则、资金检查、模拟成交、账本、指标、日志与任务状态。策略不读取 API Key，不连接交易所，不创建线程，也不自行下单。
 
 当前可执行环境是历史回测和持续模拟。正式实盘尚未接入运行主循环，管理端无法启动真实交易；存在 Binance 下单适配器并不代表完整实盘系统已经验收。具体边界见 [验收清单](ACCEPTANCE.md) 与 [Binance 适配器说明](BINANCE.md)。
 
-## 1. 最小可用策略文件
+## 0. 给开发者与 AI 的接入指引
+
+本文是可一次复制的完整接入说明，包含中性骨架、字段与条件约束、上下文、交易意图、状态、成本和验收口径。复制内容为 Markdown 文档；提交策略时只提交 Python 源码，不要把全文作为策略上传。文中的路径和链接用于查阅源码或扩展资料，完成基本接入所需的协议已写在本文。
+
+- 用户的策略需求决定信号、币种、周期、仓位和退出规则。本协议不提供或推荐任何具体交易策略；骨架中的数值仅是合法占位，不得当成用户已经选择的配置。
+- 先选市场、执行模型与账户模式，再声明币种约束、周期、历史窗口和参数。只使用本文明确存在的接口，不要自行发明回调、隐含订单类型或借助额外字段改变执行器。
+- 区分“必填”“可选”和“条件必填”：可选字段省略会采用文中默认值；Maker 下单、STOP_LIMIT 和退出意图另有各自必填字段，见第 4 节。
+- `MANIFEST` 是静态要求，`context` 是运行输入，返回列表是交易意图；不是在 `MANIFEST` 中声明余额、持仓或实际成交结果。
+- 框架负责账户凭证、行情、撮合/风控、账本和调度。策略不得自行连接 Binance、创建后台线程或读写平台数据库。
+- 不满足当前执行能力的需求必须明确指出，不能把 `to-do` 规划项当作已实现接口。当前正式实盘执行仍关闭，资金费、逐仓结算和强平模型等限制见第 8 节。
+- 实现时处理数据不足、空仓、拒单和异常；按第 9 节验证。空闲返回 `[]`，不能返回 `None`，不能把挂单被接收当作已成交。
+
+## 1. 中性策略代码骨架
 
 以下模板仅提供协议结构，不包含具体策略、指标、仓位算法或交易信号。占位配置必须根据实际策略改写；`on_bar` 默认返回空列表，不下单。
 
 ```python
-# 协议骨架：不包含交易逻辑，不会生成订单。
-# 以下市场、账户、周期是可校验的占位配置，接入时按实际策略要求修改。
+# 中性协议骨架：不包含指标、信号、仓位算法或订单，不会自动交易。
+# 标注“占位”的值不是推荐交易配置，必须按实际策略需求修改。
+# 合约/双向/Maker 的合法组合与条件必填字段见下方完整协议。
 MANIFEST = {
-    "name": "待实现策略", "version": "1.0.0",
+    # 必填：均为非空字符串；每次逻辑变更更新 version。
+    "name": "待实现策略",
+    "version": "1.0.0",
     "description": "请填写策略目标、适用条件与风险约束",
+
+    # 必填：spot（无借贷现货）或 futures（U 本位永续）。当前为占位。
     "market": "spot",
+    # 必填：mode=any/fixed/multi；values 为大写完整交易对允许列表。
+    # fixed 必须完整选中 values；multi 至少 2 个；any 也受非空 values 限制。
     "symbols": {"mode": "any", "values": [], "min_count": 1},
+    # 必填：账户要求全部声明。现货仅 one_way + cash + 1 倍。
+    # 杠杆范围是约束，实际倍数由账户配置或回测配置提供，不是策略参数。
+    # min_capital 以 U 计；以下为可通过校验的占位配置。
     "account": {
-        "position_modes": ["one_way"], "margin_modes": ["cash"],
-        "leverage_min": 1, "leverage_max": 1, "min_capital": 100
+        "position_modes": ["one_way"],
+        "margin_modes": ["cash"],
+        "leverage_min": 1,
+        "leverage_max": 1,
+        "min_capital": 100
     },
+
+    # 可选：省略时为 market_next_open_v1；这里显式写出默认模型。
+    # 不可只改模型名称：maker_grid_v1 同时要求 futures + hedge + cross，
+    # 且订单需遵守 Maker 字段、关联保护和成交规则。
+    "execution": {"model": "market_next_open_v1"},
+    # 可选：各周期每币历史上限 1–10000，默认 1000；并非已完成预热。
     "history_window": 200,
+    # 可选：默认 1m / []；全部由连续收盘 1m 合成。
+    # 主周期控制 on_bar 频率，成交检查始终使用基础 1m。
     "timeframes": {"primary": "1m", "additional": []},
+    # 必填：无策略参数时可为空。每个新增参数必须有 type 和 default。
+    # 支持 integer/number/boolean/string；可声明 minimum/maximum/enum、
+    # title/description；单位写入标题或说明，不支持嵌套对象或数组参数。
     "parameters": {"type": "object", "properties": {}}
 }
 
 class Strategy:
+    # 如需 __init__，必须支持无参数实例化；self.* 仅保存 JSON 兼容状态。
     def on_bar(self, context):
-        # 在这里实现自己的策略；字段与返回结构见协议正文。
+        # 每根完整收盘的主周期 K 线回调一次，context 是只读输入快照。
+        # 使用 context["params"]、["history"]、["positions"]、["account"] 等。
+        # 日志：context["log"](level, message, data=None)，level=debug/error。
+        # 展示：context["emit"](**display_fields)，字段含 stage/indicators/reason。
+        # 自行判断历史预热是否充分；不满足条件时返回 []。
+        # 有交易时返回所选执行模型的意图列表，不能自行连接交易所下单。
         return []
 ```
 
@@ -67,9 +109,11 @@ class Strategy:
 | --- | --- | --- |
 | `position_modes` | 非空列表，值为 `one_way` 或 `hedge` | 市价模型必须接受 `one_way`；Maker 模型必须严格为 `["hedge"]`。 |
 | `margin_modes` | 非空列表，值为 `cross`、`isolated` 或 `cash` | 市价合约模型必须接受 `cross`；Maker 模型必须严格为 `["cross"]`；现货必须为 `["cash"]`。 |
-| `leverage_min` | 大于等于 1 的整数 | 实际杠杆必须在声明范围内；持续模拟取声明的最小值。 |
+| `leverage_min` | 大于等于 1 的整数 | 账户实际配置与回测所选杠杆必须在声明范围内；持续模拟优先使用账户保存的杠杆，未配置的旧账户才沿用声明最小值。 |
 | `leverage_max` | 大于等于最小杠杆的整数 | 现货最小及最大值都必须为 1。 |
 | `min_capital` | 大于等于 0 的有限数字 | 统一以 U 表示最低资金；回测/模拟初始资金仍必须大于 0。 |
+
+账户保存的杠杆是独立执行设置，同一账户内各交易对共用；修改需执行端确认停止且无持仓挂单，实盘设置需经过接入检查和确认调整。策略读取 `context["account"]["leverage"]` 获取实际模型倍数，不能通过改写该字典改变杠杆。
 
 现货还必须声明 `position_modes: ["one_way"]`，不能做空、借贷或加杠杆。`maker_grid_v1` 仅支持合约双向全仓模型；仅声明 `hedge` 而不选择该执行模型不能获得双向撮合。逐仓结算仍未实现，仅支持逐仓的策略不能运行。账户接入检查的真实钱包与保证金要求见 Binance 文档。
 
@@ -77,7 +121,18 @@ class Strategy:
 
 市价策略可声明 `execution.paper_costs: {"fee_rate": 0.0, "slippage_bps": 0.0}` 指定持续模拟的费用假设。该对象必须且只能包含这两个有限数字字段：费率范围 0–0.1，滑点范围 0–1000 bps，零值有效。明确声明优先于账户中缓存的旧费用展示值，且同时应用于正常成交和管理员平仓；Maker 模型不接受此覆盖。未声明的策略保留原持续模拟成本逻辑（合约默认每次成交 0.0004、现货默认 0.001、滑点 2 bps）。运行指标的 `execution_model.fee_source` 记录来源。历史实验仍使用实验表单/配置中的 `fee_rate`、`slippage_bps`，不会被策略的 `paper_costs` 静默覆盖；创建零成本回测时需显式填写 0。
 
-参数结构示例见完整模板。当前支持 `integer`、`number`、`boolean`、`string`，每项必须有 `default`；支持 `minimum`、`maximum`、`enum`，`title` 用于界面标签。未提供的参数使用默认值，未知参数被拒绝；布尔值不作为数字接受，NaN/Infinity 被拒绝。复杂嵌套对象、数组、动态表单、JSON Schema 的其他关键字尚未实现。
+骨架中的空 `properties` 表示尚未定义策略参数；不要把框架账户杠杆、实验资金或费用重复塞入策略参数。当前支持 `integer`、`number`、`boolean`、`string`，每项必须有 `default`；支持 `minimum`、`maximum`、`enum`，`title` 用于界面标签。未提供的参数使用默认值，未知参数被拒绝；布尔值不作为数字接受，NaN/Infinity 被拒绝。复杂嵌套对象、数组、动态表单、JSON Schema 的其他关键字尚未实现。
+
+参数定义字段（每项写在 `parameters.properties[参数名]` 中）：
+
+| 字段 | 必需 | 说明 |
+| --- | --- | --- |
+| `type` | 是 | `integer`、`number`、`boolean` 或 `string`。 |
+| `default` | 是 | 与类型、范围和枚举一致的默认值；不能是 NaN/Infinity。 |
+| `minimum` / `maximum` | 否 | 数值上下限，包含边界；两者都声明时下限不得大于上限。 |
+| `enum` | 否 | 允许值列表，默认值也必须属于此列表。 |
+| `title` | 否，建议填写 | 中文字段名，可标明单位。 |
+| `description` | 否，建议填写 | 单位、参数作用、边界及修改含义；显示为字段帮助。 |
 
 `required` 仅允许引用已定义的参数。默认值使缺省参数可补齐，不要求用户再次输入。跨字段约束（例如快均线周期必须小于慢均线）应在策略内明确检查并抛出 `ValueError`；这些检查会使任务失败并记录原因，当前表单不能自动从 Python 推断跨字段约束。
 
@@ -173,18 +228,7 @@ Maker `lots` 包含 `id` / `lot_id`、`entry_order_id`、`symbol`、`position_si
 
 撤单示例为 `{"action": "cancel", "order_id": "稳定订单ID"}`；也可用 `client_order_id` 指定同一 ID。`{"action": "cancel_entries"}` 只撤未成交入场单，保留退出单。撤单不会生成成交记录。
 
-入场意图示例（价格仅展示字段关系，不是任何交易对当前报价）：
-
-```python
-{
-    "action": "place", "client_order_id": "grid-example-L-1-1",
-    "symbol": "SOLUSDC", "side": "buy", "position_side": "LONG",
-    "type": "LIMIT", "time_in_force": "GTX", "quantity": 1, "price": 90,
-    "reduce_only": False,
-    "bracket": {"take_profit_price": 91, "stop_price": 86, "stop_limit_price": 86.02},
-    "reason": "示例网格入场",
-}
-```
+上表定义的是订单结构，不是交易建议；不提供固定币种、价格、仓位或网格信号样例。入场价格、数量及三项保护价格均须由开发者按照用户策略逻辑计算，不能从骨架占位值推导。
 
 处理顺序为：已存在委托处理当前完整共同 1m K 线 → 按分钟收盘价估值 → 更新高周期合成 → 主周期完整收盘时调用 `on_bar` → 提交新意图。新单最早下一分钟有效；买卖单均须满足 `low <= limit <= high` 且该分钟 `volume > 0`，含边界触价，满足时按限价全量成交。跳空后整个分钟范围未触及限价时不成交。零成交量即使触价也不成交，但仍可观察到止损触发；没有盘口队列、按成交量分配或部分成交模拟。最后一根新单保留为未成交，不虚构终局平仓。
 
@@ -202,9 +246,9 @@ Maker “平仓并停止”先撤入场及原退出单，再逐 lot 挂参考价
 
 ## 5. 扩展展示、日志与状态
 
-推荐调用 `context["emit"](stage="...", indicators={symbol: {"rsi": 50}}, reason="...")`。同一次 `on_bar` 内多次调用按键覆盖合并。回测保存完整 `display`，并另外提取 `stage`、`indicators`、`reason`；模拟账户保存最新 `display`。可以加入 JSON 兼容的 `chart_lines` 等自定义键，当前通用前端尚不会自动把任意自定义线绘制成图表。
+`context["emit"]` 接受关键字参数：`stage` 为阶段文字、`indicators` 为 JSON 兼容指标字典、`reason` 为最近决策或未开仓原因；这些不是 MANIFEST 必填字段，不预设任何指标或信号。同一次 `on_bar` 内多次调用按键覆盖合并。回测保存完整 `display`，并另外提取 `stage`、`indicators`、`reason`；模拟账户保存最新 `display`。可以加入 JSON 兼容的 `chart_lines` 等自定义键，当前通用前端尚不会自动把任意自定义线绘制成图表。
 
-`log("debug", "...", {"symbol": "BTCUSDT"})` 用于观察决策；`log("error", "...", details)` 用于策略识别到的问题。记录日志本身不会终止策略，需要中止时抛出异常。历史回测日志存放在对应 decision 内，持续模拟日志写入按策略/账户筛选的日志表。不要写入 API 密钥、口令或其他凭据。
+`context["log"]("debug", message, data)` 用于观察决策；`context["log"]("error", message, data)` 用于策略识别到的问题，`data` 是可省略的结构化详情。记录日志本身不会终止策略，需要中止时抛出异常。历史回测日志存放在对应 decision 内，持续模拟日志写入按策略/账户筛选的日志表。不要写入 API 密钥、口令或其他凭据。
 
 决策记录包含当前输入、账户快照、指标、阶段、原因、交易意图、风控结果和日志。市价模型的 `status="executed"` 只表示意图处理完成，是否真正成交须读每项 `risk.status`；Maker 的 `status="submitted"` 和 `risk.status="accepted"` 仅表示委托处理/接收，须结合订单状态、成交及执行事件判断是否退出。委托接受、止损触发、成交和平仓是不同状态。
 
