@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
-from . import db, storage, downloads, artifact_cleanup
+from . import db, storage, downloads, artifact_cleanup, data_catalog
 from .account_settings import validate_leverage
 from .security import decrypt_secret, encrypt_secret, hash_password, token_hash, verify_password
 
@@ -154,7 +154,9 @@ def account_data(row, *, include_private=False):
         instance=con.execute("SELECT * FROM instances WHERE account_id=?",(d["id"],)).fetchone()
         strategy=con.execute("SELECT manifest FROM strategies WHERE id=?",(d["strategy_id"],)).fetchone()
         execution=con.execute("SELECT leverage FROM account_execution_settings WHERE account_id=?",(d["id"],)).fetchone()
+        warmup=con.execute("SELECT payload FROM ledger WHERE account_id=? AND kind='warmup'",(d["id"],)).fetchone()
     d.update(metrics)
+    d["warmup"]=db.parse(warmup["payload"],{}) if warmup else None
     d["configured_leverage"]=execution["leverage"] if execution else db.parse(strategy["manifest"],{}).get("account",{}).get("leverage_min",1) if strategy else 1
     if d["mode"]=="paper":d["leverage"]=d["configured_leverage"]
     d["strategy_name"]=db.parse(strategy["manifest"],{}).get("name",d["strategy_id"]) if strategy else d["strategy_id"]
@@ -228,10 +230,12 @@ def list_experiments():
 
 def list_datasets():
     with db.connect() as con:
-        rows=con.execute("SELECT d.*,(SELECT COUNT(*) FROM experiments e WHERE e.dataset_id=d.id) AS experiment_count FROM datasets d ORDER BY d.created_at DESC").fetchall()
+        rows=con.execute("SELECT * FROM datasets WHERE source!='legacy_archive' ORDER BY market,symbols,created_at DESC").fetchall()
+        references=[data_catalog.referenced_ids(db.parse(r['config'],{}),r['dataset_id']) for r in con.execute('SELECT dataset_id,config FROM experiments').fetchall()]
     result=[]
     for row in rows:
         d=dict(row)
+        d["experiment_count"]=sum(d["id"] in ids for ids in references)
         metadata=storage.candle_metadata(d.pop("candles"))
         d.update(symbols=db.parse(d["symbols"],[]),**metadata)
         result.append(d)
@@ -711,7 +715,7 @@ def delete_dataset(dataset_id:str,current=Depends(admin)):
         dataset=con.execute("SELECT * FROM datasets WHERE id=? FOR UPDATE",(dataset_id,)).fetchone()
         if not dataset:
             raise HTTPException(404,"数据集不存在或已删除")
-        references=con.execute("SELECT COUNT(*) FROM experiments WHERE dataset_id=?",(dataset_id,)).fetchone()[0]
+        references=sum(dataset_id in data_catalog.referenced_ids(db.parse(r['config'],{}),r['dataset_id']) for r in con.execute('SELECT dataset_id,config FROM experiments').fetchall())
         if references:
             raise HTTPException(409,f"该数据集已被 {references} 个实验引用，请先删除相关实验记录")
         artifact=db.parse(dataset["candles"],{})
@@ -768,22 +772,28 @@ def store_dataset(body,source,actor_id=None,*,download_id=None,download_owner=No
 @storage.lifecycle_lock()
 def publish_dataset_artifact(body,source,artifact,actor_id=None,*,download_id=None,download_owner=None,content_hash=None):
     """Commit an already validated immutable file without materializing candles."""
-    id=download_id or db.uid()
-    count=artifact["count"]
-    market,interval=body["market"],body["interval"]
-    symbols=artifact["symbols"]
-    content_hash=content_hash or artifact["content_sha256"]
+    original=artifact
+    artifacts=artifact if isinstance(artifact,list) else storage.split_candles(artifact)
+    identities=[download_id or db.uid()]+[db.uid() for _ in artifacts[1:]]
+    count=sum(item["count"] for item in artifacts)
     with db.connect() as con:
         if download_id:
             job=con.execute("SELECT * FROM data_download_jobs WHERE id=? FOR UPDATE",(download_id,)).fetchone()
             if not job or job["status"]!="running" or job["owner"]!=download_owner or job["lease_until"]<=time.time():
                 raise downloads.DownloadLeaseLost("下载任务租约失效，结果未发布")
-        con.execute("INSERT INTO datasets VALUES(?,?,?,?,?,?,?,?,?)",(id,str(body.get("name","导入 K 线")),market,interval,db.dump(symbols),db.dump(artifact),content_hash,source,db.now()))
-        db.audit(con,actor_id,"dataset.create","dataset",id,{"source":source,"count":count,"hash":artifact["content_sha256"]})
+        for identity,item in zip(identities,artifacts):
+            symbol=item["symbols"][0]
+            digest=content_hash if len(artifacts)==1 and content_hash else item["content_sha256"]
+            con.execute("INSERT INTO datasets VALUES(?,?,?,?,?,?,?,?,?)",(identity,symbol+" · 1m",body["market"],body["interval"],db.dump([symbol]),db.dump(item),digest,source,db.now()))
+            db.audit(con,actor_id,"dataset.create","dataset",identity,{"source":source,"count":item["count"],"hash":digest})
         if download_id:
-            con.execute("UPDATE data_download_jobs SET status='completed',progress=100,downloaded_bars=?,completed_symbols=total_symbols,current_symbol=NULL,dataset_id=?,active_slot=NULL,lease_until=0,error=NULL,waiting_reason=NULL,retry_at=NULL,completed_at=?,updated_at=? WHERE id=?",(count,id,db.now(),db.now(),download_id))
-            db.audit(con,actor_id,"dataset.download.complete","data_download",download_id,{"dataset_id":id,"count":count})
-    return next(x for x in list_datasets() if x["id"]==id)
+            con.execute("UPDATE data_download_jobs SET status='completed',progress=100,downloaded_bars=?,completed_symbols=total_symbols,current_symbol=NULL,dataset_id=?,active_slot=NULL,lease_until=0,error=NULL,waiting_reason=NULL,retry_at=NULL,completed_at=?,updated_at=? WHERE id=?",(count,identities[0],db.now(),db.now(),download_id))
+            db.audit(con,actor_id,"dataset.download.complete","data_download",download_id,{"dataset_ids":identities,"count":count})
+        cleanup_id=artifact_cleanup.enqueue(con,actor_id,[original]) if not isinstance(original,list) and len(artifacts)>1 else None
+    if cleanup_id:artifact_cleanup.drain(cleanup_id)
+    records=[x for x in list_datasets() if x["id"] in identities]
+    first=next(x for x in records if x["id"]==identities[0])
+    return {**first,"datasets":records}
 
 
 @app.post("/api/datasets",status_code=201)
@@ -848,26 +858,26 @@ def enqueue_experiment(body, *, persist=True, rules_snapshot=None, actor_id=None
     params=validate_config(manifest,body.get("parameters",body.get("params",{})),body.get("symbols",["BTCUSDT"]),body.get("market",manifest.get("market","futures")))
     if not strategy["trusted"]:
         raise HTTPException(409,"自定义策略尚待离线安全审核；控制服务不会执行上传的 Python 代码")
-    with db.connect() as con:
-        dataset=con.execute("SELECT * FROM datasets WHERE id=?",(body.get("dataset_id",""),)).fetchone()
-    if not dataset:
-        raise HTTPException(422,"请选择可用的 K 线数据集")
-    if dataset["interval"]!="1m":
-        raise HTTPException(422,"新回测必须使用 1 分钟基础 K 线；当前为历史高周期数据，请重新下载 1 分钟行情，原实验结果仍可查看")
-    if (dataset["market"]=="spot") != (manifest.get("market","futures")=="spot"):
-        raise HTTPException(422,"K 线数据市场与策略市场不一致")
     symbols=body.get("symbols",["BTCUSDT"])
-    if not set(symbols)<=set(db.parse(dataset["symbols"],[])):
-        raise HTTPException(422,"数据集未覆盖全部选中币种")
     ranges=[timestamp(body.get(k)) for k in ("train_start","train_end","validation_start","validation_end")]
-    if not ranges[0]<ranges[1]<=ranges[2]<ranges[3]:
-        raise HTTPException(422,"训练集和验证集必须按时间顺序分离，区间采用 [开始,结束) 且不可重叠")
+    if not ranges[0]<ranges[1]<=ranges[2]<ranges[3] or any(t%60000 for t in ranges):
+        raise HTTPException(422,"回测集和验证集须按时间分离，使用整分钟的 [开始,结束) 区间")
     try:
-        storage.validate_minute_windows(dataset["candles"], symbols, (ranges[:2],ranges[2:]))
+        # Explicit synthetic fixtures remain available for demo/integration only;
+        # automatic production matching never substitutes synthetic prices.
+        with db.connect() as con:
+            fixture=con.execute("SELECT * FROM datasets WHERE id=? AND source='synthetic'",(body.get("dataset_id",""),)).fetchone()
+        if fixture:
+            if fixture["interval"]!="1m" or fixture["market"]!=manifest.get("market","futures") or not set(symbols)<=set(db.parse(fixture["symbols"],[])):
+                raise ValueError("合成行情须为 1 分钟且市场、交易对匹配")
+            selection=db.parse(fixture["candles"]);used={fixture["id"]:fixture};data_hash=fixture["sha256"]
+            storage.validate_minute_windows(selection,symbols,(ranges[:2],ranges[2:]))
+        else:
+            selection,used,data_hash=data_catalog.resolve(manifest.get("market","futures"),symbols,(ranges[:2],ranges[2:]))
     except ValueError as exc:
-        if isinstance(exc,storage.ArtifactError):
-            raise
+        if isinstance(exc,storage.ArtifactError):raise
         raise HTTPException(422,str(exc)) from exc
+    dataset=next(iter(used.values()))
     maker=manifest.get("execution",{}).get("model")=="maker_grid_v1"
     from .strategy import resolve_position_mode
     try:
@@ -910,8 +920,8 @@ def enqueue_experiment(body, *, persist=True, rules_snapshot=None, actor_id=None
     config={key:body[key] for key in ("name","strategy_id","dataset_id","train_start","train_end","validation_start","validation_end") if key in body}
     from .timeframes import normalize_timeframes
     timeframes=normalize_timeframes(manifest.get("timeframes"))
-    config.update(parameters=params,symbols=symbols,position_mode=position_mode,initial_capital=capital,fee_rate=fee,slippage_bps=slip,seed=seed,market=manifest.get("market","futures"),leverage=int(leverage),ranges_ms=ranges,symbol_filters=filters,base_interval="1m",timeframes=timeframes)
-    provenance={"strategy_version":manifest.get("version"),"strategy_hash":strategy["source_hash"],"parameters_hash":hashlib.sha256(db.dump(params).encode()).hexdigest(),"data_version":dataset["id"],"data_hash":dataset["sha256"],"engine_version":db.ENGINE_VERSION,"fee_model":{"taker_rate":fee,"source":"manual"},"slippage_model":{"bps":slip,"type":"fixed_adverse"},"seed":seed,"intervals":dict(zip(("train_start","train_end","validation_start","validation_end"),ranges)),"environment":{"python":platform.python_version(),"platform":platform.system()},"source":"synthetic" if dataset["source"]=="synthetic" else "historical"}
+    config.update(dataset_id=dataset["id"],data_selection=selection,parameters=params,symbols=symbols,position_mode=position_mode,initial_capital=capital,fee_rate=fee,slippage_bps=slip,seed=seed,market=manifest.get("market","futures"),leverage=int(leverage),ranges_ms=ranges,symbol_filters=filters,base_interval="1m",timeframes=timeframes)
+    provenance={"strategy_version":manifest.get("version"),"strategy_hash":strategy["source_hash"],"parameters_hash":hashlib.sha256(db.dump(params).encode()).hexdigest(),"data_version":list(used),"data_hash":data_hash,"data_sources":[{"id":r["id"],"sha256":r["sha256"],"symbols":db.parse(r["symbols"],[])} for r in used.values()],"engine_version":db.ENGINE_VERSION,"fee_model":{"taker_rate":fee,"source":"manual"},"slippage_model":{"bps":slip,"type":"fixed_adverse"},"seed":seed,"intervals":dict(zip(("train_start","train_end","validation_start","validation_end"),ranges)),"environment":{"python":platform.python_version(),"platform":platform.system()},"source":"synthetic" if dataset["source"]=="synthetic" else "historical"}
     provenance["symbol_filters"]={"source":filters_source,"rules":filters}
     provenance.update(position_mode=position_mode,base_interval="1m",timeframes=timeframes,fill_model="minute_ohlc_inclusive_range_v1",symbol_attribution="equal_initial_capital_shared_execution")
     if maker:
@@ -926,9 +936,9 @@ def store_experiments(items,actor_id=None):
     with db.connect() as con:
         # Lock every referenced catalogue row before creating experiments so a
         # concurrent deletion either sees the committed reference or wins first.
-        for dataset_id in sorted({item["dataset_id"] for item in items}):
+        for dataset_id in sorted(set().union(*(data_catalog.referenced_ids(item.get("config",{}),item["dataset_id"]) for item in items))):
             if not con.execute("SELECT id FROM datasets WHERE id=? FOR UPDATE",(dataset_id,)).fetchone():
-                raise HTTPException(409,"所选数据集已删除，请重新选择数据集")
+                raise HTTPException(409,"行情来源已删除，请补齐行情后重试")
         for strategy_id in sorted({item["strategy_id"] for item in items}):
             lock_available_strategy(con,strategy_id)
         for item in items:

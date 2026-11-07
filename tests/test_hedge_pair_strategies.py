@@ -36,3 +36,16 @@ def test_overlap_closes_each_actual_leg_instead_of_hiding_net_zero(name):
     intents=s.on_bar({'positions':{a+':LONG':{'quantity':2},a+':SHORT':{'quantity':-2},b+':SHORT':{'quantity':-3}},'account':{'position_mode':'hedge'},'emit':lambda **kw:None})
     assert len(intents)==3 and all(o['reduce_only'] for o in intents)
     assert {(o['symbol'],o['position_side']) for o in intents}=={(a,'LONG'),(a,'SHORT'),(b,'SHORT')}
+
+@pytest.mark.parametrize('name',FILES[1:])
+@pytest.mark.parametrize('exception',[ValueError,TypeError,KeyError,OverflowError])
+def test_ols_invalid_data_exception_is_handled_in_sandbox(name,exception):
+    strategy=load_strategy((ROOT/(name+'.py')).read_text())
+    displays=[]
+    def invalid(*args):raise exception('invalid fixture')
+    strategy.decide=invalid
+    result=strategy.on_bar({'positions':{},'account':{'position_mode':'hedge'},
+        'emit':lambda **kw:displays.append(kw),'log':lambda *a:None})
+    assert result==[]
+    assert displays[-1]['stage']=='等待有效行情'
+    assert 'invalid fixture' in displays[-1]['reason']

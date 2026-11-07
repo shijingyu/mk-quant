@@ -209,6 +209,7 @@ def run(identity, owner):
     config = db.parse(row["config"])
     state = {"completed_symbols":0,"total_symbols":len(config["symbols"]),"downloaded_bars":0,
              "current_symbol":None,"fraction":0,"waiting_reason":row.get("waiting_reason"),"retry_at":row.get("retry_at")}
+    artifacts=[]
     previous_signals = {}
     alarm_active = hasattr(signal,"SIGALRM") and threading.current_thread() is threading.main_thread()
     last_update = [0.0]
@@ -261,22 +262,27 @@ def run(identity, owner):
                 hint = f"；该市场存在 {' / '.join(candidates)}，请核对合约单位后重新选择" if candidates else "；请核对市场及交易对名称"
                 details.append(symbol + hint)
             raise ValueError("下载前校验失败，币安当前交易对目录中不存在：" + "；".join(details) + "。尚未下载任何 K 线")
-        with storage.CandleStreamWriter(config["symbols"],heartbeat=heartbeat,temporary_prefix=temporary_prefix(identity,owner)+str(os.getpid())+"-") as writer:
-            for index, symbol in enumerate(config["symbols"]):
-                state.update(completed_symbols=index,current_symbol=symbol,fraction=0)
-                heartbeat(force=True)
+        artifacts=[]
+        downloaded=0
+        for index, symbol in enumerate(config["symbols"]):
+            state.update(completed_symbols=index,current_symbol=symbol,fraction=0)
+            heartbeat(force=True)
+            with storage.CandleStreamWriter([symbol],heartbeat=heartbeat,temporary_prefix=temporary_prefix(identity,owner)+str(os.getpid())+"-") as writer:
                 for page in client.iter_klines(symbol,config["interval"],config["start"],config["end"],progress=lambda event:heartbeat(),on_wait=waiting):
                     writer.append(symbol,page)
-                    state.update(downloaded_bars=writer.count,waiting_reason=None,retry_at=None)
+                    state.update(downloaded_bars=downloaded+writer.count,waiting_reason=None,retry_at=None)
                     if page:
-                        state["fraction"] = (page[-1]["timestamp"]+60000-config["start"])/max(1,config["end"]-config["start"])
+                        state["fraction"]=(page[-1]["timestamp"]+60000-config["start"])/max(1,config["end"]-config["start"])
                     heartbeat(force=True)
-                state.update(completed_symbols=index+1,fraction=0)
-                heartbeat(force=True)
-            with storage.lifecycle_lock():
-                artifact = writer.finish()
-                heartbeat(force=True)
-                publish_dataset_artifact(config,"binance_public",artifact,row["requested_by"],download_id=identity,download_owner=owner)
+                with storage.lifecycle_lock():
+                    artifact=writer.finish()
+                    artifacts.append(artifact)
+                downloaded+=writer.count
+            state.update(completed_symbols=index+1,fraction=0)
+            heartbeat(force=True)
+        with storage.lifecycle_lock():
+            heartbeat(force=True)
+            publish_dataset_artifact(config,"binance_public",artifacts,row["requested_by"],download_id=identity,download_owner=owner)
     except DownloadLeaseLost:
         return
     except Exception as exc:
@@ -286,6 +292,11 @@ def run(identity, owner):
             message = str(exc.detail) if isinstance(exc,HTTPException) else str(exc) if isinstance(exc,(BinanceError,ValueError,DownloadTimeout)) else "下载处理失败（"+type(exc).__name__+"），请检查工作进程日志"
         fail(identity,owner,message)
     finally:
+        if artifacts:
+            from . import artifact_cleanup
+            with storage.lifecycle_lock():
+                with db.connect() as con:cleanup=artifact_cleanup.enqueue(con,row["requested_by"],artifacts)
+                artifact_cleanup.drain(cleanup)
         if alarm_active:
             signal.alarm(0)
             for signum, previous in previous_signals.items():

@@ -403,8 +403,50 @@ def _candle_row_groups(parquet, symbols=None, start=None, end=None):
     return selected
 
 
+def split_candles(artifact):
+    """Write independent symbol files with bounded memory; keep singleton identity."""
+    if len(artifact["symbols"])==1:return [artifact]
+    path=_resolve(artifact)
+    _,pq=_arrow()
+    result=[]
+    for symbol in artifact["symbols"]:
+        with CandleStreamWriter([symbol]) as writer:
+            with pq.ParquetFile(path) as parquet:
+                groups=_candle_row_groups(parquet,[symbol],None,None)
+                for batch in parquet.iter_batches(batch_size=4096,row_groups=groups,columns=["symbol","payload"],use_threads=False):
+                    rows=[json.loads(r["payload"]) for r in batch.to_pylist() if r["symbol"]==symbol]
+                    if rows:writer.append(symbol,rows)
+            result.append(writer.finish())
+    return result
+
+
+def selection_parts(value, symbols=None, start=None, end=None):
+    stored = db.parse(value, {}) if isinstance(value,str) else value
+    if isinstance(stored,dict) and stored.get("storage")=="symbol_selection":
+        for part in stored["parts"]:
+            a=max(part["start"],start) if start is not None else part["start"]
+            b=min(part["end"],end) if end is not None else part["end"]
+            if a<b and (symbols is None or part["symbol"] in symbols):
+                yield part["artifact"],[part["symbol"]],a,b
+    else:
+        yield stored,symbols,start,end
+
+
+def artifact_manifests(value):
+    stored=db.parse(value,{}) if isinstance(value,str) else value
+    if is_manifest(stored):return [stored]
+    if isinstance(stored,dict) and stored.get("storage")=="symbol_selection":
+        return [m for part in stored["parts"] for m in artifact_manifests(part["artifact"])]
+    return []
+
+
 def read_candles(value, *, symbols=None, start=None, end=None):
     stored = db.parse(value, {}) if isinstance(value, str) else value
+    if isinstance(stored,dict) and stored.get("storage")=="symbol_selection":
+        result={s:[] for s in (symbols or stored["symbols"])}
+        for artifact,selected,a,b in selection_parts(stored,symbols,start,end):
+            for symbol,rows in read_candles(artifact,symbols=selected,start=a,end=b).items():result[symbol].extend(rows)
+        return result
     if not is_manifest(stored):
         # Imported rows can still contain JSON until the migration backfill;
         # this is MySQL data compatibility, never a legacy database connection.
@@ -446,20 +488,24 @@ def validate_minute_windows(value, symbols, windows):
                 state[1] = timestamp
                 state[2] += 1
 
-    if is_manifest(stored):
-        path = _resolve(stored)
-        _, pq = _arrow()
-        with pq.ParquetFile(path) as parquet:
-            groups = _candle_row_groups(parquet, symbols, min(w[0] for w in windows), max(w[1] for w in windows))
-            for batch in parquet.iter_batches(batch_size=8192, row_groups=groups, columns=["symbol", "timestamp"], use_threads=False):
-                for row in batch.to_pylist():
-                    if row["symbol"] in states[0]:
-                        accept(row["symbol"], row["timestamp"])
-    else:
-        for symbol in symbols:
-            for row in (stored or {}).get(symbol, []):
-                accept(symbol, row["timestamp"])
-    for state in states:
+    for artifact,selected,begin,finish in selection_parts(stored,symbols,min(w[0] for w in windows),max(w[1] for w in windows)):
+        if is_manifest(artifact):
+            path = _resolve(artifact)
+            _, pq = _arrow()
+            with pq.ParquetFile(path) as parquet:
+                groups = _candle_row_groups(parquet, selected, begin, finish)
+                for batch in parquet.iter_batches(batch_size=8192,row_groups=groups,columns=["symbol","timestamp"],use_threads=False):
+                    for row in batch.to_pylist():
+                        if row["symbol"] in selected and begin<=row["timestamp"]<finish:accept(row["symbol"],row["timestamp"])
+        else:
+            for symbol in selected:
+                for row in (artifact or {}).get(symbol,[]):
+                    if begin<=row["timestamp"]<finish:accept(symbol,row["timestamp"])
+    for window,state in zip(windows,states):
+        if isinstance(stored,dict) and stored.get("storage")=="symbol_selection":
+            for symbol,values in state.items():
+                if values != [window[0],window[1]-60000,(window[1]-window[0])//60000]:
+                    raise ValueError(f"{symbol} 未完整覆盖所选区间的每一分钟，请补齐行情")
         expected = None
         for symbol, values in state.items():
             if values[2] < 2:

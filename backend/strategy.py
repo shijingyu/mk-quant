@@ -249,6 +249,8 @@ def load_strategy(source: str):
         "isinstance", "len", "list", "map", "max", "min", "next", "range", "reversed",
         "round", "set", "slice", "sorted", "str", "sum", "tuple", "zip", "Exception",
         "ValueError", "TypeError", "ZeroDivisionError", "RuntimeError", "object",
+        "KeyError", "IndexError", "LookupError", "OverflowError", "ArithmeticError",
+        "AttributeError", "AssertionError", "StopIteration", "NotImplementedError",
     )
     safe_builtins = {name: getattr(builtins, name) for name in allowed}
     safe_builtins["__build_class__"] = builtins.__build_class__

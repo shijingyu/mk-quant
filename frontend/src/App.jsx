@@ -298,6 +298,16 @@ function exportJson(name, data) {
   a.click();
   setTimeout(() => URL.revokeObjectURL(url), 500);
 }
+function WarmupStatus({ account, detail = false }) {
+  const w = account.warmup;
+  if (!w && !account.display?.stage) return null;
+  const running = w?.status === "running";
+  const text = running ? `历史预热 ${(w.progress || 0).toFixed(1)}% · 1m 合成` : w?.status === "failed" ? "历史预热未完成 · 将重试" : account.display?.stage || "历史预热完成";
+  return <div className={detail ? "notice" : "account-freshness"} title={w?.error || account.display?.reason || ""}>
+    <span>{text}{detail && <small style={{ display: "block" }}>{running ? "后台补齐分钟行情并合成策略周期，不回放历史订单。" : w?.error || account.display?.reason}</small>}</span>
+  </div>;
+}
+
 function Badge({ status, children }) {
   return (
     <span className={`badge ${stateClass(status)}`}>
@@ -768,7 +778,7 @@ export default function App() {
       notify(
         job.status === "completed"
           ? job.dataset_id === null
-            ? "原下载任务已完成，但数据集已删除；可再次提交创建新下载"
+            ? "原下载任务已完成，关联行情有删除；各币种请查看行情列表"
             : "该下载任务已完成，数据集已保存"
           : "下载任务已提交，切换页面或关闭网页后仍会继续",
       );
@@ -1811,6 +1821,7 @@ function AccountTable({ accounts, setModal, compact = false }) {
               </td>
               <td data-label="状态">
                 <Badge status={a.status} />
+                <WarmupStatus account={a} />
                 <small className="account-freshness">
                   {a.stale
                     ? "数据已过期"
@@ -2337,7 +2348,8 @@ function AccountForm({
             </>
           )}
         </div>
-        {maker && <MakerNotice />}
+        <WarmupStatus account={a} detail />
+      {maker && <MakerNotice />}
         <div className="section-divider" />
         <h3>策略参数</h3>
         <div className="form-grid">
@@ -2658,6 +2670,7 @@ function ClientView({ account: a, user }) {
           </div>
         </div>
       )}
+      <WarmupStatus account={a} detail />
       {maker && <MakerNotice />}
       {a.status === "flattening" && (
         <div className="notice amber">
@@ -2960,7 +2973,7 @@ function DownloadTasks({ jobs, onReuse, disabled, mutate, notify }) {
       <div className="panel-heading">
         <div>
           <h2>后台下载任务</h2>
-          <p>离开页面后继续执行，完成后自动加入本地数据集。</p>
+          <p>离开页面后继续执行，完成后自动加入本地 K 线 · 按交易对。</p>
         </div>
       </div>
       <div className="download-job-list">
@@ -2986,7 +2999,7 @@ function DownloadTasks({ jobs, onReuse, disabled, mutate, notify }) {
                 </strong>
                 <Badge status={job.status}>
                   {datasetRemoved
-                    ? "已完成 · 数据集已删除"
+                    ? "已完成 · 关联行情有删除"
                     : waiting
                       ? "等待重试"
                       : labels[job.status] || "状态未知"}
@@ -3010,7 +3023,7 @@ function DownloadTasks({ jobs, onReuse, disabled, mutate, notify }) {
                     ? "等待研究任务进程调度"
                     : job.status === "completed"
                       ? datasetRemoved
-                        ? "下载记录保留，数据集已删除"
+                        ? "下载记录保留，各币种行情请查看下方列表"
                         : "数据集已保存"
                       : job.status === "failed"
                         ? "任务已停止，可修正配置后重试"
@@ -3418,7 +3431,7 @@ function Datasets({ data, mutate, notify, startDownload, downloadSubmitting }) {
         <div className="panel-heading">
           <div>
             <h2>
-              本地数据集{" "}
+              本地 K 线 · 按交易对{" "}
               <span className="count-pill">{data.datasets?.length || 0}</span>
             </h2>
           </div>
@@ -4167,12 +4180,6 @@ function Backtest({ data, mutate, notify, go }) {
     [configTab, setConfigTab] = useState("strategy"),
     [form, setForm] = useState({
       name: "",
-      dataset_id:
-        datasets.find(
-          (d) =>
-            d.interval === "1m" &&
-            d.market === (initialStrategy?.manifest || initialStrategy)?.market,
-        )?.id || "",
       symbols: strategySymbols(initialStrategy).join(","),
       initial_capital: 10000,
       fee_rate: isMakerStrategy(initialStrategy) ? 0.0002 : 0.0004,
@@ -4197,8 +4204,7 @@ function Backtest({ data, mutate, notify, go }) {
     strategyPresets = presets.filter((item) => item.strategy_id === sid),
     minuteDatasets = datasets.filter(
       (d) => d.interval === "1m" && d.market === manifest.market,
-    ),
-    selectedDataset = datasets.find((d) => d.id === form.dataset_id);
+    );
   useEffect(() => {
     setSelectedPreset("");
     setPreset("");
@@ -4348,12 +4354,6 @@ function Backtest({ data, mutate, notify, go }) {
                   setConfigTab("data");
                   throw new Error("请补全回测集与验证集的北京时间区间");
                 }
-                if (!selectedDataset || selectedDataset.interval !== "1m") {
-                  setConfigTab("data");
-                  throw new Error(
-                    "新回测需要 1 分钟 K 线数据，请先下载或导入 1m 数据集",
-                  );
-                }
                 const intervals = Object.fromEntries(
                   [
                     "train_start",
@@ -4364,7 +4364,6 @@ function Backtest({ data, mutate, notify, go }) {
                 );
                 const ranges = Object.values(intervals).map(Date.parse);
                 if (
-                  !form.dataset_id ||
                   !form.symbols.trim() ||
                   !(
                     ranges[0] < ranges[1] &&
@@ -4374,7 +4373,7 @@ function Backtest({ data, mutate, notify, go }) {
                 ) {
                   setConfigTab("data");
                   throw new Error(
-                    "请选择数据集与交易对，并按顺序设置不重叠的回测集和验证集区间",
+                    "请输入交易对，并按顺序设置不重叠的回测集和验证集区间",
                   );
                 }
                 if (
@@ -4581,43 +4580,6 @@ function Backtest({ data, mutate, notify, go }) {
                 disabled={configTab !== "data"}
               >
                 <div className="form-grid">
-                  <Field label="K 线数据集">
-                    <select
-                      required
-                      value={form.dataset_id}
-                      onChange={(e) => {
-                        change("dataset_id", e.target.value);
-                        const d = datasets.find((x) => x.id === e.target.value);
-                        if (d?.symbols) {
-                          const selectedSymbols = maker
-                            ? d.symbols.filter((symbol) =>
-                                strategySymbols(s).includes(symbol),
-                              )
-                            : d.symbols;
-                          if (selectedSymbols.length)
-                            change("symbols", selectedSymbols.join(","));
-                        }
-                      }}
-                    >
-                      <option value="">请选择数据集</option>
-                      {selectedDataset &&
-                        !minuteDatasets.some(
-                          (d) => d.id === selectedDataset.id,
-                        ) && (
-                          <option value={selectedDataset.id} disabled>
-                            {selectedDataset.name} · 需更换为匹配市场的 1m 数据
-                          </option>
-                        )}
-                      {minuteDatasets.map((d) => (
-                        <option key={d.id} value={d.id}>
-                          {d.name} · 1m{" "}
-                          {["demo", "synthetic"].includes(d.source)
-                            ? "[合成数据]"
-                            : ""}
-                        </option>
-                      ))}
-                    </select>
-                  </Field>
                   <Field
                     label="交易对"
                     hint={
@@ -4636,23 +4598,14 @@ function Backtest({ data, mutate, notify, go }) {
                   </Field>
                 </div>
                 <p className="minute-dataset-help">
-                  {minuteDatasets.length
-                    ? "仅列出当前市场的 1 分钟数据。策略所需周期由完整收盘分钟合成。"
-                    : "暂无当前市场的 1 分钟数据集，请先到行情数据下载或导入。"}
-                  {datasets.some((d) => d.interval !== "1m") &&
-                    " 旧的其他周期数据和实验仍保留，不能用于新的分钟撮合回测。"}
+                  根据交易对、市场和时间区间自动匹配本地 1 分钟 K 线，可跨下载批次组合。其他周期由框架合成；缺少行情时会提示补齐。
                 </p>
-                <p className="fee-source">
-                  数据覆盖（北京时间）：
-                  {formatBeijing(
-                    datasets.find((d) => d.id === form.dataset_id)?.start,
-                  )}{" "}
-                  —{" "}
-                  {formatBeijing(
-                    datasets.find((d) => d.id === form.dataset_id)?.end,
-                  )}
-                  ，结束为末根 K 线开盘时间。
-                </p>
+                <div className="catalog-match-list">
+                  {[...new Set(form.symbols.split(/[,，\s/]+/).filter(Boolean))].map(symbol => {
+                    const matches = minuteDatasets.filter(d => d.symbols?.includes(symbol) && !["synthetic", "demo"].includes(d.source));
+                    return <div key={symbol}><strong>{symbol}</strong><span>{matches.length ? `已找到 ${matches.length} 份行情，提交时校验区间完整性` : "暂无本地行情，请先下载或导入"}</span></div>;
+                  })}
+                </div>
                 <div className="config-section-grid">
                   <div className="date-group">
                     <span>
@@ -5210,6 +5163,12 @@ function Experiments({ data, mutate, notify, go }) {
                   </td>
                   <td>
                     <Badge status={e.status} />
+                    {["queued", "running"].includes(e.status) && <div className="experiment-progress">
+                      <div><span>{e.status === "queued" ? "等待执行" : e.phase === "publishing" ? "保存结果" : e.execution_progress?.split === "validation" ? "验证集" : e.execution_progress?.split === "train" ? "回测集" : "准备行情"}</span><strong>{(Math.min(.999, Math.max(0, e.progress || 0)) * 100).toFixed(1)}%</strong></div>
+                      <progress max="100" value={Math.min(99.9, Math.max(0, (e.progress || 0) * 100))} aria-label="回测总进度" />
+                      {e.execution_progress && <small>{Number(e.execution_progress.processed).toLocaleString()} / {Number(e.execution_progress.total).toLocaleString()} 个分钟时间点</small>}
+                    </div>}
+
                   </td>
                   <td
                     className={`mono numeric ${valueTone(e.metrics?.total_return)}`}

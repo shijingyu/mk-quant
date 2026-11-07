@@ -97,7 +97,7 @@ def run_experiment(id):
             cancellation_value=not current or bool(current[0])
             return cancellation_value
         for i,(split,start,end) in enumerate((("train",ranges[0],ranges[1]),("validation",ranges[2],ranges[3]))):
-            data=CandleWindow(dataset["candles"],config["symbols"],start,end)
+            data=CandleWindow(config.get("data_selection",dataset["candles"]),config["symbols"],start,end)
             curve_key="curve" if split=="train" else "validation_curve"
             def progress(event):
                 nonlocal last_publish
@@ -112,6 +112,8 @@ def run_experiment(id):
                 for symbol in config["symbols"]:
                     partial["symbol_results"][symbol][curve_key]=accumulators[(curve_key,symbol)].points()
                 value=min(99.9,(i+event["processed"]/max(event["total"],1))*50)
+                partial["phase"]=split
+                partial["execution_progress"]={"split":split,"processed":event["processed"],"total":event["total"],"updated_at":db.now()}
                 preview=storage.result_preview(partial)
                 with db.connect() as con:
                     con.execute("UPDATE experiments SET progress=?,result=? WHERE id=? AND status='running'",(value,db.dump(preview),id))
@@ -617,6 +619,7 @@ def maker_runtime_tick(account, instance, commands, strategy, snapshot, fence, c
         frame_state=frames.dump()
         if primary_ready:
             frame_context=frames.context()
+
     decision_called=False
     references={symbol:bar["close"] for symbol,bar in bars.items()}
     if book.flattening:
@@ -839,6 +842,7 @@ def runtime_tick(account_id,owner):
         frame_state=frames.dump()
         if primary_ready:
             frame_context=frames.context()
+
     decision_called=False
     if timestamp>last and primary_ready and mode in {"running","paused"}:
         strategy_obj=load_strategy(strategy["source"])
@@ -871,6 +875,8 @@ def runtime_tick(account_id,owner):
         if not current_lease(con):
             return True
         _archive_executor(con,account_id,archived,"market_next_open_v1")
+        if decision_called:
+            con.execute("INSERT INTO logs(level,strategy_id,account_id,message,details,source,created_at) VALUES(?,?,?,?,?,?,?)",("debug",account["strategy_id"],account_id,(str(display.get("stage") or "策略决策")+"："+str(display.get("reason") or "已处理完整主周期 K 线"))[:4000],db.dump({"timestamp":timestamp,"display":display,"intent_count":len(pending),"risk":risk}),"runtime",db.now()))
         for order in ledger.orders[old_order_count:]:
             db.persist_fill(con,account_id,order)
             con.execute("INSERT INTO ledger VALUES(?,?,?,?,?,?)",(db.uid(),account_id,"fill",f"{account_id}:{order['id']}",db.dump(order),db.now()))
@@ -909,6 +915,7 @@ def runtime_loop(once=False):
     owner=db.uid();children={}
     ensure_market_cache()
     market=None if once else subprocess.Popen([sys.executable,"-m","backend.worker","market"])
+    warmer=None if once else subprocess.Popen([sys.executable,"-m","backend.worker","warmup"],preexec_fn=_account_limits if os.name=="posix" else None)
     try:
         while True:
             service("runtime",owner)
@@ -928,6 +935,8 @@ def runtime_loop(once=False):
                     children[id]=subprocess.Popen([sys.executable,"-m","backend.worker","account",id]+(["--once"] if once else []),preexec_fn=_account_limits if os.name=="posix" else None)
             if market and market.poll() is not None:
                 market=subprocess.Popen([sys.executable,"-m","backend.worker","market"])
+            if warmer and warmer.poll() is not None:
+                warmer=subprocess.Popen([sys.executable,"-m","backend.worker","warmup"],preexec_fn=_account_limits if os.name=="posix" else None)
             if once:
                 for child in children.values():
                     child.wait(timeout=20)
@@ -940,11 +949,13 @@ def runtime_loop(once=False):
                 child.terminate()
         if market and market.poll() is None:
             market.terminate()
+        if warmer and warmer.poll() is None:
+            warmer.terminate()
 
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode",choices=("backtest","runtime","market","job","download-job","account","init-demo","create-admin","trust-strategy"))
+    parser.add_argument("mode",choices=("backtest","runtime","market","warmup","job","download-job","account","init-demo","create-admin","trust-strategy"))
     parser.add_argument("id",nargs="?")
     parser.add_argument("--once",action="store_true")
     parser.add_argument("--username", help="管理员用户名；不提供则交互输入")
@@ -955,7 +966,7 @@ def main():
     args=parser.parse_args();db.init_db()
     if args.mode in {"runtime","backtest"}:
         signal.signal(signal.SIGTERM,lambda signum,frame:sys.exit(0))
-    if args.mode in {"job","download-job","account","market"}:
+    if args.mode in {"job","download-job","account","market","warmup"}:
         os.environ.pop("MK_MASTER_KEY",None)
         os.environ.pop("MK_ENABLE_LIVE",None)
     if args.mode=="init-demo":
@@ -1001,6 +1012,10 @@ def main():
     elif args.mode=="backtest":backtest_loop(args.once)
     elif args.mode=="runtime":runtime_loop(args.once)
     elif args.mode=="market":market_loop(args.once)
+    elif args.mode=="warmup":
+        if hasattr(os,"nice"):os.nice(10)
+        from .warmup import service_loop
+        service_loop(args.once)
     elif args.mode=="job":run_experiment(args.id)
     elif args.mode=="download-job":
         if not args.id or not args.download_owner:

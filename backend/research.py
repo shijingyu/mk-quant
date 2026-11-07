@@ -130,16 +130,22 @@ class CandleWindow:
         self.cursors = []
 
     def prepare(self):
-        if not storage.is_manifest(self.value):
+        if not storage.is_manifest(self.value) and self.value.get("storage")!="symbol_selection":
             from .engine import _prepare_candles
             return _prepare_candles(storage.read_candles(self.value,symbols=self.symbols,start=self.start,end=self.end))
         state = storage.validate_minute_windows(self.value, self.symbols, [(self.start, self.end)])[0]
         first, last, _ = state[self.symbols[0]]
         timestamps = range(first, last + 60000, 60000)
-        path = storage._resolve(self.value)
         prepared = {}
         for symbol in self.symbols:
-            cursor = _SymbolCursor(path, symbol, first, last + 60000, len(timestamps))
+            chunks=list(storage.selection_parts(self.value,[symbol],first,last+60000))
+            cursor = _SymbolCursor(None, symbol, first, last + 60000, len(timestamps))
+            def rows(chunks=chunks,symbol=symbol):
+                for artifact,_,begin,end in chunks:
+                    if storage.is_manifest(artifact):
+                        yield from _SymbolCursor._rows(storage._resolve(artifact),symbol,begin,end)
+                    else:yield from storage.read_candles(artifact,symbols=[symbol],start=begin,end=end).get(symbol,[])
+            cursor.rows=rows()
             self.cursors.append(cursor)
             prepared[symbol] = cursor
         return prepared, timestamps
