@@ -85,3 +85,41 @@ def test_funding_interval_is_observed_not_hardcoded(monkeypatch):
     result=c.funding_snapshot(Client(),['BTCUSDC','BAD'],20000000)
     assert result['BTCUSDC']=={'rate':.0002,'time':18000000,'interval_hours':4}
     assert result['BAD']['rate'] is None
+
+
+def test_scheduler_refreshes_without_page_requests_and_deduplicates(monkeypatch):
+    calls=[]
+    monkeypatch.setattr(c.time,'time',lambda:1000)
+    monkeypatch.setattr(c,'_states',{q:{'refreshing':False,'next_refresh':0} for q in ['USDT','USDC']})
+    class Thread:
+        def __init__(self,**kwargs):self.args=kwargs['args']
+        def start(self):calls.append(self.args)
+    monkeypatch.setattr(c.threading,'Thread',Thread)
+    class OneTick:
+        done=False
+        def is_set(self):return self.done
+        def wait(self,seconds):assert seconds==15;self.done=True
+    c._scheduler_loop(OneTick())
+    assert calls==[('USDT',),('USDC',)]
+    assert all(s['refreshing'] and s['refresh_phase']=='queued' for s in c._states.values())
+    c._queue_due_refreshes()
+    assert len(calls)==2
+    c._states['USDC'].update(refreshing=False,next_refresh=1100)
+    c._queue_due_refreshes()
+    assert len(calls)==2
+    c._states['USDC']['next_refresh']=999
+    c._queue_due_refreshes()
+    assert calls[-1]==('USDC',) and len(calls)==3
+
+
+def test_scheduler_launch_failure_retries_and_keeps_old_data(monkeypatch):
+    monkeypatch.setattr(c.time,'time',lambda:1000)
+    monkeypatch.setattr(c,'_states',{'USDC':{'refreshing':False,'next_refresh':0,'windows':{'old':True},'updated_at':123}})
+    class BrokenThread:
+        def __init__(self,**kwargs):pass
+        def start(self):raise RuntimeError('cannot start')
+    monkeypatch.setattr(c.threading,'Thread',BrokenThread)
+    c._queue_due_refreshes()
+    state=c._states['USDC']
+    assert not state['refreshing'] and state['next_refresh']==1060
+    assert state['windows']=={'old':True} and state['updated_at']==123 and state['error']

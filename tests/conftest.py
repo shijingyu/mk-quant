@@ -25,3 +25,10 @@ def mysql_database(tmp_path, monkeypatch):
             con.execute("SET FOREIGN_KEY_CHECKS=1")
     db.init_db()
     return name
+
+
+@pytest.fixture(autouse=True)
+def disable_correlation_scheduler_in_tests(monkeypatch):
+    from backend import correlation
+    monkeypatch.setattr(correlation, "start_scheduler", lambda: None)
+    monkeypatch.setattr(correlation, "stop_scheduler", lambda: None)

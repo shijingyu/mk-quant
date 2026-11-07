@@ -108,14 +108,18 @@ def funding_snapshot(client, symbols, server_ms):
 
 _lock=threading.Lock()
 _fetch_lock=threading.Lock()
+_scheduler_thread=None
+_scheduler_stop=None
 _states={q:{'windows':{},'funding':{},'updated_at':None,'refreshing':False,'error':None,'next_refresh':0} for q in ('USDT','USDC')}
 
 
 def _refresh(quote='USDT'):
-    client=BinanceClient(market='futures',timeout=8,max_retries=1)
+    client=None
     # Both pages share one serial exchange request lane, independent snapshots.
     with _fetch_lock:
+        with _lock:_states[quote]['refresh_phase']='fetching'
         try:
+            client=BinanceClient(market='futures',timeout=8,max_retries=1)
             server_ms=int(client._request('GET','/fapi/v1/time')['serverTime'])
             exchange=client._request('GET','/fapi/v1/exchangeInfo')
             tradable={s['symbol'] for s in exchange['symbols'] if s.get('contractType')=='PERPETUAL' and s.get('status')=='TRADING' and s.get('quoteAsset')==quote}
@@ -125,16 +129,55 @@ def _refresh(quote='USDT'):
         except Exception as exc:
             with _lock:_states[quote].update(error='公开行情更新失败：'+str(exc)[:200],next_refresh=max(time.time()+60,getattr(client,'_cooldown_until',0)))
         finally:
-            with _lock:_states[quote]['refreshing']=False
+            with _lock:_states[quote].update(refreshing=False,refresh_phase=None)
+
+
+def _launch_locked(quote):
+    state=_states[quote]
+    if state['refreshing'] or time.time()<state['next_refresh']:
+        return
+    state.update(refreshing=True,refresh_phase='queued',refresh_started_at=int(time.time()*1000))
+    try:
+        threading.Thread(target=_refresh,args=(quote,),daemon=True,name='public-correlation-'+quote).start()
+    except Exception:
+        state.update(refreshing=False,refresh_phase=None,error='行情更新任务启动失败',next_refresh=time.time()+60)
+
+
+def _queue_due_refreshes():
+    with _lock:
+        for quote in _states:
+            _launch_locked(quote)
+
+
+def _scheduler_loop(stop):
+    while not stop.is_set():
+        _queue_due_refreshes()
+        stop.wait(15)
+
+
+def start_scheduler():
+    """Warm both quotes and refresh on deadlines, even with no open browsers."""
+    global _scheduler_thread,_scheduler_stop
+    with _lock:
+        if _scheduler_thread is not None and _scheduler_thread.is_alive():return
+        _scheduler_stop=threading.Event()
+        _scheduler_thread=threading.Thread(target=_scheduler_loop,args=(_scheduler_stop,),daemon=True,name='correlation-scheduler')
+        _scheduler_thread.start()
+
+
+def stop_scheduler():
+    with _lock:
+        stop,thread=_scheduler_stop,_scheduler_thread
+    if stop is not None:stop.set()
+    if thread is not None:thread.join(timeout=1)
 
 
 def snapshot(quote='USDT'):
     if quote not in _states:raise ValueError('不支持的计价币种')
     with _lock:
         state=_states[quote]
-        if not state['refreshing'] and time.time()>=state['next_refresh']:
-            state['refreshing']=True
-            threading.Thread(target=_refresh,args=(quote,),daemon=True,name='public-correlation-'+quote).start()
+        # Request-driven fallback is retained for standalone callers.
+        _launch_locked(quote)
         return {**state,'quote':quote,'windows':{k:{a:b for a,b in v.items() if a!='_prices'} for k,v in state['windows'].items()},
                 'stale':bool(state['error']) or not state['updated_at'] or time.time()*1000-state['updated_at']>1200000,'next_refresh':int(state['next_refresh']*1000)}
 

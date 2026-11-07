@@ -23,7 +23,12 @@ async def lifespan(app):
     if os.getenv("MK_DEMO", "0") == "1":
         db.seed_demo()
     artifact_cleanup.drain()
-    yield
+    from .correlation import start_scheduler, stop_scheduler
+    start_scheduler()
+    try:
+        yield
+    finally:
+        stop_scheduler()
 
 
 app = FastAPI(title="MK Quant 控制服务", version="0.1.0", lifespan=lifespan)

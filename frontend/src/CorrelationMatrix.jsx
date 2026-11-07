@@ -51,9 +51,13 @@ export default function CorrelationMatrix({ quote = "USDT" }) {
   }, [pairSelection]);
   useEffect(() => {
     let active = true,
+      inFlight = false,
       timer,
       controller;
     const update = async () => {
+      if (!active || inFlight) return;
+      clearTimeout(timer);
+      inFlight = true;
       controller = new AbortController();
       let timeout = setTimeout(() => controller.abort(), 15000);
       try {
@@ -74,11 +78,19 @@ export default function CorrelationMatrix({ quote = "USDT" }) {
           timer = setTimeout(update, 30000);
         }
       } finally {
+        inFlight = false;
         clearTimeout(timeout);
       }
     };
+    const resume = () => {
+      if (document.visibilityState === "visible") update();
+    };
+    document.addEventListener("visibilitychange", resume);
+    globalThis.addEventListener("focus", resume);
     update();
     return () => {
+      document.removeEventListener("visibilitychange", resume);
+      globalThis.removeEventListener("focus", resume);
       active = false;
       clearTimeout(timer);
       controller?.abort();
@@ -122,14 +134,29 @@ export default function CorrelationMatrix({ quote = "USDT" }) {
         <div className="correlation-status" role="status">
           {data?.updated_at
             ? `更新于 ${formatBeijing(data.updated_at, { second: "2-digit" })} · 北京时间`
-            : "正在获取公开行情，首次计算约需一分钟"}
-          <span className={data?.stale || error ? "negative" : "positive"}>
+            : "正在获取公开行情，首次计算约需 1–3 分钟"}
+          <span className={error || data?.stale ? "negative" : "positive"}>
             {data?.updated_at
-              ? data.stale || error
-                ? " · 数据已过期"
-                : " · 数据有效"
+              ? error
+                ? " · 连接异常，显示上次数据"
+                : data.stale
+                  ? data.refreshing
+                    ? " · 数据已过期，正在更新"
+                    : " · 数据已过期，等待重试"
+                  : data.refreshing
+                    ? " · 数据有效，正在更新"
+                    : " · 数据有效"
               : ""}
           </span>
+          {data?.refreshing && (
+            <span>
+              {" "}
+              ·{" "}
+              {data.refresh_phase === "queued"
+                ? "已排队，等待行情采集"
+                : "正在采集公开行情"}
+            </span>
+          )}
         </div>
         {(error || data?.error) && (
           <p className="inline-error">
