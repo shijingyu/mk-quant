@@ -14,12 +14,13 @@ import math
 MANIFEST = {
     "id": "btc_eth_usdc_ratio",
     "name": "BTC/ETH 比值回归 · USDC",
-    "version": "1.0.1",
+    "version": "1.1.0",
     "description": "BTCUSDC/ETHUSDC 原始收盘比值，按主周期动态滚动总体标准差；默认1h、168/3/0.25。账户杠杆支持2–100倍，双腿各用权益50%名义额；下一分钟逐腿执行，异常腿及未完成退出持续只减仓。模拟手续费和固定滑点为0，仍按交易规则取整，不含资金费。",
     "market": "futures",
     "symbols": {"mode": "fixed", "values": ["BTCUSDC", "ETHUSDC"], "min_count": 2},
     "account": {
-        "position_modes": ["one_way"],
+        "position_modes": ["hedge"],
+        "default_position_mode": "hedge",
         "margin_modes": ["cross"],
         "leverage_min": 2,
         "leverage_max": 100,
@@ -73,6 +74,50 @@ class Strategy:
         return intents
 
     def on_bar(self, context):
+        # Hedge legs remain independent in the framework. The pair signal core
+        # sees one signed leg per asset only after checking for unexpected overlap.
+        if context.get("account", {}).get("position_mode", "hedge") != "hedge":
+            raise ValueError("该策略要求 hedge 双向持仓账本")
+        pair = ('BTCUSDC', 'ETHUSDC')
+        positions = context.get("positions")
+        if not isinstance(positions, dict):
+            raise ValueError("持仓快照必须为字典")
+        normalized = {}
+        exits = []
+        overlap = False
+        for symbol in pair:
+            legs = []
+            for side in ("LONG", "SHORT"):
+                position = positions.get(symbol + ":" + side, {})
+                quantity = position.get("quantity", 0)
+                if isinstance(quantity, bool) or not isinstance(quantity, (int, float)) or not math.isfinite(quantity):
+                    raise ValueError("持仓数量必须为有限数字")
+                if quantity:
+                    if (quantity > 0) != (side == "LONG"):
+                        raise ValueError("持仓腿与数量方向不一致")
+                    legs.append(position)
+                    exits.append({"symbol":symbol, "position_side":side,
+                        "side":"sell" if side=="LONG" else "buy", "quantity":abs(quantity),
+                        "reduce_only":True, "reason":"检测到同币多空重叠，逐腿只减仓恢复"})
+            if positions.get(symbol, {}).get("quantity", 0):
+                raise ValueError("检测到单向持仓键，禁止当作双向账本继续运行")
+            overlap = overlap or len(legs) > 1
+            if legs:
+                normalized[symbol] = legs[0]
+        if overlap:
+            context["emit"](stage="双向持仓恢复", reason="同币多空重叠，先逐腿平仓；禁止净额抵消或重复开仓")
+            return exits
+        inputs = dict(context)
+        inputs["positions"] = normalized
+        intents = self.pair_decision(inputs)
+        for intent in intents:
+            if intent.get("reduce_only"):
+                intent["position_side"] = "LONG" if intent["side"] == "sell" else "SHORT"
+            else:
+                intent["position_side"] = "LONG" if intent["side"] == "buy" else "SHORT"
+        return intents
+
+    def pair_decision(self, context):
         positions = context["positions"]
         quantity_a = positions.get("BTCUSDC", {}).get("quantity", 0)
         quantity_b = positions.get("ETHUSDC", {}).get("quantity", 0)

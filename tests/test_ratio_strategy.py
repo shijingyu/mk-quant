@@ -41,7 +41,7 @@ def context(ratios, *, positions=None, overrides=None, equity=10000.):
 
 
 def positions(a=-1.,b=2.):
-    return {s:dict(symbol=s,quantity=q,average_price=100.,position_side="LONG" if q>0 else "SHORT")
+    return {s+(":LONG" if q>0 else ":SHORT"):dict(symbol=s,quantity=q,average_price=100.,position_side="LONG" if q>0 else "SHORT")
             for s,q in zip(SYMBOLS,(a,b)) if q}
 
 
@@ -160,7 +160,7 @@ def test_orphan_or_same_direction_position_is_reduced_before_warmup(held):
     assert len(intents)==len(held)
     assert all(i["reduce_only"] for i in intents)
     for intent in intents:
-        original=held[intent["symbol"]]["quantity"]
+        original=held[intent["symbol"]+":"+intent["position_side"]]["quantity"]
         assert intent["quantity"]==abs(original)
         assert intent["side"]==("sell" if original>0 else "buy")
 
