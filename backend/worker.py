@@ -372,14 +372,18 @@ def ensure_market_cache():
 def persist_market_cache(market, symbol, candles, filters, fetched_at):
     """Confirm feed freshness without rewriting unchanged candle windows.
 
-    MIXED/statement binlogs record the complete SQL payload, even when an
-    upsert contains the same candles. Compare before choosing the write so
-    repeated successful polls only log the small freshness update. Compare
+    Statement binlogs record the complete SQL payload; ROW/MIXED with FULL
+    images also repeat unchanged TEXT fields. Use minimal row images on this
+    connection and compare before choosing the write so repeated successful
+    polls only log the small freshness update. Compare
     the full contents: exchanges can correct bars or symbol filters without
     changing the last candle timestamp.
     """
     encoded_candles, encoded_filters = db.dump(candles), db.dump(filters)
     with db.connect() as con:
+        # Scoped to this short-lived feed connection, never disables binlogs
+        # or changes other applications. market_cache has a primary key.
+        con.execute("SET SESSION binlog_row_image='MINIMAL'")
         previous = con.execute(
             "SELECT candles,filters FROM market_cache WHERE market=? AND symbol=? AND interval='1m' FOR UPDATE",
             (market, symbol),

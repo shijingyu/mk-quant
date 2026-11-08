@@ -21,6 +21,7 @@ def test_identical_successful_poll_only_updates_freshness(mysql_database, monkey
 
     def capture(self, query, params=None):
         if query.startswith(('UPDATE market_cache', 'INSERT INTO market_cache')):
+            assert original(self, 'SELECT @@session.binlog_row_image').fetchone()[0] == 'MINIMAL'
             writes.append((query, params))
         return original(self, query, params)
 

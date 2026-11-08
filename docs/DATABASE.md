@@ -88,7 +88,7 @@ python scripts/migrate_sqlite_to_mysql.py --source /private-backup/legacy.sqlite
 
 ## 磁盘与 MySQL 二进制日志
 
-MySQL 二进制日志独立于业务表大小；反复写入行情窗口等大字段，会使小型业务库生成大量日志。共享行情仅在内容或交易规则变化时写入大字段，其余成功轮询只更新时间，不改变数据过期判断或分钟撮合频率。
+MySQL 二进制日志独立于业务表大小；反复写入行情窗口等大字段，会使小型业务库生成大量日志。共享行情仅在内容或交易规则变化时写入大字段，其余成功轮询只更新时间，不改变数据过期判断或分钟撮合频率。行情写入专用连接设置 `SESSION binlog_row_image=MINIMAL`，避免 ROW/MIXED 的完整行镜像重复记录未修改的 TEXT 字段；不关闭二进制日志，也不修改其他业务的全局配置。`market_cache` 保留完整主键，复制环境需保持源端与目标端的表结构一致。参见 [MySQL 5.7 行镜像说明](https://dev.mysql.com/doc/mysql-replication-excerpt/5.7/en/replication-options-binary-log.html#sysvar_binlog_row_image)。
 
 运维需同时监测磁盘剩余空间、inode、二进制日志增长和备份容量。磁盘写满出现 errno 28 时，先释放可再生缓存并校验一致性备份，检查复制与恢复依赖，再经管理员确认使用 `PURGE BINARY LOGS` 清理备份坐标之前的日志；不要直接删除数据目录中的文件。日志保留期限须匹配恢复目标，MySQL 5.7 使用 `expire_logs_days`，同时更新运行值和配置文件；日志轮转时才触发过期清理，`max_binlog_size` 可限制单文件的通常规模（大事务仍可能超限）。缩短保留期会缩短可按时间点恢复的范围，不能代替数据库与 Parquet 联合备份。
 
