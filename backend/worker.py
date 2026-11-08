@@ -369,6 +369,30 @@ def ensure_market_cache():
     return None
 
 
+def persist_market_cache(market, symbol, candles, filters, fetched_at):
+    """Confirm feed freshness without rewriting unchanged candle windows.
+
+    MIXED/statement binlogs record the complete SQL payload, even when an
+    upsert contains the same candles. Compare before choosing the write so
+    repeated successful polls only log the small freshness update. Compare
+    the full contents: exchanges can correct bars or symbol filters without
+    changing the last candle timestamp.
+    """
+    encoded_candles, encoded_filters = db.dump(candles), db.dump(filters)
+    with db.connect() as con:
+        previous = con.execute(
+            "SELECT candles,filters FROM market_cache WHERE market=? AND symbol=? AND interval='1m' FOR UPDATE",
+            (market, symbol),
+        ).fetchone()
+        if previous and previous["candles"] == encoded_candles and previous["filters"] == encoded_filters:
+            con.execute("UPDATE market_cache SET fetched_at=? WHERE market=? AND symbol=? AND interval='1m'",
+                        (fetched_at, market, symbol))
+            return False
+        con.execute("INSERT INTO market_cache VALUES(?,?,'1m',?,?,?) ON DUPLICATE KEY UPDATE candles=VALUES(candles),filters=VALUES(filters),fetched_at=VALUES(fetched_at)",
+                    (market, symbol, encoded_candles, encoded_filters, fetched_at))
+    return True
+
+
 def market_loop(once=False):
     """One shared public feed poller, independent from account strategy processes."""
     from .binance import BinanceClient
@@ -391,8 +415,7 @@ def market_loop(once=False):
                 end=int(time.time()//60)*60000
                 candles=client.klines(symbol,"1m",end-1000*60000,end)
                 candles=[c for c in candles if c["timestamp"]<end]
-                with db.connect() as con:
-                    con.execute("INSERT INTO market_cache VALUES(?,?,'1m',?,?,?) ON DUPLICATE KEY UPDATE candles=VALUES(candles),filters=VALUES(filters),fetched_at=VALUES(fetched_at)",(market,symbol,db.dump(candles),db.dump(item.get("filters",item)),time.time()))
+                persist_market_cache(market, symbol, candles, item.get("filters",item), time.time())
             except Exception as exc:
                 db.log("error","共享行情更新失败",details={"symbol":symbol,"market":market,"exception":type(exc).__name__})
         if once:
