@@ -1,6 +1,7 @@
 """MySQL / InnoDB control store shared by development, tests and production.
 
-All connections use UTC, strict SQL mode and READ COMMITTED. No in-memory or
+All connections use UTC, strict SQL mode, READ COMMITTED and minimal binlog
+row images. No in-memory or
 file-database fallback is provided: missing MySQL configuration fails closed.
 """
 from contextlib import contextmanager
@@ -157,6 +158,11 @@ def connect():
         con.execute("SET SESSION time_zone = '+00:00'")
         con.execute("SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED")
         con.execute("SET SESSION sql_mode = ?", (SQL_MODE,))
+        # Every business table has a primary key. Record that key and changed
+        # columns instead of repeating full before-images of snapshot/history
+        # TEXT fields on every update. This leaves binary logging enabled and
+        # changes only this application's connection, never the server default.
+        con.execute("SET SESSION binlog_row_image = 'MINIMAL'")
         yield con
         con.commit()
     except BaseException:

@@ -23,6 +23,44 @@ import traceback
 from . import db, storage, downloads
 
 
+# Only transport/availability and transaction-conflict failures are retried.
+# Authentication, schema, disk-full and strategy failures remain explicit errors.
+_TRANSIENT_DB_CODES={1040,1042,1047,1053,1158,1159,1160,1161,1205,1213,1927,2002,2003,2006,2013}
+
+
+def transient_database_error(exc):
+    from pymysql.err import OperationalError, InterfaceError
+    code=exc.args[0] if exc.args else None
+    return (isinstance(exc,OperationalError) and code in _TRANSIENT_DB_CODES
+            or isinstance(exc,InterfaceError) and code in {0,2006,2013})
+
+
+def _database_retry_wait(role,exc,failures):
+    delay=min(15,2**min(failures-1,4))
+    # Database logging cannot be used while that database is unavailable.
+    # Deliberately omit the exception message, which may contain SQL/config.
+    print(f"{role}: temporary database failure ({type(exc).__name__}:{exc.args[0] if exc.args else 'unknown'}); retry in {delay}s",file=sys.stderr,flush=True)
+    time.sleep(delay)
+
+
+def retry_database(operation,role,*,once=False):
+    """Retry by reloading durable state, never by replaying a failed SQL call.
+
+    A lost COMMIT acknowledgement is ambiguous. Callers must reconstruct work
+    from MySQL on each attempt; account ticks reacquire their fence and reload
+    the snapshot/order cursor before calculating or persisting any new action.
+    """
+    failures=0
+    while True:
+        try:
+            return operation()
+        except Exception as exc:
+            if once or not transient_database_error(exc):
+                raise
+            failures+=1
+            _database_retry_wait(role,exc,failures)
+
+
 def service(name,owner):
     with db.connect() as con:
         con.execute("INSERT INTO services VALUES(?,?,?,'online') ON DUPLICATE KEY UPDATE owner=VALUES(owner),heartbeat=VALUES(heartbeat),status='online'",(name,owner,db.now()))
@@ -211,6 +249,10 @@ def _child_limits():
 
 
 def backtest_loop(once=False):
+    return retry_database(lambda:_backtest_loop(once),"backtest",once=once)
+
+
+def _backtest_loop(once=False):
     owner=db.uid()
     while True:
         service("backtest",owner)
@@ -398,6 +440,10 @@ def persist_market_cache(market, symbol, candles, filters, fetched_at):
 
 
 def market_loop(once=False):
+    return retry_database(lambda:_market_loop(once),"market",once=once)
+
+
+def _market_loop(once=False):
     """One shared public feed poller, independent from account strategy processes."""
     from .binance import BinanceClient
     ensure_market_cache()
@@ -923,15 +969,33 @@ def account_loop(account_id,once=False):
     owner=db.uid()
     while True:
         try:
-            keep_running=runtime_tick(account_id,owner)
+            keep_running=retry_database(lambda:runtime_tick(account_id,owner),f"account:{account_id}",once=once)
         except Exception as exc:
-            with db.connect() as con:
-                lease=db.lock_instance(con,account_id)
-                if lease and lease["owner"]==owner and lease["lease_until"]>time.time():
-                    con.execute("UPDATE instances SET observed_state='error',desired_state='stopped',error=? WHERE account_id=?",(str(exc)[:2000],account_id))
-                    con.execute("UPDATE commands SET status='failed',completed_at=?,error=? WHERE account_id=? AND status IN ('pending','running')",(db.now(),str(exc)[:2000],account_id))
-                    db.audit(con,None,"instance.fail","account",account_id,{"error":str(exc)[:2000],"fence":lease["fence"]})
-            db.log("error","模拟运行进程异常，停止继续开仓",account_id=account_id,details={"error":str(exc)[:2000]})
+            message=str(exc)[:2000]
+            failure_fence=None
+            def record_failure():
+                nonlocal failure_fence
+                with db.connect() as con:
+                    lease=db.lock_instance(con,account_id)
+                    # The actor may have lost its lease while MySQL was down.
+                    # Stop only if this is still its ownership epoch; never stop
+                    # a replacement actor. An expired lease with the SAME owner
+                    # cannot be used to execute, but can safely fail closed here.
+                    if not lease or lease["owner"]!=owner:
+                        return
+                    if failure_fence is None:
+                        failure_fence=lease["fence"]
+                    if lease["fence"]!=failure_fence:
+                        return
+                    # A committed failure whose acknowledgement was lost must
+                    # not create duplicate audit/log entries on reconnect.
+                    if lease["desired_state"]=="stopped" and lease["observed_state"]=="error" and lease["error"]==message:
+                        return
+                    con.execute("UPDATE instances SET observed_state='error',desired_state='stopped',error=? WHERE account_id=? AND owner=? AND fence=?",(message,account_id,owner,failure_fence))
+                    con.execute("UPDATE commands SET status='failed',completed_at=?,error=? WHERE account_id=? AND status IN ('pending','running')",(db.now(),message,account_id))
+                    db.audit(con,None,"instance.fail","account",account_id,{"error":message,"fence":failure_fence})
+                    con.execute("INSERT INTO logs(level,account_id,message,details,source,created_at) VALUES('error',?,?,?,?,?)",(account_id,"模拟运行进程异常，停止继续开仓",db.dump({"error":message}),"runtime",db.now()))
+            retry_database(record_failure,f"account-failure:{account_id}",once=once)
             return
         if once or not keep_running:
             return
@@ -977,27 +1041,40 @@ def runtime_loop(once=False):
     market=None if once else subprocess.Popen([sys.executable,"-m","backend.worker","market"])
     warmer=None if once else subprocess.Popen([sys.executable,"-m","backend.worker","warmup"],preexec_fn=_account_limits if os.name=="posix" else None)
     try:
+        database_failures=0
         while True:
-            service("runtime",owner)
-            for account_id,child in list(children.items()):
-                if child.poll() is None:
-                    stop_unresponsive_account(account_id,child,started_at[account_id])
-            with db.connect() as con:
-                rows=con.execute("SELECT DISTINCT i.account_id FROM instances i JOIN accounts a ON a.id=i.account_id LEFT JOIN commands c ON c.account_id=i.account_id WHERE i.desired_state IN ('running','paused') OR i.observed_state='flattening' OR c.status IN ('pending','running') OR (JSON_UNQUOTE(JSON_EXTRACT(a.metrics,'$.execution_model.model'))='maker_grid_v1' AND (COALESCE(JSON_EXTRACT(a.metrics,'$.position_count'),0)>0 OR COALESCE(JSON_EXTRACT(a.metrics,'$.open_order_count'),0)>0))").fetchall()
-            for row in rows:
-                id=row["account_id"]
-                if id not in children or children[id].poll() is not None:
-                    children[id]=subprocess.Popen([sys.executable,"-m","backend.worker","account",id]+(["--once"] if once else []),preexec_fn=_account_limits if os.name=="posix" else None)
-                    started_at[id]=time.monotonic()
-            if market and market.poll() is not None:
-                market=subprocess.Popen([sys.executable,"-m","backend.worker","market"])
-            if warmer and warmer.poll() is not None:
-                warmer=subprocess.Popen([sys.executable,"-m","backend.worker","warmup"],preexec_fn=_account_limits if os.name=="posix" else None)
-            if once:
-                for child in children.values():
-                    child.wait(timeout=20)
-                return
-            time.sleep(2)
+            try:
+                service("runtime",owner)
+                if database_failures:
+                    # Database recovery is not evidence that an actor is hung.
+                    # Give actors time to reconnect/reload before the watchdog runs.
+                    for account_id in started_at:
+                        started_at[account_id]=time.monotonic()
+                    database_failures=0
+                for account_id,child in list(children.items()):
+                    if child.poll() is None:
+                        stop_unresponsive_account(account_id,child,started_at[account_id])
+                with db.connect() as con:
+                    rows=con.execute("SELECT DISTINCT i.account_id FROM instances i JOIN accounts a ON a.id=i.account_id LEFT JOIN commands c ON c.account_id=i.account_id WHERE i.desired_state IN ('running','paused') OR i.observed_state='flattening' OR c.status IN ('pending','running') OR (JSON_UNQUOTE(JSON_EXTRACT(a.metrics,'$.execution_model.model'))='maker_grid_v1' AND (COALESCE(JSON_EXTRACT(a.metrics,'$.position_count'),0)>0 OR COALESCE(JSON_EXTRACT(a.metrics,'$.open_order_count'),0)>0))").fetchall()
+                for row in rows:
+                    id=row["account_id"]
+                    if id not in children or children[id].poll() is not None:
+                        children[id]=subprocess.Popen([sys.executable,"-m","backend.worker","account",id]+(["--once"] if once else []),preexec_fn=_account_limits if os.name=="posix" else None)
+                        started_at[id]=time.monotonic()
+                if market and market.poll() is not None:
+                    market=subprocess.Popen([sys.executable,"-m","backend.worker","market"])
+                if warmer and warmer.poll() is not None:
+                    warmer=subprocess.Popen([sys.executable,"-m","backend.worker","warmup"],preexec_fn=_account_limits if os.name=="posix" else None)
+                if once:
+                    for child in children.values():
+                        child.wait(timeout=20)
+                    return
+                time.sleep(2)
+            except Exception as exc:
+                if once or not transient_database_error(exc):
+                    raise
+                database_failures+=1
+                _database_retry_wait("runtime",exc,database_failures)
     finally:
         # Web restarts never execute this. A supervisor stop deliberately stops actors.
         for child in children.values():
@@ -1019,7 +1096,8 @@ def main():
     parser.add_argument("--source-hash")
     parser.add_argument("--download-owner")
     parser.add_argument("--accept-trusted-code",action="store_true")
-    args=parser.parse_args();db.init_db()
+    args=parser.parse_args()
+    retry_database(db.init_db,"startup:"+args.mode,once=args.once or args.mode not in {"runtime","backtest","market","warmup","account"})
     if args.mode in {"runtime","backtest"}:
         signal.signal(signal.SIGTERM,lambda signum,frame:sys.exit(0))
     if args.mode in {"job","download-job","account","market","warmup"}:

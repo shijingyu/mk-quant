@@ -25,10 +25,11 @@ def test_innodb_strict_mode_utc_and_rollback(mysql_database):
     with db.connect() as con:
         tables = con.execute("SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE()").fetchall()
         assert tables and all(row["ENGINE"] == "InnoDB" for row in tables)
-        settings = con.execute("SELECT @@session.time_zone tz, @@session.sql_mode mode, @@session.tx_isolation isolation_level").fetchone()
+        settings = con.execute("SELECT @@session.time_zone tz, @@session.sql_mode mode, @@session.tx_isolation isolation_level, @@session.binlog_row_image row_image").fetchone()
         assert settings["tz"] == "+00:00"
         assert "STRICT_ALL_TABLES" in settings["mode"]
         assert settings["isolation_level"] == "READ-COMMITTED"
+        assert settings["row_image"] == "MINIMAL"
     user_id = db.uid()
     with pytest.raises(RuntimeError, match="rollback"):
         with db.connect() as con:
@@ -36,6 +37,21 @@ def test_innodb_strict_mode_utc_and_rollback(mysql_database):
             raise RuntimeError("rollback")
     with db.connect() as con:
         assert con.execute("SELECT id FROM users WHERE id=?", (user_id,)).fetchone() is None
+
+
+def test_minimal_row_images_are_session_scoped_with_primary_keys(mysql_database):
+    with db.connect() as con:
+        global_before = con.execute("SELECT @@global.binlog_row_image").fetchone()[0]
+        tables = {row[0] for row in con.execute(
+            "SELECT TABLE_NAME FROM information_schema.TABLE_CONSTRAINTS "
+            "WHERE TABLE_SCHEMA=DATABASE() AND CONSTRAINT_TYPE='PRIMARY KEY'").fetchall()}
+        assert set(db.TABLES) <= tables
+        # A connection's local change must not leak into a subsequent actor,
+        # and application initialization must not alter unrelated services.
+        con.execute("SET SESSION binlog_row_image = 'FULL'")
+    with db.connect() as con:
+        assert con.execute("SELECT @@session.binlog_row_image").fetchone()[0] == "MINIMAL"
+        assert con.execute("SELECT @@global.binlog_row_image").fetchone()[0] == global_before
 
 
 def test_competing_leases_have_one_owner_and_expiry_fences_old_owner(mysql_database):

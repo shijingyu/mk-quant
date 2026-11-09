@@ -58,7 +58,9 @@ if role=="backtest":
     resource.setrlimit(resource.RLIMIT_AS,(ceiling,ceiling))
 if role!="api":
     os.environ.pop("MK_MASTER_KEY",None)
-    argv=[sys.executable,"-m","backend.worker",role]
+    sys.path.insert(0,str(base))
+    from deploy.worker_supervisor import run_role
+    raise SystemExit(run_role(role,base))
 else:
     argv=[sys.executable,"-m","uvicorn","backend.app:app","--host","127.0.0.1","--port","8765","--proxy-headers","--forwarded-allow-ips","127.0.0.1"]
 os.execv(sys.executable,argv)

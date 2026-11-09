@@ -4,7 +4,7 @@
 
 ## 环境与事务规则
 
-当前部署基线为 MySQL 5.7.44，与宝塔实际安装版本一致；开发与集成 Compose 也固定同一版本。`backend/schema.py` 是共同 schema；每个连接设置 `utf8mb4`、UTC 会话时区、READ COMMITTED 隔离和严格 SQL 模式。`schema_migrations` 记录建表及一次性导入版本。未来升级数据库版本时，先在隔离库运行相同集成测试并验证迁移和恢复，再同步更新开发、集成、生产及两份 Compose 配置；不跳过数据库测试或用模拟库替代。
+当前部署基线为 MySQL 5.7.44，与宝塔实际安装版本一致；开发与集成 Compose 也固定同一版本。`backend/schema.py` 是共同 schema；每个连接设置 `utf8mb4`、UTC 会话时区、READ COMMITTED 隔离、严格 SQL 模式及 `SESSION binlog_row_image=MINIMAL`。`schema_migrations` 记录建表及一次性导入版本。未来升级数据库版本时，先在隔离库运行相同集成测试并验证迁移和恢复，再同步更新开发、集成、生产及两份 Compose 配置；不跳过数据库测试或用模拟库替代。
 
 每个环境使用独立数据库、独立用户和独立文件目录。专用用户只拥有自身业务库权限；测试清理需要数据库名以 `_test` 结尾并设置 `MK_TEST_ALLOW_RESET=1`，生产库不允许此标记。MySQL 不开放公网端口。
 
@@ -88,7 +88,7 @@ python scripts/migrate_sqlite_to_mysql.py --source /private-backup/legacy.sqlite
 
 ## 磁盘与 MySQL 二进制日志
 
-MySQL 二进制日志独立于业务表大小；反复写入行情窗口等大字段，会使小型业务库生成大量日志。共享行情仅在内容或交易规则变化时写入大字段，其余成功轮询只更新时间，不改变数据过期判断或分钟撮合频率。行情写入专用连接设置 `SESSION binlog_row_image=MINIMAL`，避免 ROW/MIXED 的完整行镜像重复记录未修改的 TEXT 字段；不关闭二进制日志，也不修改其他业务的全局配置。`market_cache` 保留完整主键，复制环境需保持源端与目标端的表结构一致。参见 [MySQL 5.7 行镜像说明](https://dev.mysql.com/doc/mysql-replication-excerpt/5.7/en/replication-options-binary-log.html#sysvar_binlog_row_image)。
+MySQL 二进制日志独立于业务表大小；反复写入行情窗口等大字段，会使小型业务库生成大量日志。共享行情仅在内容或交易规则变化时写入大字段，其余成功轮询只更新时间，不改变数据过期判断或分钟撮合频率。项目的所有数据库连接设置 `SESSION binlog_row_image=MINIMAL`，避免 ROW/MIXED 的完整行镜像重复记录未修改字段及更新前的整份快照；不关闭二进制日志，也不修改其他业务的全局配置。行情成功轮询仅更新时间，账户快照和指标发生变化时仍完整持久化新的字段内容，不删减曲线、订单或持仓。所有业务表均有主键，复制环境需保持源端与目标端的表结构一致。参见 [MySQL 5.7 行镜像说明](https://dev.mysql.com/doc/mysql-replication-excerpt/5.7/en/replication-options-binary-log.html#sysvar_binlog_row_image)。
 
 运维需同时监测磁盘剩余空间、inode、二进制日志增长和备份容量。磁盘写满出现 errno 28 时，先释放可再生缓存并校验一致性备份，检查复制与恢复依赖，再经管理员确认使用 `PURGE BINARY LOGS` 清理备份坐标之前的日志；不要直接删除数据目录中的文件。日志保留期限须匹配恢复目标，MySQL 5.7 使用 `expire_logs_days`，同时更新运行值和配置文件；日志轮转时才触发过期清理，`max_binlog_size` 可限制单文件的通常规模（大事务仍可能超限）。缩短保留期会缩短可按时间点恢复的范围，不能代替数据库与 Parquet 联合备份。
 
