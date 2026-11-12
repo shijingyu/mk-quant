@@ -2513,6 +2513,7 @@ function OpenOrders({ orders }) {
                 <th className="numeric">触发价格</th>
                 <th className="numeric">数量</th>
                 <th>状态</th>
+                <th>挂单时间 · 北京时间</th>
                 <th>关联信息</th>
               </tr>
             </thead>
@@ -2577,6 +2578,9 @@ function OpenOrders({ orders }) {
                     </td>
                     <td data-label="状态">
                       <Badge status={state}>{label}</Badge>
+                    </td>
+                    <td data-label="挂单时间 · 北京时间" className="order-time">
+                      {formatBeijing(order.submitted_at, { second: "2-digit" })}
                     </td>
                     <td data-label="关联信息">
                       <details className="order-metadata">
@@ -2885,6 +2889,7 @@ function ClientView({ account: a, user }) {
                   <th className="numeric">成交价格</th>
                   <th className="numeric">已实现盈亏 U</th>
                   <th>状态</th>
+                  <th>成交时间 · 北京时间</th>
                 </tr>
               </thead>
               <tbody>
@@ -2925,6 +2930,9 @@ function ClientView({ account: a, user }) {
                             REJECTED: "已拒单",
                           }[o.status] || o.status
                         : "—"}
+                    </td>
+                    <td data-label="成交时间 · 北京时间" className="order-time">
+                      {formatBeijing(o.timestamp, { second: "2-digit" })}
                     </td>
                   </tr>
                 ))}

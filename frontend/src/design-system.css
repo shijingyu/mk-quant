@@ -2803,3 +2803,13 @@ footer {
 .experiment-progress > div {display:flex;justify-content:space-between;gap:12px;font-size:12px;}
 .experiment-progress progress {display:block;width:100%;height:6px;margin:6px 0;accent-color:var(--accent,#146c54);}
 .experiment-progress small {font-size:12px;white-space:normal;}
+
+/* Account order timestamps remain readable in desktop tables and mobile cards. */
+.order-time { white-space: nowrap; font-variant-numeric: tabular-nums; }
+@media (max-width: 760px) {
+  .client-view .table-wrap td.order-time { grid-column: 1 / -1; text-align: left; }
+  .client-view .table-wrap td.order-time[data-label]::before {
+    content: attr(data-label); display: block; color: var(--muted);
+    font-size: 12px; margin-bottom: 5px;
+  }
+}
